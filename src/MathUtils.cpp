@@ -9,13 +9,18 @@ static double estimatePValueFromT(double t, size_t df) {
     if (df <= 0) return 1.0;
     t = std::abs(t);
     
+    // Large degree of freedom approximation (Normal distribution)
+    if (df >= 100) {
+        return std::erfc(t / std::sqrt(2.0));
+    }
+    
     double nu = static_cast<double>(df);
     double c = std::tgamma((nu + 1.0) / 2.0) / (std::sqrt(nu * M_PI) * std::tgamma(nu / 2.0));
     
     // Transform integral from t to infinity into bounded arctan(t/sqrt(nu)) to pi/2
     double start = std::atan(t / std::sqrt(nu));
     double end = M_PI / 2.0;
-    int steps = 1000;
+    int steps = 50; // Reduced from 1000 for efficiency
     double step = (end - start) / steps;
     double p = 0.0;
     
@@ -29,7 +34,6 @@ static double estimatePValueFromT(double t, size_t df) {
             return c * std::sqrt(nu) * std::pow(cos_y, nu - 1.0);
         };
         
-        // Simpson's 3/8 or simple 1/3 rule. Using Simpson's 1/3 rule.
         p += (f(y1) + 4.0 * f(ym) + f(y2)) * (step / 6.0);
     }
     
@@ -224,10 +228,24 @@ void MathUtils::Matrix::qrDecomposition(Matrix& Q, Matrix& R) const {
 
 std::vector<double> MathUtils::multipleLinearRegression(const Matrix& X, const Matrix& Y) {
     if (X.rows != Y.rows) throw std::invalid_argument("X and Y row dimensions must match for MLR.");
+    if (X.rows < X.cols) return std::vector<double>(); // Underdetermined
     
     // Solve X * beta = Y using QR Decomposition
     Matrix Q(0, 0), R(0, 0);
     X.qrDecomposition(Q, R);
+
+    // Check condition number / rank deficiency
+    double max_diag = 0.0;
+    double min_diag = 1e30;
+    for (size_t i = 0; i < X.cols; ++i) {
+        double val = std::abs(R.data[i][i]);
+        if (val > max_diag) max_diag = val;
+        if (val < min_diag) min_diag = val;
+    }
+
+    if (min_diag < 1e-12 || (max_diag / min_diag) > 1e10) {
+        return std::vector<double>(); // Singular or ill-conditioned matrix
+    }
 
     // Q is orthogonal (m x m), R is upper triangular (m x n)
     // Minimizer solves: R * beta = Q^T * Y
@@ -239,10 +257,6 @@ std::vector<double> MathUtils::multipleLinearRegression(const Matrix& X, const M
 
     // Back substitution
     for (int i = n - 1; i >= 0; --i) {
-        if (std::abs(R.data[i][i]) < 1e-12) {
-            // Singular or highly collinear matrix
-            return std::vector<double>(); 
-        }
         double sum = QTY.data[i][0];
         for (size_t j = i + 1; j < n; ++j) {
             sum -= R.data[i][j] * beta[j];

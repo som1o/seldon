@@ -77,7 +77,7 @@ int main(int argc, char* argv[]) {
 
     // Layer 3 Synthesis
     // Dynamic Topology: Input size dynamically scales based on MLR independent variable counts.
-    size_t targetIdx = dataset.getColCount() - 1; // Default to last column
+    std::vector<size_t> targetIndices = {dataset.getColCount() - 1}; // Default to last column
     std::vector<size_t> inputIndices;
     
     if (!mlrRegressions.empty()) {
@@ -88,9 +88,10 @@ int main(int argc, char* argv[]) {
                  }
              }
         }
+        targetIndices.clear();
         for (size_t i = 0; i < dataset.getColCount(); ++i) {
              if (dataset.getColumnNames()[i] == mlrRegressions.front().dependentFeature) {
-                 targetIdx = i; break;
+                 targetIndices.push_back(i); break;
              }
         }
     } else if (!regressions.empty()) {
@@ -99,9 +100,10 @@ int main(int argc, char* argv[]) {
                  inputIndices.push_back(i); break;
              }
         }
+        targetIndices.clear();
         for (size_t i = 0; i < dataset.getColCount(); ++i) {
              if (dataset.getColumnNames()[i] == regressions.front().featureY) {
-                 targetIdx = i; break;
+                 targetIndices.push_back(i); break;
              }
         }
     } else {
@@ -111,12 +113,13 @@ int main(int argc, char* argv[]) {
     }
 
     size_t inputNodes = inputIndices.empty() ? 1 : inputIndices.size();
+    size_t outputNodes = targetIndices.size();
     size_t hiddenNodes = inputNodes * 2; // Simple heuristic
-
+    
     std::cout << "        -> Agent configured dynamic architecture: [" 
-              << inputNodes << " Input] -> [" << hiddenNodes << " Hidden] -> [1 Output]\n";
+              << inputNodes << " Input] -> [" << hiddenNodes << " Hidden] -> [" << outputNodes << " Output]\n";
 
-    std::vector<size_t> topology = {inputNodes, hiddenNodes, 1};
+    std::vector<size_t> topology = {inputNodes, hiddenNodes, outputNodes};
     NeuralNet nn(topology);
 
     const auto& columns = dataset.getColumns();
@@ -138,16 +141,35 @@ int main(int argc, char* argv[]) {
     for (size_t idx : inputIndices) {
         scaledXCols.push_back(getScaledCol(idx));
     }
-    std::vector<double> scaledYCol = getScaledCol(targetIdx);
+    
+    std::vector<std::vector<double>> scaledYCols;
+    for (size_t idx : targetIndices) {
+        scaledYCols.push_back(getScaledCol(idx));
+    }
     
     for (size_t r = 0; r < dataset.getRowCount(); ++r) {
         std::vector<double> xRow;
         for (const auto& col : scaledXCols) xRow.push_back(col[r]);
         X_train.push_back(xRow);
-        Y_train.push_back({scaledYCol[r]});
+        
+        std::vector<double> yRow;
+        for (const auto& col : scaledYCols) yRow.push_back(col[r]);
+        Y_train.push_back(yRow);
     }
 
-    nn.train(X_train, Y_train, 0.1, 100);
+    NeuralNet::Hyperparameters hp;
+    hp.learningRate = 0.05;
+    hp.epochs = 150;
+    hp.batchSize = 16;
+    hp.activation = NeuralNet::Activation::RELU;
+    hp.optimizer = NeuralNet::Optimizer::ADAM;
+    hp.verbose = true;
+    hp.l2Lambda = 0.0001;
+
+    nn.train(X_train, Y_train, hp);
+
+    // Save model for persistence demonstration
+    nn.saveModel("seldon_model.json");
 
     // Run inference on the first row of data for conceptual validation
     std::vector<double> inferenceInput;
