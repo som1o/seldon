@@ -7,16 +7,9 @@ std::vector<std::vector<double>> LogicEngine::calculateCorrelationMatrix(
     const Dataset& dataset, const std::vector<ColumnStats>& stats) 
 {
     size_t cols = dataset.getColCount();
-    size_t rows = dataset.getRowCount();
     std::vector<std::vector<double>> matrix(cols, std::vector<double>(cols, 1.0)); // diagonal is 1.0
 
-    // Extract columns temporarily for processing efficiency
-    std::vector<std::vector<double>> columns(cols, std::vector<double>(rows));
-    for (size_t c = 0; c < cols; ++c) {
-        for (size_t r = 0; r < rows; ++r) {
-            columns[c][r] = dataset.getData()[r][c];
-        }
-    }
+    const auto& columns = dataset.getColumns();
 
     for (size_t i = 0; i < cols; ++i) {
         for (size_t j = i + 1; j < cols; ++j) {
@@ -59,7 +52,6 @@ std::vector<RegressionResult> LogicEngine::performSimpleRegressions(
     std::vector<RegressionResult> results;
     const auto& names = dataset.getColumnNames();
     size_t cols = names.size();
-    size_t rows = dataset.getRowCount();
 
     // Map feature name to index (inefficient but readable for prototype)
     auto getIndex = [&names](const std::string& name) -> size_t {
@@ -69,13 +61,7 @@ std::vector<RegressionResult> LogicEngine::performSimpleRegressions(
         return 0; // should throw ideally
     };
 
-    // Extract columns
-    std::vector<std::vector<double>> columns(cols, std::vector<double>(rows));
-    for (size_t c = 0; c < cols; ++c) {
-        for (size_t r = 0; r < rows; ++r) {
-            columns[c][r] = dataset.getData()[r][c];
-        }
-    }
+    const auto& columns = dataset.getColumns();
 
     for (const auto& corr : highCorrelations) {
         size_t idxX = getIndex(corr.feature1);
@@ -113,11 +99,13 @@ std::vector<MultipleRegressionResult> LogicEngine::performMultipleRegressions(
             std::vector<std::string> indepNames;
             for (auto xI : xIndices) indepNames.push_back(names[xI]);
 
+            const auto& columns = dataset.getColumns();
+
             for (size_t r = 0; r < rows; ++r) {
-                Y.data[r][0] = dataset.getData()[r][yIdx];
+                Y.data[r][0] = columns[yIdx][r];
                 X.data[r][0] = 1.0; // Intercept column
                 for (size_t c = 0; c < xIndices.size(); ++c) {
-                    X.data[r][c + 1] = dataset.getData()[r][xIndices[c]];
+                    X.data[r][c + 1] = columns[xIndices[c]][r];
                 }
             }
 

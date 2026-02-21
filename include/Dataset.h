@@ -6,16 +6,22 @@ class Dataset {
 public:
     Dataset(const std::string& filename);
 
-    bool load();
+    // skipMalformed=true will silently discard unparseable rows and warn.
+    // skipMalformed=false will abort loading on first bad row.
+    bool load(bool skipMalformed = true);
     void printSummary() const;
 
     const std::vector<std::string>& getColumnNames() const { return columnNames; }
-    const std::vector<std::vector<double>>& getData() const { return data; }
-    size_t getRowCount() const { return data.empty() ? 0 : data.size(); }
+    
+    // Returns data grouped by columns instead of rows for better cache locality and performance
+    const std::vector<std::vector<double>>& getColumns() const { return columns; }
+    
+    size_t getRowCount() const { return rowCount; }
     size_t getColCount() const { return columnNames.size(); }
 
 private:
     std::string filename_;
     std::vector<std::string> columnNames;
-    std::vector<std::vector<double>> data; // rows of numerical data
+    std::vector<std::vector<double>> columns; // columns of numerical data
+    size_t rowCount = 0;
 };

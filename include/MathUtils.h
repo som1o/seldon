@@ -31,9 +31,11 @@ public:
 
         Matrix(size_t r, size_t c) : rows(r), cols(c), data(r, std::vector<double>(c, 0.0)) {}
 
+        static Matrix identity(size_t n);
         Matrix transpose() const;
         Matrix multiply(const Matrix& other) const;
         Matrix inverse() const; // Using Gaussian Elimination
+        void qrDecomposition(Matrix& Q, Matrix& R) const;
     };
 
     // Multiple Linear Regression using Normal Equation: beta = (X^T * X)^-1 * X^T * Y

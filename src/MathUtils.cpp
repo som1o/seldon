@@ -5,16 +5,35 @@
 #include <iostream>
 #include <numeric>
 
-// Simple approximation of the Student's t-distribution cumulative distribution function (CDF) 
-// for evaluating the p-value without pulling in boost::math. Valid for large n.
 static double estimatePValueFromT(double t, size_t df) {
     if (df <= 0) return 1.0;
-    // For n > 30, t-distribution approaches standard normal. 
-    // We use a simple approximation here for the agentic scope.
-    double x = t / std::sqrt(2.0);
-    // std::erfc(x) = 1 - erf(x), mapping directly to two-tailed test
-    double p = std::erfc(std::abs(x)); 
-    return p;
+    t = std::abs(t);
+    
+    double nu = static_cast<double>(df);
+    double c = std::tgamma((nu + 1.0) / 2.0) / (std::sqrt(nu * M_PI) * std::tgamma(nu / 2.0));
+    
+    // Transform integral from t to infinity into bounded arctan(t/sqrt(nu)) to pi/2
+    double start = std::atan(t / std::sqrt(nu));
+    double end = M_PI / 2.0;
+    int steps = 1000;
+    double step = (end - start) / steps;
+    double p = 0.0;
+    
+    for (int i = 0; i < steps; ++i) {
+        double y1 = start + i * step;
+        double y2 = start + (i + 1) * step;
+        double ym = (y1 + y2) / 2.0;
+        
+        auto f = [c, nu](double y) {
+            double cos_y = std::cos(y);
+            return c * std::sqrt(nu) * std::pow(cos_y, nu - 1.0);
+        };
+        
+        // Simpson's 3/8 or simple 1/3 rule. Using Simpson's 1/3 rule.
+        p += (f(y1) + 4.0 * f(ym) + f(y2)) * (step / 6.0);
+    }
+    
+    return p * 2.0; // Two-tailed p-value
 }
 
 Significance MathUtils::calculateSignificance(double r, size_t n) {
@@ -45,10 +64,13 @@ double MathUtils::calculatePearson(const std::vector<double>& x, const std::vect
     if (statsX.stddev == 0 || statsY.stddev == 0) return 0.0;
 
     size_t n = x.size();
-    double covarianceSum = 0;
-    for (size_t i = 0; i < n; ++i) {
-        covarianceSum += (x[i] - statsX.mean) * (y[i] - statsY.mean);
-    }
+    
+    // Modern C++ algorithm replacing raw loops
+    double covarianceSum = std::inner_product(x.begin(), x.end(), y.begin(), 0.0,
+        std::plus<>(),
+        [statsX, statsY](double valX, double valY) {
+            return (valX - statsX.mean) * (valY - statsY.mean);
+        });
     
     // Pearson r = Covariance(X,Y) / (StdDevX * StdDevY)
     double covariance = covarianceSum / (n - 1);
@@ -63,6 +85,12 @@ std::pair<double, double> MathUtils::simpleLinearRegression(const std::vector<do
     // c = My - m*Mx
     double c = statsY.mean - (m * statsX.mean);
     return {m, c};
+}
+
+MathUtils::Matrix MathUtils::Matrix::identity(size_t n) {
+    Matrix res(n, n);
+    for (size_t i = 0; i < n; ++i) res.data[i][i] = 1.0;
+    return res;
 }
 
 MathUtils::Matrix MathUtils::Matrix::transpose() const {
@@ -116,7 +144,7 @@ MathUtils::Matrix MathUtils::Matrix::inverse() const {
         std::swap(augmented.data[i], augmented.data[maxRow]);
 
         // Check for singularity
-        if (std::abs(augmented.data[i][i]) < 1e-9) {
+        if (std::abs(augmented.data[i][i]) < 1e-12) {
             return Matrix(0, 0); // Return empty on failure silently
         }
 
@@ -147,25 +175,79 @@ MathUtils::Matrix MathUtils::Matrix::inverse() const {
     return result;
 }
 
+// Computes the Householder QR decomposition
+void MathUtils::Matrix::qrDecomposition(Matrix& Q, Matrix& R) const {
+    size_t m = rows;
+    size_t n = cols;
+    Q = Matrix::identity(m);
+    R = *this;
+
+    for (size_t k = 0; k < n && k < m - 1; ++k) {
+        std::vector<double> x(m - k);
+        double normX = 0;
+        for (size_t i = k; i < m; ++i) {
+            x[i - k] = R.data[i][k];
+            normX += x[i - k] * x[i - k];
+        }
+        normX = std::sqrt(normX);
+
+        if (normX <= 1e-12) continue;
+
+        double alpha = (R.data[k][k] > 0 ? -1.0 : 1.0) * normX;
+        std::vector<double> u = x;
+        u[0] -= alpha;
+        
+        double normU = 0;
+        for (double val : u) normU += val * val;
+        normU = std::sqrt(normU);
+        if (normU > 1e-12) {
+            for (double& val : u) val /= normU;
+        } else {
+            continue;
+        }
+
+        // R = R - 2 u (u^T R)
+        for (size_t j = k; j < n; ++j) {
+            double dot = 0;
+            for (size_t i = k; i < m; ++i) dot += u[i - k] * R.data[i][j];
+            for (size_t i = k; i < m; ++i) R.data[i][j] -= 2.0 * u[i - k] * dot;
+        }
+
+        // Q = Q - 2 (Q u) u^T
+        for (size_t i = 0; i < m; ++i) {
+            double dot = 0;
+            for (size_t j = k; j < m; ++j) dot += Q.data[i][j] * u[j - k];
+            for (size_t j = k; j < m; ++j) Q.data[i][j] -= 2.0 * dot * u[j - k];
+        }
+    }
+}
+
 std::vector<double> MathUtils::multipleLinearRegression(const Matrix& X, const Matrix& Y) {
     if (X.rows != Y.rows) throw std::invalid_argument("X and Y row dimensions must match for MLR.");
     
-    // Normal Equation: beta = (X^T * X)^-1 * X^T * Y
-    Matrix XT = X.transpose();
-    Matrix XTX = XT.multiply(X);
-    
-    // Check if invertible
-    Matrix XTX_inv = XTX.inverse();
-    if (XTX_inv.rows == 0) {
-        return std::vector<double>(); 
-    }
+    // Solve X * beta = Y using QR Decomposition
+    Matrix Q(0, 0), R(0, 0);
+    X.qrDecomposition(Q, R);
 
-    Matrix XT_Y = XT.multiply(Y);
-    Matrix betaMatrix = XTX_inv.multiply(XT_Y);
+    // Q is orthogonal (m x m), R is upper triangular (m x n)
+    // Minimizer solves: R * beta = Q^T * Y
+    Matrix QT = Q.transpose();
+    Matrix QTY = QT.multiply(Y);
 
-    std::vector<double> beta(betaMatrix.rows);
-    for (size_t i = 0; i < betaMatrix.rows; ++i) {
-        beta[i] = betaMatrix.data[i][0];
+    size_t n = X.cols;
+    std::vector<double> beta(n, 0.0);
+
+    // Back substitution
+    for (int i = n - 1; i >= 0; --i) {
+        if (std::abs(R.data[i][i]) < 1e-12) {
+            // Singular or highly collinear matrix
+            return std::vector<double>(); 
+        }
+        double sum = QTY.data[i][0];
+        for (size_t j = i + 1; j < n; ++j) {
+            sum -= R.data[i][j] * beta[j];
+        }
+        beta[i] = sum / R.data[i][i];
     }
 
     return beta;

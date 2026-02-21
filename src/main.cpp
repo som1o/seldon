@@ -5,6 +5,7 @@
 #include "TerminalUI.h"
 #include <iostream>
 #include <string>
+#include <algorithm>
 
 int main(int argc, char* argv[]) {
     std::cout << "Seldon: Agentic Data Analytics Engine Initialization...\n";
@@ -21,6 +22,11 @@ int main(int argc, char* argv[]) {
     }
 
     dataset.printSummary();
+
+    if (dataset.getRowCount() == 0 || dataset.getColCount() == 0) {
+        std::cerr << "\n[Agent Error] Zero mathematical rows or columns isolated. Terminating analytics sequence gracefully.\n";
+        return 1;
+    }
 
     std::cout << "\n[Agent] Ingestion successful. Initiating Layer 1 analysis...\n";
 
@@ -71,13 +77,40 @@ int main(int argc, char* argv[]) {
 
     // Layer 3 Synthesis
     // Dynamic Topology: Input size dynamically scales based on MLR independent variable counts.
-    size_t inputNodes = 3; // Minimum fallback
+    size_t targetIdx = dataset.getColCount() - 1; // Default to last column
+    std::vector<size_t> inputIndices;
+    
     if (!mlrRegressions.empty()) {
-        inputNodes = mlrRegressions.front().independentFeatures.size();
+        for (const auto& indepFeature : mlrRegressions.front().independentFeatures) {
+             for (size_t i = 0; i < dataset.getColCount(); ++i) {
+                 if (dataset.getColumnNames()[i] == indepFeature) {
+                     inputIndices.push_back(i); break;
+                 }
+             }
+        }
+        for (size_t i = 0; i < dataset.getColCount(); ++i) {
+             if (dataset.getColumnNames()[i] == mlrRegressions.front().dependentFeature) {
+                 targetIdx = i; break;
+             }
+        }
     } else if (!regressions.empty()) {
-        inputNodes = 1;
+        for (size_t i = 0; i < dataset.getColCount(); ++i) {
+             if (dataset.getColumnNames()[i] == regressions.front().featureX) {
+                 inputIndices.push_back(i); break;
+             }
+        }
+        for (size_t i = 0; i < dataset.getColCount(); ++i) {
+             if (dataset.getColumnNames()[i] == regressions.front().featureY) {
+                 targetIdx = i; break;
+             }
+        }
+    } else {
+        // Fallback: Use first up to 3 columns to predict the last
+        size_t limit = std::min(dataset.getColCount() - 1, static_cast<size_t>(3));
+        for(size_t i = 0; i < limit; ++i) inputIndices.push_back(i);
     }
 
+    size_t inputNodes = inputIndices.empty() ? 1 : inputIndices.size();
     size_t hiddenNodes = inputNodes * 2; // Simple heuristic
 
     std::cout << "        -> Agent configured dynamic architecture: [" 
@@ -86,16 +119,43 @@ int main(int argc, char* argv[]) {
     std::vector<size_t> topology = {inputNodes, hiddenNodes, 1};
     NeuralNet nn(topology);
 
-    // Provide some normalized sample parameters derived from previous steps 
-    // Example conceptual simulation for Synthesis Output
+    const auto& columns = dataset.getColumns();
+    std::vector<std::vector<double>> X_train;
+    std::vector<std::vector<double>> Y_train;
+    
+    // Scale features to [0, 1] for stable sigmoids
+    auto getScaledCol = [&](size_t colIdx) {
+        std::vector<double> col = columns[colIdx];
+        double minVal = *std::min_element(col.begin(), col.end());
+        double maxVal = *std::max_element(col.begin(), col.end());
+        double range = maxVal - minVal;
+        if (range == 0) range = 1.0;
+        for (auto& val : col) val = (val - minVal) / range;
+        return col;
+    };
+    
+    std::vector<std::vector<double>> scaledXCols;
+    for (size_t idx : inputIndices) {
+        scaledXCols.push_back(getScaledCol(idx));
+    }
+    std::vector<double> scaledYCol = getScaledCol(targetIdx);
+    
+    for (size_t r = 0; r < dataset.getRowCount(); ++r) {
+        std::vector<double> xRow;
+        for (const auto& col : scaledXCols) xRow.push_back(col[r]);
+        X_train.push_back(xRow);
+        Y_train.push_back({scaledYCol[r]});
+    }
+
+    nn.train(X_train, Y_train, 0.1, 100);
+
+    // Run inference on the first row of data for conceptual validation
     std::vector<double> inferenceInput;
     for (size_t i = 0; i < inputNodes; ++i) {
-        inferenceInput.push_back((rand() / double(RAND_MAX))); // Random normalized conceptual inputs
+        inferenceInput.push_back(X_train[0][i]);
     }
     
-    nn.feedForward(inferenceInput);
-    
-    std::vector<double> results = nn.getResults();
+    std::vector<double> results = nn.predict(inferenceInput);
 
     TerminalUI::printSynthesisReport(results);
     

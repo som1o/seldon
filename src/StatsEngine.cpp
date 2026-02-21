@@ -51,16 +51,11 @@ ColumnStats StatsEngine::calculateStats(const std::vector<double>& col) {
 std::vector<ColumnStats> StatsEngine::calculateFoundation(const Dataset& dataset) {
     std::vector<ColumnStats> allStats;
     size_t cols = dataset.getColCount();
-    size_t rows = dataset.getRowCount();
     
-    // Transpose data conceptually to calculate per-column stats
     for (size_t c = 0; c < cols; ++c) {
-        std::vector<double> columnData;
-        columnData.reserve(rows);
-        for (size_t r = 0; r < rows; ++r) {
-            columnData.push_back(dataset.getData()[r][c]);
-        }
-        allStats.push_back(calculateStats(columnData));
+        // Since Dataset is now column-major, we can directly pass the column vector
+        // eliminating the heavy abstraction overhead of building isolated copies.
+        allStats.push_back(calculateStats(dataset.getColumns()[c]));
     }
 
     return allStats;
