@@ -7,6 +7,7 @@
 #include <sstream>
 #include <cstdint>
 #include <cstring>
+#include "SeldonExceptions.h"
 
 namespace {
     bool isLittleEndian() {
@@ -116,11 +117,15 @@ void NeuralNet::feedForward(const std::vector<double>& inputValues, Activation a
         Layer& prev = m_layers[l - 1];
         current.activation = (l == m_layers.size() - 1) ? outputAct : act;
 
+        #ifdef USE_OPENMP
         #pragma omp parallel for
+        #endif
         for (size_t n = 0; n < current.size; ++n) {
             double sum = current.biases[n];
             size_t weightOffset = n * prev.size;
+            #ifdef USE_OPENMP
             #pragma omp simd reduction(+:sum)
+            #endif
             for (size_t pn = 0; pn < prev.size; ++pn) {
                 sum += prev.outputs[pn] * current.weights[weightOffset + pn];
             }
@@ -159,7 +164,9 @@ void NeuralNet::computeGradients(const std::vector<double>& targetValues, LossFu
         }
     }
 
+    #ifdef USE_OPENMP
     #pragma omp parallel for
+    #endif
     for (size_t l = m_layers.size() - 2; l > 0; --l) {
         Layer& hidden = m_layers[l];
         Layer& next = m_layers[l + 1];
@@ -170,7 +177,9 @@ void NeuralNet::computeGradients(const std::vector<double>& targetValues, LossFu
                 continue;
             }
             double dow = 0.0;
+            #ifdef USE_OPENMP
             #pragma omp simd reduction(+:dow)
+            #endif
             for (size_t nn = 0; nn < next.size; ++nn) {
                 dow += next.weights[nn * hidden.size + n] * next.gradients[nn];
             }
@@ -186,7 +195,9 @@ void NeuralNet::applyOptimization(const Hyperparameters& hp, size_t t_step) {
         Layer& current = m_layers[l];
         Layer& prev = m_layers[l - 1];
 
+        #ifdef USE_OPENMP
         #pragma omp parallel for
+        #endif
         for (size_t n = 0; n < current.size; ++n) {
             // Update Bias
             double grad_bias = current.gradients[n];
@@ -201,7 +212,9 @@ void NeuralNet::applyOptimization(const Hyperparameters& hp, size_t t_step) {
             }
 
             size_t weightOffset = n * prev.size;
+            #ifdef USE_OPENMP
             #pragma omp simd
+            #endif
             for (size_t pn = 0; pn < prev.size; ++pn) {
                 double grad_w = current.gradients[n] * prev.outputs[pn];
                 grad_w += hp.l2Lambda * current.weights[weightOffset + pn]; // Weight decay scaling
@@ -236,6 +249,12 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
 
     size_t valSize = static_cast<size_t>(X.size() * hp.valSplit);
     size_t trainSize = X.size() - valSize;
+    
+    // Safety guard for extremely small datasets
+    if (trainSize == 0) {
+        trainSize = X.size();
+        valSize = 0;
+    }
 
     std::vector<size_t> indices(X.size());
     std::iota(indices.begin(), indices.end(), 0);
@@ -246,70 +265,21 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
     double currentLR = hp.learningRate;
 
     for (size_t epoch = 0; epoch < hp.epochs; ++epoch) {
-        // Learning Rate Scheduling (Step Decay)
-        if (epoch > 0 && epoch % hp.lrStepSize == 0) {
-            currentLR *= hp.lrDecay;
-            if (hp.verbose) std::cout << "\n[Agent] Learning rate decayed to " << currentLR << "\n";
-        }
-
         if (epoch % std::max(size_t(1), hp.epochs / 10) == 0) {
             std::cout << "\r[Agent] Training Neural Lattice: [" << (epoch * 100 / hp.epochs) << "%] " << std::flush;
         }
         std::shuffle(indices.begin(), indices.end(), rng);
 
-        // Modify hp copy to pass the decaying LR
-        Hyperparameters currentHp = hp;
-        currentHp.learningRate = currentLR;
-
-        double trainLoss = 0.0;
-        for (size_t i = 0; i < trainSize; i += hp.batchSize) {
-            size_t currentBatchEnd = std::min(i + hp.batchSize, trainSize);
-            t_step++;
-
-            for (size_t b = i; b < currentBatchEnd; ++b) {
-                feedForward(X[indices[b]], hp.activation, hp.outputActivation, true, hp.dropoutRate);
-                backpropagate(Y[indices[b]], currentHp, t_step);
-
-                for (size_t j = 0; j < Y[indices[b]].size(); ++j) {
-                    double actual = Y[indices[b]][j];
-                    double pred = m_layers.back().outputs[j];
-                    if (hp.loss == LossFunction::CROSS_ENTROPY) {
-                        pred = std::clamp(pred, 1e-15, 1.0 - 1e-15);
-                        trainLoss -= (actual * std::log(pred) + (1.0 - actual) * std::log(1.0 - pred));
-                    } else {
-                        trainLoss += (actual - pred) * (actual - pred);
-                    }
-                }
-            }
-        }
-
-        // Validation phase
-        double valLossSum = 0.0;
-        if (valSize > 0) {
-            for (size_t i = trainSize; i < X.size(); ++i) {
-                feedForward(X[indices[i]], hp.activation, hp.outputActivation, false);
-                for (size_t j = 0; j < Y[indices[i]].size(); ++j) {
-                    double actual = Y[indices[i]][j];
-                    double pred = m_layers.back().outputs[j];
-                    if (hp.loss == LossFunction::CROSS_ENTROPY) {
-                        pred = std::clamp(pred, 1e-15, 1.0 - 1e-15);
-                        valLossSum -= (actual * std::log(pred) + (1.0 - actual) * std::log(1.0 - pred));
-                    } else {
-                        valLossSum += (actual - pred) * (actual - pred);
-                    }
-                }
-            }
-            valLossSum /= (valSize * m_layers.back().size); 
-        }
+        double trainLoss = runEpoch(X, Y, indices, trainSize, hp, currentLR, t_step);
+        double valLoss = valSize > 0 ? validate(X, Y, indices, trainSize, hp) : 0.0;
 
         if (hp.verbose && (epoch % std::max(size_t(1), hp.epochs / 10) == 0 || epoch == hp.epochs - 1)) {
-            double finalTrainLoss = trainLoss / (trainSize * m_layers.back().size);
-            std::cout << "[Epoch " << epoch << "] Train Loss: " << finalTrainLoss << " | Val Loss: " << valLossSum << std::endl;
+            std::cout << "[Epoch " << epoch << "] Train Loss: " << trainLoss << " | Val Loss: " << valLoss << std::endl;
         }
 
         if (valSize > 0) {
-            if (valLossSum < (bestValLoss - hp.minDelta)) {
-                bestValLoss = valLossSum;
+            if (valLoss < (bestValLoss - hp.minDelta)) {
+                bestValLoss = valLoss;
                 patienceCounter = 0;
             } else {
                 patienceCounter++;
@@ -321,6 +291,73 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
         }
     }
     std::cout << "\r[Agent] Training Neural Lattice: [100%] Complete.          " << std::endl;
+}
+
+double NeuralNet::runEpoch(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
+                           const std::vector<size_t>& indices, size_t trainSize, 
+                           const Hyperparameters& hp, double& currentLR, size_t& t_step) {
+    // Learning Rate Scheduling
+    size_t batchesPerEpoch = std::max(size_t(1), trainSize / hp.batchSize);
+    size_t epoch = t_step / batchesPerEpoch;
+    if (epoch > 0 && epoch % hp.lrStepSize == 0 && t_step % batchesPerEpoch == 0) {
+        currentLR *= hp.lrDecay;
+        if (hp.verbose) std::cout << "\n[Agent] Learning rate decayed to " << currentLR << "\n";
+    }
+
+    Hyperparameters currentHp = hp;
+    currentHp.learningRate = currentLR;
+
+    double epochLoss = 0.0;
+    for (size_t i = 0; i < trainSize; i += hp.batchSize) {
+        size_t currentBatchEnd = std::min(i + hp.batchSize, trainSize);
+        epochLoss += runBatch(X, Y, indices, i, currentBatchEnd, currentHp, t_step);
+    }
+    double denom = static_cast<double>(trainSize * m_layers.back().size);
+    return denom > 0 ? epochLoss / denom : 0.0;
+}
+
+double NeuralNet::runBatch(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
+                            const std::vector<size_t>& indices, size_t batchStart, size_t batchEnd, 
+                            const Hyperparameters& hp, size_t& t_step) {
+    double batchLoss = 0.0;
+    t_step++;
+    for (size_t b = batchStart; b < batchEnd; ++b) {
+        feedForward(X[indices[b]], hp.activation, hp.outputActivation, true, hp.dropoutRate);
+        backpropagate(Y[indices[b]], hp, t_step);
+
+        for (size_t j = 0; j < Y[indices[b]].size(); ++j) {
+            double actual = Y[indices[b]][j];
+            double pred = m_layers.back().outputs[j];
+            if (hp.loss == LossFunction::CROSS_ENTROPY) {
+                pred = std::clamp(pred, 1e-15, 1.0 - 1e-15);
+                batchLoss -= (actual * std::log(pred) + (1.0 - actual) * std::log(1.0 - pred));
+            } else {
+                batchLoss += (actual - pred) * (actual - pred);
+            }
+        }
+    }
+    return batchLoss;
+}
+
+double NeuralNet::validate(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
+                           const std::vector<size_t>& indices, size_t trainSize, const Hyperparameters& hp) {
+    double valLossSum = 0.0;
+    size_t valSize = X.size() - trainSize;
+    for (size_t i = trainSize; i < X.size(); ++i) {
+        feedForward(X[indices[i]], hp.activation, hp.outputActivation, false);
+        for (size_t j = 0; j < Y[indices[i]].size(); ++j) {
+            double actual = Y[indices[i]][j];
+            double pred = m_layers.back().outputs[j];
+            if (hp.loss == LossFunction::CROSS_ENTROPY) {
+                pred = std::clamp(pred, 1e-15, 1.0 - 1e-15);
+                valLossSum -= (actual * std::log(pred) + (1.0 - actual) * std::log(1.0 - pred));
+            } else {
+                valLossSum += (actual - pred) * (actual - pred);
+            }
+        }
+    }
+    double denom = static_cast<double>(valSize * m_layers.back().size);
+    return denom > 0 ? valLossSum / denom : 0.0;
 }
 
 std::vector<double> NeuralNet::predict(const std::vector<double>& inputValues) {
@@ -347,74 +384,7 @@ std::vector<double> NeuralNet::predict(const std::vector<double>& inputValues) {
     }
     return result;
 }
-
-bool NeuralNet::saveModel(const std::string& filename) const {
-    std::ofstream out(filename);
-    if (!out) return false;
-    
-    out << "SELDON_MODEL_V3\n";
-    out << topology.size() << "\n";
-    for (size_t t : topology) out << t << " ";
-    out << "\n";
-
-    // Activations
-    for (const auto& layer : m_layers) out << static_cast<int>(layer.activation) << " ";
-    out << "\n";
-
-    out << inputScales.size() << " " << outputScales.size() << "\n";
-    for (const auto& s : inputScales) out << s.min << " " << s.max << " ";
-    out << "\n";
-    for (const auto& s : outputScales) out << s.min << " " << s.max << " ";
-    out << "\n";
-
-    for (size_t l = 1; l < m_layers.size(); ++l) {
-        const auto& layer = m_layers[l];
-        for (double b : layer.biases) out << b << " ";
-        out << "\n";
-        for (double w : layer.weights) out << w << " ";
-        out << "\n";
-    }
-    return true;
-}
-
-bool NeuralNet::loadModel(const std::string& filename) {
-    std::ifstream in(filename);
-    if (!in) return false;
-
-    auto fail = [&in]() { return in.fail(); };
-
-    std::string version;
-    if (!(in >> version) || version != "SELDON_MODEL_V3") return false;
-
-    size_t topSize;
-    if (!(in >> topSize) || fail()) return false;
-    
-    topology.clear();
-    for (size_t i = 0; i < topSize; ++i) {
-        size_t t; if (!(in >> t) || fail()) return false;
-        topology.push_back(t);
-    }
-    
-    *this = NeuralNet(topology);
-
-    for (size_t i = 0; i < m_layers.size(); ++i) {
-        int act; if (!(in >> act) || fail()) return false;
-        m_layers[i].activation = static_cast<Activation>(act);
-    }
-
-    size_t inS, outS;
-    if (!(in >> inS >> outS) || fail()) return false;
-    inputScales.resize(inS);
-    for (size_t i = 0; i < inS; ++i) if (!(in >> inputScales[i].min >> inputScales[i].max) || fail()) return false;
-    outputScales.resize(outS);
-    for (size_t i = 0; i < outS; ++i) if (!(in >> outputScales[i].min >> outputScales[i].max) || fail()) return false;
-
-    for (size_t l = 1; l < m_layers.size(); ++l) {
-        for (size_t i = 0; i < m_layers[l].size; ++i) if (!(in >> m_layers[l].biases[i]) || fail()) return false;
-        for (size_t i = 0; i < m_layers[l].weights.size(); ++i) if (!(in >> m_layers[l].weights[i]) || fail()) return false;
-    }
-    return true;
-}
+// Textual save/load logic removed for V3. Refer to binary persistence.
 
 std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std::vector<double>>& X, 
                                                const std::vector<std::vector<double>>& Y,
@@ -464,9 +434,9 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
     return importances;
 }
 
-bool NeuralNet::saveModelBinary(const std::string& filename) const {
+void NeuralNet::saveModelBinary(const std::string& filename) const {
     std::ofstream out(filename, std::ios::binary);
-    if (!out) return false;
+    if (!out) throw Seldon::IOException("Could not open " + filename + " for writing");
 
     const char sig[] = "SELDON_BIN_V2";
     out.write(sig, sizeof(sig));
@@ -501,12 +471,11 @@ bool NeuralNet::saveModelBinary(const std::string& filename) const {
         for (double b : layer.biases) writeLE(out, b);
         for (double w : layer.weights) writeLE(out, w);
     }
-    return true;
 }
 
-bool NeuralNet::loadModelBinary(const std::string& filename) {
+void NeuralNet::loadModelBinary(const std::string& filename) {
     std::ifstream in(filename, std::ios::binary);
-    if (!in) return false;
+    if (!in) throw Seldon::IOException("Could not open " + filename + " for reading");
 
     char sigV2[sizeof("SELDON_BIN_V2")];
     in.read(sigV2, sizeof(sigV2));
@@ -548,43 +517,8 @@ bool NeuralNet::loadModelBinary(const std::string& filename) {
             for (double& b : layer.biases) readLE(in, b);
             for (double& w : layer.weights) readLE(in, w);
         }
-        return true;
+        return;
     } 
     
-    // Legacy support (best effort, assuming same endianness and 64-bit size_t)
-    in.seekg(0);
-    char sigV1[sizeof("SELDON_BIN_V1")];
-    in.read(sigV1, sizeof(sigV1));
-    if (std::string(sigV1) == "SELDON_BIN_V1") {
-        size_t topSize;
-        in.read(reinterpret_cast<char*>(&topSize), sizeof(topSize));
-        std::vector<size_t> top(topSize);
-        in.read(reinterpret_cast<char*>(top.data()), topSize * sizeof(size_t));
-
-        *this = NeuralNet(top);
-
-        for (size_t i = 0; i < m_layers.size(); ++i) {
-            int act;
-            in.read(reinterpret_cast<char*>(&act), sizeof(act));
-            m_layers[i].activation = static_cast<Activation>(act);
-        }
-
-        size_t inS, outS;
-        in.read(reinterpret_cast<char*>(&inS), sizeof(inS));
-        in.read(reinterpret_cast<char*>(&outS), sizeof(outS));
-        
-        inputScales.resize(inS);
-        if (inS > 0) in.read(reinterpret_cast<char*>(inputScales.data()), inS * sizeof(ScaleInfo));
-        outputScales.resize(outS);
-        if (outS > 0) in.read(reinterpret_cast<char*>(outputScales.data()), outS * sizeof(ScaleInfo));
-
-        for (size_t l = 1; l < m_layers.size(); ++l) {
-            auto& layer = m_layers[l];
-            in.read(reinterpret_cast<char*>(layer.biases.data()), layer.biases.size() * sizeof(double));
-            in.read(reinterpret_cast<char*>(layer.weights.data()), layer.weights.size() * sizeof(double));
-        }
-        return true;
-    }
-
-    return false;
+    throw Seldon::NeuralNetException("Unsupported or invalid binary model signature in " + filename);
 }

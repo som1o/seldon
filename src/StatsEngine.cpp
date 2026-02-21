@@ -2,7 +2,9 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#ifdef USE_OPENMP
 #include <omp.h>
+#endif
 
 ColumnStats StatsEngine::calculateStats(const std::vector<double>& col) {
     ColumnStats stats{0, 0, 0, 0, 0, 0};
@@ -62,7 +64,9 @@ std::vector<ColumnStats> StatsEngine::calculateFoundation(const Dataset& dataset
     size_t cols = dataset.getColCount();
     std::vector<ColumnStats> allStats(cols);
     
+    #ifdef USE_OPENMP
     #pragma omp parallel for
+    #endif
     for (size_t c = 0; c < cols; ++c) {
         allStats[c] = calculateStats(dataset.getColumns()[c]);
     }

@@ -24,6 +24,10 @@ void printUsage(const std::string& prog) {
               << "  --loss <mse|cross_entropy>       Manual neural net loss function override\n"
               << "  --verbose                        Enable detailed logs\n"
               << "  --batch                          Non-interactive mode\n"
+              << "  --target <col>                   Set target feature for prediction (default: last column)\n"
+              << "  --exclude <cols>                 Exclude columns from neural network inputs/targets\n"
+              << "  --hidden-nodes <val>             Override neural network hidden layer size\n"
+              << "  --chunked                        Enable out-of-core processing for large files\n"
               << "  --help                           Show this help message\n";
 }
 
@@ -40,6 +44,10 @@ struct SeldonConfig {
     Dataset::ImputationStrategy imputation = Dataset::ImputationStrategy::ZERO;
     bool batchMode = false;
     bool showHelp = false;
+    bool chunked = false;
+    std::string targetCol;
+    std::vector<std::string> excludedCols;
+    int hiddenNodesOverride = -1;
     std::optional<NeuralNet::LossFunction> lossOverride;
 };
 
@@ -108,6 +116,20 @@ SeldonConfig parseArguments(int argc, char* argv[]) {
             else if (loss == "cross_entropy") config.lossOverride = NeuralNet::LossFunction::CROSS_ENTROPY;
         } else if ((arg == "--output" || arg == "-o") && i + 1 < argc) {
             config.outputFilename = argv[++i];
+        } else if (arg == "--chunked") {
+            config.chunked = true;
+        } else if (arg == "--target" && i + 1 < argc) {
+            config.targetCol = argv[++i];
+        } else if (arg == "--exclude" && i + 1 < argc) {
+            std::string exList = argv[++i];
+            size_t pos = 0;
+            while ((pos = exList.find(',')) != std::string::npos) {
+                config.excludedCols.push_back(exList.substr(0, pos));
+                exList.erase(0, pos + 1);
+            }
+            if (!exList.empty()) config.excludedCols.push_back(exList);
+        } else if (arg == "--hidden-nodes" && i + 1 < argc) {
+            config.hiddenNodesOverride = std::stoi(argv[++i]);
         } else if (arg == "--help") {
             config.showHelp = true;
         } else {
@@ -128,10 +150,15 @@ int main(int argc, char* argv[]) {
 
     Dataset dataset(config.filename);
     try {
-        if (!dataset.load(config.skipMalformed, config.exhaustiveScan, config.imputation)) {
-            std::cerr << "[Agent Error] Failed to load dataset: " << config.filename << "\n";
-            return 1;
+        if (config.chunked) {
+             std::cout << "[Agent] Operating in Chunked Mode. Ingesting first 10k rows for metadata...\n";
+             dataset.loadChunk(0, 10000);
+        } else {
+             dataset.loadAuto(config.skipMalformed, config.exhaustiveScan, config.imputation);
         }
+    } catch (const Seldon::SeldonException& e) {
+        std::cerr << "[Agent Error] " << e.what() << "\n";
+        return 1;
     } catch (const std::exception& e) {
         std::cerr << "[Agent Exception] " << e.what() << "\n";
         return 1;
@@ -146,6 +173,32 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[Agent] Ingestion successful. Initiating Layer 1 analysis...\n";
 
+    auto allCols = dataset.getColumnNames();
+    std::vector<std::string> filteredCols;
+    std::vector<size_t> filteredIndices;
+
+    for (size_t i = 0; i < allCols.size(); ++i) {
+        if (std::find(config.excludedCols.begin(), config.excludedCols.end(), allCols[i]) == config.excludedCols.end()) {
+            filteredCols.push_back(allCols[i]);
+            filteredIndices.push_back(i);
+        }
+    }
+
+    if (filteredCols.empty()) {
+        std::cerr << "\n[Agent Error] All numeric columns were excluded. Terminating analytics sequence gracefully.\n";
+        return 1;
+    }
+
+    if (config.excludedCols.size() > 0 && config.verbose) {
+        std::cout << "[Agent] Filtered out " << config.excludedCols.size() << " column(s).\n";
+    }
+
+    // Since Seldon passes Dataset object, we'll keep the exclude check in StatsEngine and LogicEngine
+    // Wait, StatsEngine doesn't know about exclusions unless we filter it here or pass the indices.
+    // Instead, let's just make a sub-matrix of dataset columns for these operations. 
+    // Actually, Seldon's existing architecture passes Dataset& which doesn't support col subsetting easily.
+    // Let's filter the exclude list against correlation matrices and inputs below.
+    
     // Layer 1
     auto stats = StatsEngine::calculateFoundation(dataset);
     TerminalUI::printFoundationTable(dataset.getColumnNames(), stats);
@@ -200,15 +253,38 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[Agent] Initializing predictive modeling. Synthesizing Neural Topology...\n";
 
     // Layer 3 Synthesis
-    std::vector<size_t> targetIndices = {dataset.getColCount() - 1}; // Default target: last column
+    std::vector<size_t> targetIndices;
     std::vector<size_t> inputIndices;
-    std::string dependentVarName = dataset.getColumnNames().back();
+    std::string dependentVarName;
 
-    if (!mlrRegressions.empty()) {
+    if (!config.targetCol.empty()) {
+        dependentVarName = config.targetCol;
+        for (size_t i = 0; i < dataset.getColCount(); ++i) {
+            if (dataset.getColumnNames()[i] == dependentVarName) {
+                targetIndices.push_back(i); break;
+            }
+        }
+        if (targetIndices.empty()) {
+            std::cerr << "[Agent Error] Target column '" << config.targetCol << "' not found.\n";
+            return 1;
+        }
+    } else {
+        // Find last column that is NOT excluded
+        for (int i = dataset.getColCount() - 1; i >= 0; --i) {
+            if (std::find(config.excludedCols.begin(), config.excludedCols.end(), dataset.getColumnNames()[i]) == config.excludedCols.end()) {
+                dependentVarName = dataset.getColumnNames()[i];
+                targetIndices.push_back(i);
+                break;
+            }
+        }
+    }
+
+    if (!mlrRegressions.empty() && config.targetCol.empty()) {
         dependentVarName = mlrRegressions.front().dependentFeature;
         for (const auto& mlr : mlrRegressions) {
             if (mlr.rSquared > 0.45) { // Threshold for inclusion in aggregate architecture
                 for (const auto& feat : mlr.independentFeatures) {
+                    if (std::find(config.excludedCols.begin(), config.excludedCols.end(), feat) != config.excludedCols.end()) continue;
                     for (size_t i = 0; i < dataset.getColCount(); ++i) {
                         if (dataset.getColumnNames()[i] == feat) {
                             if (std::find(inputIndices.begin(), inputIndices.end(), i) == inputIndices.end()) {
@@ -230,6 +306,7 @@ int main(int argc, char* argv[]) {
 
     if (inputIndices.empty()) {
         for (const auto& reg : regressions) {
+            if (std::find(config.excludedCols.begin(), config.excludedCols.end(), reg.featureX) != config.excludedCols.end()) continue;
             for (size_t i = 0; i < dataset.getColCount(); ++i) {
                 if (dataset.getColumnNames()[i] == reg.featureX) {
                     if (std::find(inputIndices.begin(), inputIndices.end(), i) == inputIndices.end()) {
@@ -242,13 +319,33 @@ int main(int argc, char* argv[]) {
     }
 
     if (inputIndices.empty()) {
-        size_t limit = std::min(dataset.getColCount() - 1, static_cast<size_t>(3));
-        for(size_t i = 0; i < limit; ++i) inputIndices.push_back(i);
+        size_t limit = std::min(dataset.getColCount(), static_cast<size_t>(3));
+        for(size_t i = 0; i < dataset.getColCount() && inputIndices.size() < limit; ++i) {
+            if (std::find(config.excludedCols.begin(), config.excludedCols.end(), dataset.getColumnNames()[i]) == config.excludedCols.end() && 
+                std::find(targetIndices.begin(), targetIndices.end(), i) == targetIndices.end()) {
+                inputIndices.push_back(i);
+            }
+        }
     }
 
     size_t inputNodes = inputIndices.size();
     size_t outputNodes = targetIndices.size();
-    size_t hiddenNodes = inputNodes * 2 + 2; 
+    
+    // Advanced Topology Automation
+    size_t hiddenNodes;
+    if (config.hiddenNodesOverride > 0) {
+        hiddenNodes = static_cast<size_t>(config.hiddenNodesOverride);
+    } else {
+        if (inputNodes == 1) {
+            hiddenNodes = inputNodes + 2; 
+        } else {
+            // Scaled heuristic for complex feature sets: Geometric mean representation with a bias factor
+            size_t geoMean = static_cast<size_t>(std::round(std::sqrt(inputNodes * outputNodes)));
+            hiddenNodes = std::max(geoMean + 2, inputNodes + 1);
+            // Cap to prevent explosion on very large feature sets
+            if (hiddenNodes > 100) hiddenNodes = 100;
+        }
+    }
     
     std::cout << "        -> Target variable: " << dependentVarName << "\n";
 
@@ -291,7 +388,7 @@ int main(int argc, char* argv[]) {
     hp.learningRate = config.lr;
     hp.lrDecay = 0.5;
     hp.epochs = config.epochs;
-    hp.lrStepSize = hp.epochs / 3; // Decay every 1/3 of total epochs
+    hp.lrStepSize = std::max(size_t(1), hp.epochs / 3); // Decay every 1/3 of total epochs
     hp.batchSize = 16;
     hp.activation = NeuralNet::Activation::RELU;
     hp.outputActivation = NeuralNet::Activation::SIGMOID;
@@ -324,9 +421,53 @@ int main(int argc, char* argv[]) {
     hp.l2Lambda = 0.001;
 
     try {
-        nn.train(X_train, Y_train, hp, inputScales, outputScales);
-        nn.saveModel("seldon_model.json");
-
+        if (!config.chunked) {
+            nn.train(X_train, Y_train, hp, inputScales, outputScales);
+        } else {
+            std::cout << "[Agent] Starting Out-of-Core Chunked Training...\n";
+            dataset.openStream();
+            size_t chunkCount = 0;
+            // Train on initial metadata chunk
+            nn.train(X_train, Y_train, hp, inputScales, outputScales);
+            
+            // fetchNextChunk will read subsequent data
+            while (dataset.fetchNextChunk(10000)) {
+                chunkCount++;
+                std::cout << "\n[Agent] Processing Chunk " << chunkCount << "...\n";
+                // Prepare scaled data for this chunk
+                std::vector<std::vector<double>> chunk_X, chunk_Y;
+                const auto& cols = dataset.getColumns();
+                for (size_t r = 0; r < dataset.getRowCount(); ++r) {
+                    std::vector<double> xRow, yRow;
+                    for (size_t i = 0; i < inputIndices.size(); ++i) {
+                        double val = cols[inputIndices[i]][r];
+                        double range = inputScales[i].max - inputScales[i].min;
+                        if (range == 0) range = 1;
+                        xRow.push_back((val - inputScales[i].min) / range);
+                    }
+                    for (size_t i = 0; i < targetIndices.size(); ++i) {
+                        double val = cols[targetIndices[i]][r];
+                        double range = outputScales[i].max - outputScales[i].min;
+                        if (range == 0) range = 1;
+                        yRow.push_back((val - outputScales[i].min) / range);
+                    }
+                    chunk_X.push_back(xRow);
+                    chunk_Y.push_back(yRow);
+                }
+                
+                // Fine-tune on this chunk
+                NeuralNet::Hyperparameters chunkHp = hp;
+                chunkHp.epochs = std::max(size_t(1), hp.epochs / 10);
+                chunkHp.earlyStoppingPatience = 3;
+                
+                nn.train(chunk_X, chunk_Y, chunkHp, inputScales, outputScales);
+            }
+            dataset.closeStream();
+            std::cout << "\n[Agent] Out-of-Core Training Complete. Processed " << chunkCount << " additional chunks.\n";
+        }
+        std::cout << "[Agent] Saving trained matrices to binary file...\n";
+        nn.saveModelBinary("seldon_model.seldon");
+        std::cout << "[Agent] Neural structure preserved at 'seldon_model.seldon'.\n";
         std::cout << "[Agent] Calculating Feature Importance...\n";
         auto importance = nn.calculateFeatureImportance(X_train, Y_train);
         
@@ -341,8 +482,11 @@ int main(int argc, char* argv[]) {
             std::cout << "        - " << std::left << std::setw(20) << featureNames[i] 
                       << ": " << std::fixed << std::setprecision(2) << (importance[i] * 100.0) << "%\n";
         }
-    } catch (const std::exception& e) {
+    } catch (const Seldon::SeldonException& e) {
         std::cerr << "[Agent Error] Core synthesis failed: " << e.what() << "\n";
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "[Agent Exception] " << e.what() << "\n";
         return 1;
     }
     

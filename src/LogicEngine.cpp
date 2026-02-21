@@ -3,7 +3,9 @@
 #include <cmath>
 #include <iostream>
 #include <algorithm>
+#ifdef USE_OPENMP
 #include <omp.h>
+#endif
 
 std::vector<std::vector<double>> LogicEngine::calculateCorrelationMatrix(
     const Dataset& dataset, const std::vector<ColumnStats>& stats) 
@@ -13,7 +15,9 @@ std::vector<std::vector<double>> LogicEngine::calculateCorrelationMatrix(
 
     const auto& columns = dataset.getColumns();
 
+    #ifdef USE_OPENMP
     #pragma omp parallel for collapse(2)
+    #endif
     for (size_t i = 0; i < cols; ++i) {
         for (size_t j = 0; j < cols; ++j) {
             if (i >= j) continue; // Diagonal and symmetric handled
@@ -85,7 +89,9 @@ std::vector<RegressionResult> LogicEngine::performSimpleRegressions(
 {
     const auto& columns = dataset.getColumns();
     std::vector<RegressionResult> results(highCorrelations.size());
+    #ifdef USE_OPENMP
     #pragma omp parallel for
+    #endif
     for (size_t k = 0; k < highCorrelations.size(); ++k) {
         const auto& corr = highCorrelations[k];
         size_t idxX = 0, idxY = 0;
@@ -145,7 +151,9 @@ std::vector<MultipleRegressionResult> LogicEngine::performMultipleRegressions(
     const auto& names = dataset.getColumnNames();
     const auto& columns = dataset.getColumns();
 
+    #ifdef USE_OPENMP
     #pragma omp parallel for
+    #endif
     for (size_t i = 0; i < cols; ++i) {
         std::vector<size_t> independentIndices;
         for (size_t j = 0; j < cols; ++j) {

@@ -50,23 +50,17 @@ public:
                                                    const std::vector<std::vector<double>>& Y,
                                                    size_t trials = 5);
 
-    // Model Persistence (includes scaling parameters)
-    bool saveModel(const std::string& filename) const;
-    bool loadModel(const std::string& filename);
-
     /**
      * @brief Saves the current model state (weights, biases, and scale info) to a binary file.
      * @param filename Path to the output file.
-     * @return true if successful, false otherwise.
      */
-    bool saveModelBinary(const std::string& filename) const;
+    void saveModelBinary(const std::string& filename) const;
 
     /**
      * @brief Loads a model state from a binary file.
      * @param filename Path to the Seldon binary model file.
-     * @return true if successful, false otherwise.
      */
-    bool loadModelBinary(const std::string& filename);
+    void loadModelBinary(const std::string& filename);
 
 private:
     struct Layer {
@@ -93,6 +87,16 @@ private:
     
     double activate(double x, Activation act);
     double activateDerivative(double out, Activation act);
+
+    // Decomposition helpers for train
+    double runEpoch(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
+                    const std::vector<size_t>& indices, size_t trainSize, 
+                    const Hyperparameters& hp, double& currentLR, size_t& t_step);
+    double runBatch(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
+                     const std::vector<size_t>& indices, size_t batchStart, size_t batchEnd, 
+                     const Hyperparameters& hp, size_t& t_step);
+    double validate(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
+                    const std::vector<size_t>& indices, size_t trainSize, const Hyperparameters& hp);
 
     std::vector<Layer> m_layers;
     std::vector<size_t> topology;

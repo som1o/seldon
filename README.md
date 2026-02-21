@@ -53,6 +53,7 @@ Significance is computed via the regularized incomplete beta function. We avoid 
 | `--lr` | | Neural network learning rate | `0.02` |
 | `--impute` | | Missing value handling (`skip`, `zero`, `mean`, `median`) | `zero` |
 | `--output` | `-o` | Export findings to JSON/CSV | |
+| `--exclude` | | Comma-separated columns to exclude exclusively from Neural Network targets and inputs | |
 | `--batch` | | Non-interactive mode (auto-accept prompts) | `false` |
 | `--verbose` | | Enable detailed epoch-by-epoch logs | `false` |
 
