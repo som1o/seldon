@@ -16,15 +16,33 @@ struct CorrelationResult {
 struct RegressionResult {
     std::string featureX;
     std::string featureY;
-    double m; // slope
-    double c; // intercept
-    double r; // r-score
+    double m;             // slope
+    double c;             // intercept
+    double r;             // Pearson r
+    double rSquared;
+    double stdErrorM;     // Standard Error for slope
+    double tStatM;        // t-statistic for slope
+    double pValueM;       // p-value for slope
+    double confLowM;      // 95% Confidence Interval Low
+    double confHighM;     // 95% Confidence Interval High
 };
 
 struct MultipleRegressionResult {
     std::string dependentFeature;
     std::vector<std::string> independentFeatures;
     std::vector<double> coefficients; // [Intercept, b1, b2, ...]
+    std::vector<double> stdErrors;    // Standard errors for coefficients
+    std::vector<double> tStats;       // t-statistics for coefficients
+    std::vector<double> pValues;      // p-values for coefficients
+    double rSquared;
+    double adjustedRSquared;
+    double fStatistic;
+    double modelPValue;
+};
+
+struct Thresholds {
+    double bivariate;
+    double mlr;
 };
 
 class LogicEngine {
@@ -32,6 +50,8 @@ public:
     static std::vector<std::vector<double>> calculateCorrelationMatrix(
         const Dataset& dataset, 
         const std::vector<ColumnStats>& stats);
+
+    static Thresholds suggestThresholds(const std::vector<std::vector<double>>& matrix);
 
     static std::vector<CorrelationResult> findHighCorrelations(
         const Dataset& dataset, 

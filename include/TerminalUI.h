@@ -14,5 +14,6 @@ public:
     static void printMultipleRegressionFindings(const std::vector<MultipleRegressionResult>& mlrCorrelations);
 
     // Phase 3 display
-    static void printSynthesisReport(const std::vector<double>& syntheticOutput);
+    static void printNeuralNetInit(size_t inputs, size_t hidden, size_t outputs);
+    static void printSynthesisReport(const std::string& targetName, const std::vector<std::string>& inputNames, const std::vector<double>& syntheticOutput);
 };

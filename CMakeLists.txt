@@ -8,4 +8,9 @@ include_directories(include)
 
 file(GLOB SOURCES "src/*.cpp")
 
+# Find and enable OpenMP
+find_package(OpenMP REQUIRED)
+
+# Seldon Application
 add_executable(seldon ${SOURCES})
+target_link_libraries(seldon PUBLIC OpenMP::OpenMP_CXX)

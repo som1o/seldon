@@ -5,29 +5,83 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <cstdint>
+#include <cstring>
+
+namespace {
+    bool isLittleEndian() {
+        uint16_t number = 0x1;
+        char *numPtr = reinterpret_cast<char*>(&number);
+        return (numPtr[0] == 1);
+    }
+
+    template<typename T>
+    void swapEndian(T &val) {
+        char *ptr = reinterpret_cast<char*>(&val);
+        int size = sizeof(T);
+        for (int i = 0; i < size / 2; i++) {
+            std::swap(ptr[i], ptr[size - 1 - i]);
+        }
+    }
+
+    template<typename T>
+    void writeLE(std::ostream& out, T val) {
+        if (!isLittleEndian()) {
+            swapEndian(val);
+        }
+        out.write(reinterpret_cast<const char*>(&val), sizeof(T));
+    }
+
+    template<typename T>
+    void readLE(std::istream& in, T& val) {
+        in.read(reinterpret_cast<char*>(&val), sizeof(T));
+        if (!isLittleEndian()) {
+            swapEndian(val);
+        }
+    }
+}
 
 NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
     std::random_device rd;
-    std::mt19937 gen(rd());
+    rng.seed(rd());
     std::uniform_real_distribution<> dis(-0.5, 0.5);
 
     for (size_t l = 0; l < topology.size(); ++l) {
-        layers.push_back(std::vector<Neuron>());
-        size_t numOutputs = (l == topology.size() - 1) ? 0 : topology[l + 1];
+        Layer layer;
+        layer.size = topology[l];
+        layer.outputs.assign(layer.size, 0.0);
+        layer.biases.assign(layer.size, 0.0);
+        layer.gradients.assign(layer.size, 0.0);
+        layer.m_biases.assign(layer.size, 0.0);
+        layer.v_biases.assign(layer.size, 0.0);
+        layer.dropMask.assign(layer.size, false);
+        layer.activation = (l == topology.size() - 1) ? Activation::SIGMOID : Activation::RELU;
 
-        for (size_t n = 0; n < topology[l]; ++n) {
-            Neuron neuron;
-            neuron.outputVal = 0.0;
-            neuron.bias = dis(gen);
-            neuron.gradient = 0.0;
+        if (l > 0) {
+            size_t prevSize = topology[l - 1];
+            size_t weightCount = layer.size * prevSize;
             
-            for (size_t w = 0; w < numOutputs; ++w) {
-                neuron.weights.push_back(dis(gen));
-                neuron.m_weights.push_back(0.0);
-                neuron.v_weights.push_back(0.0);
+            // Xavier/He initialization based on activation
+            double stddev = 0.1;
+            if (layer.activation == Activation::RELU) {
+                stddev = std::sqrt(2.0 / prevSize); // He initialization
+            } else {
+                stddev = std::sqrt(1.0 / prevSize); // Xavier initialization
             }
-            layers.back().push_back(neuron);
+            
+            std::normal_distribution<> weightDis(0.0, stddev);
+            layer.weights.reserve(weightCount);
+            for (size_t i = 0; i < weightCount; ++i) {
+                layer.weights.push_back(weightDis(rng));
+            }
+
+            layer.m_weights.assign(weightCount, 0.0);
+            layer.v_weights.assign(weightCount, 0.0);
+            for (size_t i = 0; i < layer.size; ++i) {
+                layer.biases[i] = 0.01; // Small positive bias to prevent dead neurons
+            }
         }
+        m_layers.push_back(layer);
     }
 }
 
@@ -50,108 +104,135 @@ double NeuralNet::activateDerivative(double out, Activation act) {
 }
 
 void NeuralNet::feedForward(const std::vector<double>& inputValues, Activation act, Activation outputAct, bool isTraining, double dropoutRate) {
-    for (size_t i = 0; i < inputValues.size(); ++i) {
-        layers[0][i].outputVal = inputValues[i];
+    size_t inputSize = std::min(inputValues.size(), m_layers[0].size);
+    for (size_t i = 0; i < inputSize; ++i) {
+        m_layers[0].outputs[i] = inputValues[i];
     }
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
     std::uniform_real_distribution<> dis(0.0, 1.0);
 
-    for (size_t l = 1; l < layers.size(); ++l) {
-        std::vector<Neuron>& prevLayer = layers[l - 1];
-        bool isOutputLayer = (l == layers.size() - 1);
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        Layer& current = m_layers[l];
+        Layer& prev = m_layers[l - 1];
+        current.activation = (l == m_layers.size() - 1) ? outputAct : act;
 
-        for (size_t n = 0; n < layers[l].size(); ++n) {
-            double sum = 0.0;
-            for (size_t pn = 0; pn < prevLayer.size(); ++pn) {
-                sum += prevLayer[pn].outputVal * prevLayer[pn].weights[n];
+        #pragma omp parallel for
+        for (size_t n = 0; n < current.size; ++n) {
+            double sum = current.biases[n];
+            size_t weightOffset = n * prev.size;
+            #pragma omp simd reduction(+:sum)
+            for (size_t pn = 0; pn < prev.size; ++pn) {
+                sum += prev.outputs[pn] * current.weights[weightOffset + pn];
             }
             
-            double out = activate(sum + layers[l][n].bias, isOutputLayer ? outputAct : act);
+            double out = activate(sum, current.activation);
 
-            // Apply Dropout only on hidden layers during training
-            if (isTraining && !isOutputLayer && dropoutRate > 0.0) {
-                if (dis(gen) < dropoutRate) {
-                    layers[l][n].outputVal = 0.0;
-                    layers[l][n].dropMask = true;
+            if (isTraining && l < m_layers.size() - 1 && dropoutRate > 0.0) {
+                // Thread-local RNG to avoid critical section contention
+                static thread_local std::mt19937 t_rng(std::random_device{}());
+                std::uniform_real_distribution<> t_dis(0.0, 1.0);
+
+                if (t_dis(t_rng) < dropoutRate) {
+                    current.outputs[n] = 0.0;
+                    current.dropMask[n] = true;
                 } else {
-                    layers[l][n].outputVal = out / (1.0 - dropoutRate); // Inverted Dropout scaling
-                    layers[l][n].dropMask = false;
+                    current.outputs[n] = out / (1.0 - dropoutRate);
+                    current.dropMask[n] = false;
                 }
             } else {
-                layers[l][n].outputVal = out;
-                layers[l][n].dropMask = false;
+                current.outputs[n] = out;
+                current.dropMask[n] = false;
+            }
+        }
+    }
+}
+
+void NeuralNet::computeGradients(const std::vector<double>& targetValues, LossFunction loss) {
+    Layer& outputLayer = m_layers.back();
+    for (size_t n = 0; n < outputLayer.size; ++n) {
+        if (loss == LossFunction::CROSS_ENTROPY && outputLayer.activation == Activation::SIGMOID) {
+            // Simplified gradient for Cross-Entropy + Sigmoid
+            outputLayer.gradients[n] = outputLayer.outputs[n] - targetValues[n];
+        } else {
+            double delta = outputLayer.outputs[n] - targetValues[n]; // MSE Gradient
+            outputLayer.gradients[n] = delta * activateDerivative(outputLayer.outputs[n], outputLayer.activation);
+        }
+    }
+
+    #pragma omp parallel for
+    for (size_t l = m_layers.size() - 2; l > 0; --l) {
+        Layer& hidden = m_layers[l];
+        Layer& next = m_layers[l + 1];
+
+        for (size_t n = 0; n < hidden.size; ++n) {
+            if (hidden.dropMask[n]) {
+                hidden.gradients[n] = 0.0;
+                continue;
+            }
+            double dow = 0.0;
+            #pragma omp simd reduction(+:dow)
+            for (size_t nn = 0; nn < next.size; ++nn) {
+                dow += next.weights[nn * hidden.size + n] * next.gradients[nn];
+            }
+            hidden.gradients[n] = dow * activateDerivative(hidden.outputs[n], hidden.activation);
+        }
+    }
+}
+
+void NeuralNet::applyOptimization(const Hyperparameters& hp, size_t t_step) {
+    const double beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8;
+
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        Layer& current = m_layers[l];
+        Layer& prev = m_layers[l - 1];
+
+        #pragma omp parallel for
+        for (size_t n = 0; n < current.size; ++n) {
+            // Update Bias
+            double grad_bias = current.gradients[n];
+            if (hp.optimizer == Optimizer::ADAM) {
+                current.m_biases[n] = beta1 * current.m_biases[n] + (1.0 - beta1) * grad_bias;
+                current.v_biases[n] = beta2 * current.v_biases[n] + (1.0 - beta2) * grad_bias * grad_bias;
+                double m_hat = current.m_biases[n] / (1.0 - std::pow(beta1, t_step));
+                double v_hat = current.v_biases[n] / (1.0 - std::pow(beta2, t_step));
+                current.biases[n] -= hp.learningRate * (m_hat / (std::sqrt(v_hat) + epsilon));
+            } else {
+                current.biases[n] -= hp.learningRate * grad_bias;
+            }
+
+            size_t weightOffset = n * prev.size;
+            #pragma omp simd
+            for (size_t pn = 0; pn < prev.size; ++pn) {
+                double grad_w = current.gradients[n] * prev.outputs[pn];
+                grad_w += hp.l2Lambda * current.weights[weightOffset + pn]; // Weight decay scaling
+
+                if (hp.optimizer == Optimizer::ADAM) {
+                    current.m_weights[weightOffset + pn] = beta1 * current.m_weights[weightOffset + pn] + (1.0 - beta1) * grad_w;
+                    current.v_weights[weightOffset + pn] = beta2 * current.v_weights[weightOffset + pn] + (1.0 - beta2) * grad_w * grad_w;
+                    double m_hat = current.m_weights[weightOffset + pn] / (1.0 - std::pow(beta1, t_step));
+                    double v_hat = current.v_weights[weightOffset + pn] / (1.0 - std::pow(beta2, t_step));
+                    current.weights[weightOffset + pn] -= hp.learningRate * (m_hat / (std::sqrt(v_hat) + epsilon));
+                } else {
+                    current.weights[weightOffset + pn] -= hp.learningRate * grad_w;
+                }
             }
         }
     }
 }
 
 void NeuralNet::backpropagate(const std::vector<double>& targetValues, const Hyperparameters& hp, size_t t_step) {
-    std::vector<Neuron>& outputLayer = layers.back();
-    for (size_t n = 0; n < outputLayer.size(); ++n) {
-        double delta = targetValues[n] - outputLayer[n].outputVal;
-        outputLayer[n].gradient = delta * activateDerivative(outputLayer[n].outputVal, hp.outputActivation);
-    }
-
-    for (size_t l = layers.size() - 2; l > 0; --l) {
-        std::vector<Neuron>& hiddenLayer = layers[l];
-        std::vector<Neuron>& nextLayer = layers[l + 1];
-
-        for (size_t n = 0; n < hiddenLayer.size(); ++n) {
-            if (hiddenLayer[n].dropMask) {
-                hiddenLayer[n].gradient = 0.0;
-                continue;
-            }
-            double dow = 0.0;
-            for (size_t nn = 0; nn < nextLayer.size(); ++nn) {
-                dow += hiddenLayer[n].weights[nn] * nextLayer[nn].gradient;
-            }
-            hiddenLayer[n].gradient = dow * activateDerivative(hiddenLayer[n].outputVal, hp.activation);
-        }
-    }
-
-    // Adam Optimizer Constants
-    const double beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8;
-
-    for (size_t l = layers.size() - 1; l > 0; --l) {
-        std::vector<Neuron>& currentLayer = layers[l];
-        std::vector<Neuron>& prevLayer = layers[l - 1];
-
-        for (size_t n = 0; n < currentLayer.size(); ++n) {
-            // Update Bias
-            double grad_bias = currentLayer[n].gradient;
-            if (hp.optimizer == Optimizer::ADAM) {
-                currentLayer[n].m_bias = beta1 * currentLayer[n].m_bias + (1.0 - beta1) * grad_bias;
-                currentLayer[n].v_bias = beta2 * currentLayer[n].v_bias + (1.0 - beta2) * grad_bias * grad_bias;
-                double m_hat = currentLayer[n].m_bias / (1.0 - std::pow(beta1, t_step));
-                double v_hat = currentLayer[n].v_bias / (1.0 - std::pow(beta2, t_step));
-                currentLayer[n].bias += hp.learningRate * m_hat / (std::sqrt(v_hat) + epsilon);
-            } else {
-                currentLayer[n].bias += hp.learningRate * grad_bias;
-            }
-
-            for (size_t pn = 0; pn < prevLayer.size(); ++pn) {
-                double grad_w = currentLayer[n].gradient * prevLayer[pn].outputVal;
-                // L2 Regularization (Weight Decay)
-                grad_w += hp.l2Lambda * prevLayer[pn].weights[n];
-
-                if (hp.optimizer == Optimizer::ADAM) {
-                    prevLayer[pn].m_weights[n] = beta1 * prevLayer[pn].m_weights[n] + (1.0 - beta1) * grad_w;
-                    prevLayer[pn].v_weights[n] = beta2 * prevLayer[pn].v_weights[n] + (1.0 - beta2) * grad_w * grad_w;
-                    double m_hat = prevLayer[pn].m_weights[n] / (1.0 - std::pow(beta1, t_step));
-                    double v_hat = prevLayer[pn].v_weights[n] / (1.0 - std::pow(beta2, t_step));
-                    prevLayer[pn].weights[n] += hp.learningRate * m_hat / (std::sqrt(v_hat) + epsilon);
-                } else {
-                    prevLayer[pn].weights[n] += hp.learningRate * grad_w;
-                }
-            }
-        }
-    }
+    computeGradients(targetValues, hp.loss);
+    applyOptimization(hp, t_step);
 }
 
-void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, const Hyperparameters& hp) {
+void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
+                      const Hyperparameters& hp,
+                      const std::vector<ScaleInfo>& inScales,
+                      const std::vector<ScaleInfo>& outScales) 
+{
     if (X.empty()) return;
+    this->inputScales = inScales;
+    this->outputScales = outScales;
 
     size_t valSize = static_cast<size_t>(X.size() * hp.valSplit);
     size_t trainSize = X.size() - valSize;
@@ -162,9 +243,23 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
     double bestValLoss = 1e30;
     int patienceCounter = 0;
     size_t t_step = 0;
+    double currentLR = hp.learningRate;
 
     for (size_t epoch = 0; epoch < hp.epochs; ++epoch) {
-        std::shuffle(indices.begin(), indices.end(), std::random_device());
+        // Learning Rate Scheduling (Step Decay)
+        if (epoch > 0 && epoch % hp.lrStepSize == 0) {
+            currentLR *= hp.lrDecay;
+            if (hp.verbose) std::cout << "\n[Agent] Learning rate decayed to " << currentLR << "\n";
+        }
+
+        if (epoch % std::max(size_t(1), hp.epochs / 10) == 0) {
+            std::cout << "\r[Agent] Training Neural Lattice: [" << (epoch * 100 / hp.epochs) << "%] " << std::flush;
+        }
+        std::shuffle(indices.begin(), indices.end(), rng);
+
+        // Modify hp copy to pass the decaying LR
+        Hyperparameters currentHp = hp;
+        currentHp.learningRate = currentLR;
 
         double trainLoss = 0.0;
         for (size_t i = 0; i < trainSize; i += hp.batchSize) {
@@ -173,69 +268,111 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
 
             for (size_t b = i; b < currentBatchEnd; ++b) {
                 feedForward(X[indices[b]], hp.activation, hp.outputActivation, true, hp.dropoutRate);
-                backpropagate(Y[indices[b]], hp, t_step);
+                backpropagate(Y[indices[b]], currentHp, t_step);
 
                 for (size_t j = 0; j < Y[indices[b]].size(); ++j) {
-                    double diff = Y[indices[b]][j] - layers.back()[j].outputVal;
-                    trainLoss += diff * diff;
+                    double actual = Y[indices[b]][j];
+                    double pred = m_layers.back().outputs[j];
+                    if (hp.loss == LossFunction::CROSS_ENTROPY) {
+                        pred = std::clamp(pred, 1e-15, 1.0 - 1e-15);
+                        trainLoss -= (actual * std::log(pred) + (1.0 - actual) * std::log(1.0 - pred));
+                    } else {
+                        trainLoss += (actual - pred) * (actual - pred);
+                    }
                 }
             }
         }
 
         // Validation phase
-        double valLoss = 0.0;
+        double valLossSum = 0.0;
         if (valSize > 0) {
             for (size_t i = trainSize; i < X.size(); ++i) {
                 feedForward(X[indices[i]], hp.activation, hp.outputActivation, false);
                 for (size_t j = 0; j < Y[indices[i]].size(); ++j) {
-                    double diff = Y[indices[i]][j] - layers.back()[j].outputVal;
-                    valLoss += diff * diff;
+                    double actual = Y[indices[i]][j];
+                    double pred = m_layers.back().outputs[j];
+                    if (hp.loss == LossFunction::CROSS_ENTROPY) {
+                        pred = std::clamp(pred, 1e-15, 1.0 - 1e-15);
+                        valLossSum -= (actual * std::log(pred) + (1.0 - actual) * std::log(1.0 - pred));
+                    } else {
+                        valLossSum += (actual - pred) * (actual - pred);
+                    }
                 }
             }
-            valLoss /= valSize;
+            valLossSum /= (valSize * m_layers.back().size); 
         }
 
         if (hp.verbose && (epoch % std::max(size_t(1), hp.epochs / 10) == 0 || epoch == hp.epochs - 1)) {
-            std::cout << "[Epoch " << epoch << "] Train Loss: " << (trainLoss / trainSize) 
-                      << " | Val Loss: " << valLoss << std::endl;
+            double finalTrainLoss = trainLoss / (trainSize * m_layers.back().size);
+            std::cout << "[Epoch " << epoch << "] Train Loss: " << finalTrainLoss << " | Val Loss: " << valLossSum << std::endl;
         }
 
-        // Early Stopping
         if (valSize > 0) {
-            if (valLoss < bestValLoss) {
-                bestValLoss = valLoss;
+            if (valLossSum < (bestValLoss - hp.minDelta)) {
+                bestValLoss = valLossSum;
                 patienceCounter = 0;
             } else {
                 patienceCounter++;
                 if (patienceCounter >= hp.earlyStoppingPatience) {
-                    if (hp.verbose) std::cout << "Early stopping triggered at epoch " << epoch << std::endl;
+                    if (hp.verbose) std::cout << "\n[Agent] Early stopping triggered at epoch " << epoch << std::endl;
                     break;
                 }
             }
         }
     }
+    std::cout << "\r[Agent] Training Neural Lattice: [100%] Complete.          " << std::endl;
 }
 
 std::vector<double> NeuralNet::predict(const std::vector<double>& inputValues) {
-    feedForward(inputValues, Activation::RELU, Activation::SIGMOID, false); // Default RELU but usually load from saved model state
+    std::vector<double> scaledInput = inputValues;
+    if (!inputScales.empty() && inputScales.size() == inputValues.size()) {
+        for (size_t i = 0; i < inputValues.size(); ++i) {
+            double range = inputScales[i].max - inputScales[i].min;
+            if (range == 0) range = 1.0;
+            scaledInput[i] = (inputValues[i] - inputScales[i].min) / range;
+        }
+    }
+
+    feedForward(scaledInput, m_layers[1].activation, m_layers.back().activation, false);
+    
     std::vector<double> result;
-    for (auto& n : layers.back()) result.push_back(n.outputVal);
+    for (size_t i = 0; i < m_layers.back().size; ++i) {
+        double val = m_layers.back().outputs[i];
+        if (!outputScales.empty() && i < outputScales.size()) {
+            double range = outputScales[i].max - outputScales[i].min;
+            if (range == 0) range = 1.0;
+            val = val * range + outputScales[i].min;
+        }
+        result.push_back(val);
+    }
     return result;
 }
 
 bool NeuralNet::saveModel(const std::string& filename) const {
     std::ofstream out(filename);
     if (!out) return false;
+    
+    out << "SELDON_MODEL_V3\n";
     out << topology.size() << "\n";
     for (size_t t : topology) out << t << " ";
     out << "\n";
 
-    for (const auto& layer : layers) {
-        for (const auto& neuron : layer) {
-            out << neuron.bias << " ";
-            for (double w : neuron.weights) out << w << " ";
-            out << "\n";
-        }
+    // Activations
+    for (const auto& layer : m_layers) out << static_cast<int>(layer.activation) << " ";
+    out << "\n";
+
+    out << inputScales.size() << " " << outputScales.size() << "\n";
+    for (const auto& s : inputScales) out << s.min << " " << s.max << " ";
+    out << "\n";
+    for (const auto& s : outputScales) out << s.min << " " << s.max << " ";
+    out << "\n";
+
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        const auto& layer = m_layers[l];
+        for (double b : layer.biases) out << b << " ";
+        out << "\n";
+        for (double w : layer.weights) out << w << " ";
+        out << "\n";
     }
     return true;
 }
@@ -243,21 +380,211 @@ bool NeuralNet::saveModel(const std::string& filename) const {
 bool NeuralNet::loadModel(const std::string& filename) {
     std::ifstream in(filename);
     if (!in) return false;
+
+    auto fail = [&in]() { return in.fail(); };
+
+    std::string version;
+    if (!(in >> version) || version != "SELDON_MODEL_V3") return false;
+
     size_t topSize;
-    in >> topSize;
+    if (!(in >> topSize) || fail()) return false;
+    
     topology.clear();
     for (size_t i = 0; i < topSize; ++i) {
-        size_t t; in >> t; topology.push_back(t);
+        size_t t; if (!(in >> t) || fail()) return false;
+        topology.push_back(t);
     }
     
-    // Re-init with correct topology
     *this = NeuralNet(topology);
 
-    for (auto& layer : layers) {
-        for (auto& neuron : layer) {
-            in >> neuron.bias;
-            for (double& w : neuron.weights) in >> w;
-        }
+    for (size_t i = 0; i < m_layers.size(); ++i) {
+        int act; if (!(in >> act) || fail()) return false;
+        m_layers[i].activation = static_cast<Activation>(act);
+    }
+
+    size_t inS, outS;
+    if (!(in >> inS >> outS) || fail()) return false;
+    inputScales.resize(inS);
+    for (size_t i = 0; i < inS; ++i) if (!(in >> inputScales[i].min >> inputScales[i].max) || fail()) return false;
+    outputScales.resize(outS);
+    for (size_t i = 0; i < outS; ++i) if (!(in >> outputScales[i].min >> outputScales[i].max) || fail()) return false;
+
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        for (size_t i = 0; i < m_layers[l].size; ++i) if (!(in >> m_layers[l].biases[i]) || fail()) return false;
+        for (size_t i = 0; i < m_layers[l].weights.size(); ++i) if (!(in >> m_layers[l].weights[i]) || fail()) return false;
     }
     return true;
+}
+
+std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std::vector<double>>& X, 
+                                               const std::vector<std::vector<double>>& Y,
+                                               size_t trials) {
+    if (X.empty() || Y.empty() || X.size() != Y.size()) return {};
+    size_t numFeatures = X[0].size();
+    std::vector<double> importances(numFeatures, 0.0);
+
+    // Calculate baseline error (MSE)
+    auto getError = [&](const std::vector<std::vector<double>>& dataX) {
+        double totalError = 0.0;
+        for (size_t i = 0; i < dataX.size(); ++i) {
+            auto p = predict(dataX[i]);
+            for (size_t j = 0; j < p.size(); ++j) {
+                double diff = p[j] - Y[i][j];
+                totalError += diff * diff;
+            }
+        }
+        return totalError / (dataX.size() * Y[0].size());
+    };
+
+    double baselineError = getError(X);
+
+    for (size_t f = 0; f < numFeatures; ++f) {
+        double featureErrorSum = 0.0;
+        for (size_t t = 0; t < trials; ++t) {
+            std::vector<std::vector<double>> shuffledX = X;
+            std::vector<double> featureVals;
+            for (const auto& row : X) featureVals.push_back(row[f]);
+            std::shuffle(featureVals.begin(), featureVals.end(), rng);
+            for (size_t i = 0; i < X.size(); ++i) shuffledX[i][f] = featureVals[i];
+            
+            featureErrorSum += getError(shuffledX);
+        }
+        // Importance = how much error increased when feature was destroyed
+        importances[f] = (featureErrorSum / (double)trials) - baselineError;
+        if (importances[f] < 0) importances[f] = 0; // Clip noise
+    }
+
+    // Normalize to percentages
+    double sum = 0;
+    for (double v : importances) sum += v;
+    if (sum > 0) {
+        for (double& v : importances) v /= sum;
+    }
+
+    return importances;
+}
+
+bool NeuralNet::saveModelBinary(const std::string& filename) const {
+    std::ofstream out(filename, std::ios::binary);
+    if (!out) return false;
+
+    const char sig[] = "SELDON_BIN_V2";
+    out.write(sig, sizeof(sig));
+
+    uint64_t topSize = static_cast<uint64_t>(topology.size());
+    writeLE(out, topSize);
+    for (size_t t : topology) {
+        writeLE(out, static_cast<uint64_t>(t));
+    }
+
+    for (const auto& layer : m_layers) {
+        int32_t act = static_cast<int32_t>(layer.activation);
+        writeLE(out, act);
+    }
+
+    uint64_t inS = static_cast<uint64_t>(inputScales.size());
+    uint64_t outS = static_cast<uint64_t>(outputScales.size());
+    writeLE(out, inS);
+    writeLE(out, outS);
+    
+    for (const auto& s : inputScales) {
+        writeLE(out, s.min);
+        writeLE(out, s.max);
+    }
+    for (const auto& s : outputScales) {
+        writeLE(out, s.min);
+        writeLE(out, s.max);
+    }
+
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        const auto& layer = m_layers[l];
+        for (double b : layer.biases) writeLE(out, b);
+        for (double w : layer.weights) writeLE(out, w);
+    }
+    return true;
+}
+
+bool NeuralNet::loadModelBinary(const std::string& filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) return false;
+
+    char sigV2[sizeof("SELDON_BIN_V2")];
+    in.read(sigV2, sizeof(sigV2));
+    if (std::string(sigV2) == "SELDON_BIN_V2") {
+        uint64_t topSize;
+        readLE(in, topSize);
+        std::vector<size_t> top(topSize);
+        for (uint64_t i = 0; i < topSize; ++i) {
+            uint64_t val;
+            readLE(in, val);
+            top[i] = static_cast<size_t>(val);
+        }
+
+        *this = NeuralNet(top);
+
+        for (size_t i = 0; i < m_layers.size(); ++i) {
+            int32_t act;
+            readLE(in, act);
+            m_layers[i].activation = static_cast<Activation>(act);
+        }
+
+        uint64_t inS, outS;
+        readLE(in, inS);
+        readLE(in, outS);
+        
+        inputScales.resize(inS);
+        for (uint64_t i = 0; i < inS; ++i) {
+            readLE(in, inputScales[i].min);
+            readLE(in, inputScales[i].max);
+        }
+        outputScales.resize(outS);
+        for (uint64_t i = 0; i < outS; ++i) {
+            readLE(in, outputScales[i].min);
+            readLE(in, outputScales[i].max);
+        }
+
+        for (size_t l = 1; l < m_layers.size(); ++l) {
+            auto& layer = m_layers[l];
+            for (double& b : layer.biases) readLE(in, b);
+            for (double& w : layer.weights) readLE(in, w);
+        }
+        return true;
+    } 
+    
+    // Legacy support (best effort, assuming same endianness and 64-bit size_t)
+    in.seekg(0);
+    char sigV1[sizeof("SELDON_BIN_V1")];
+    in.read(sigV1, sizeof(sigV1));
+    if (std::string(sigV1) == "SELDON_BIN_V1") {
+        size_t topSize;
+        in.read(reinterpret_cast<char*>(&topSize), sizeof(topSize));
+        std::vector<size_t> top(topSize);
+        in.read(reinterpret_cast<char*>(top.data()), topSize * sizeof(size_t));
+
+        *this = NeuralNet(top);
+
+        for (size_t i = 0; i < m_layers.size(); ++i) {
+            int act;
+            in.read(reinterpret_cast<char*>(&act), sizeof(act));
+            m_layers[i].activation = static_cast<Activation>(act);
+        }
+
+        size_t inS, outS;
+        in.read(reinterpret_cast<char*>(&inS), sizeof(inS));
+        in.read(reinterpret_cast<char*>(&outS), sizeof(outS));
+        
+        inputScales.resize(inS);
+        if (inS > 0) in.read(reinterpret_cast<char*>(inputScales.data()), inS * sizeof(ScaleInfo));
+        outputScales.resize(outS);
+        if (outS > 0) in.read(reinterpret_cast<char*>(outputScales.data()), outS * sizeof(ScaleInfo));
+
+        for (size_t l = 1; l < m_layers.size(); ++l) {
+            auto& layer = m_layers[l];
+            in.read(reinterpret_cast<char*>(layer.biases.data()), layer.biases.size() * sizeof(double));
+            in.read(reinterpret_cast<char*>(layer.weights.data()), layer.weights.size() * sizeof(double));
+        }
+        return true;
+    }
+
+    return false;
 }

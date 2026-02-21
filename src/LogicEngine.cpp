@@ -2,6 +2,8 @@
 #include "MathUtils.h"
 #include <cmath>
 #include <iostream>
+#include <algorithm>
+#include <omp.h>
 
 std::vector<std::vector<double>> LogicEngine::calculateCorrelationMatrix(
     const Dataset& dataset, const std::vector<ColumnStats>& stats) 
@@ -11,14 +13,44 @@ std::vector<std::vector<double>> LogicEngine::calculateCorrelationMatrix(
 
     const auto& columns = dataset.getColumns();
 
+    #pragma omp parallel for collapse(2)
     for (size_t i = 0; i < cols; ++i) {
-        for (size_t j = i + 1; j < cols; ++j) {
-            double r = MathUtils::calculatePearson(columns[i], columns[j], stats[i], stats[j]);
+        for (size_t j = 0; j < cols; ++j) {
+            if (i >= j) continue; // Diagonal and symmetric handled
+            auto r_opt = MathUtils::calculatePearson(columns[i], columns[j], stats[i], stats[j]);
+            double r = r_opt.value_or(std::numeric_limits<double>::quiet_NaN());
             matrix[i][j] = r;
             matrix[j][i] = r; // symmetric
         }
     }
     return matrix;
+}
+
+Thresholds LogicEngine::suggestThresholds(const std::vector<std::vector<double>>& matrix) {
+    size_t cols = matrix.size();
+    std::vector<double> rValues;
+    for (size_t i = 0; i < cols; ++i) {
+        for (size_t j = i + 1; j < cols; ++j) {
+            rValues.push_back(std::abs(matrix[i][j]));
+        }
+    }
+
+    if (rValues.empty()) return {0.6, 0.5};
+
+    double sum = 0;
+    for (double v : rValues) sum += v;
+    double mean = sum / rValues.size();
+
+    double sq_sum = 0;
+    for (double v : rValues) sq_sum += (v - mean) * (v - mean);
+    double stdev = std::sqrt(sq_sum / rValues.size());
+
+    // Heuristic: Use Mean + 1 StdDev for Bivariate, Mean + 0.5 StdDev for MLR
+    // Clamp to reasonable ranges
+    double biv = std::clamp(mean + stdev, 0.3, 0.85);
+    double mlr = std::clamp(mean + 0.5 * stdev, 0.25, 0.7);
+
+    return {biv, mlr};
 }
 
 std::vector<CorrelationResult> LogicEngine::findHighCorrelations(
@@ -47,76 +79,124 @@ std::vector<CorrelationResult> LogicEngine::findHighCorrelations(
 }
 
 std::vector<RegressionResult> LogicEngine::performSimpleRegressions(
-    const Dataset& dataset, const std::vector<ColumnStats>& stats, const std::vector<CorrelationResult>& highCorrelations)
+    const Dataset& dataset, 
+    const std::vector<ColumnStats>& stats,
+    const std::vector<CorrelationResult>& highCorrelations) 
 {
-    std::vector<RegressionResult> results;
-    const auto& names = dataset.getColumnNames();
-    size_t cols = names.size();
-
-    // Map feature name to index (inefficient but readable for prototype)
-    auto getIndex = [&names](const std::string& name) -> size_t {
-        for (size_t i = 0; i < names.size(); ++i) {
-            if (names[i] == name) return i;
-        }
-        return 0; // should throw ideally
-    };
-
     const auto& columns = dataset.getColumns();
+    std::vector<RegressionResult> results(highCorrelations.size());
+    #pragma omp parallel for
+    for (size_t k = 0; k < highCorrelations.size(); ++k) {
+        const auto& corr = highCorrelations[k];
+        size_t idxX = 0, idxY = 0;
+        for (size_t i = 0; i < dataset.getColCount(); ++i) {
+            if (dataset.getColumnNames()[i] == corr.feature1) idxX = i;
+            if (dataset.getColumnNames()[i] == corr.feature2) idxY = i;
+        }
 
-    for (const auto& corr : highCorrelations) {
-        size_t idxX = getIndex(corr.feature1);
-        size_t idxY = getIndex(corr.feature2);
+        auto params = MathUtils::simpleLinearRegression(columns[idxX], columns[idxY], stats[idxX], stats[idxY], corr.r);
+        
+        RegressionResult res;
+        res.featureX = corr.feature1;
+        res.featureY = corr.feature2;
+        res.m = params.first;
+        res.c = params.second;
+        res.r = corr.r;
+        res.rSquared = corr.r * corr.r;
 
-        auto line = MathUtils::simpleLinearRegression(columns[idxX], columns[idxY], stats[idxX], stats[idxY], corr.r);
-        results.push_back({corr.feature1, corr.feature2, line.first, line.second, corr.r});
+        // Diagnostics
+        size_t n = dataset.getRowCount();
+        if (n > 2) {
+            double rss = 0;
+            for (size_t i = 0; i < n; ++i) {
+                double y_pred = res.m * columns[idxX][i] + res.c;
+                double diff = columns[idxY][i] - y_pred;
+                rss += diff * diff;
+            }
+            
+            double s2 = rss / (n - 2);
+            double varX_sum = (n - 1) * stats[idxX].variance;
+            
+            if (varX_sum > 0) {
+                res.stdErrorM = std::sqrt(s2 / varX_sum);
+                res.tStatM = res.m / res.stdErrorM;
+                res.pValueM = MathUtils::getPValueFromT(res.tStatM, n - 2);
+                
+                double tCrit = MathUtils::getCriticalT(0.05, n - 2);
+                res.confLowM = res.m - tCrit * res.stdErrorM;
+                res.confHighM = res.m + tCrit * res.stdErrorM;
+            } else {
+                res.stdErrorM = 0; res.tStatM = 0; res.pValueM = 1.0;
+                res.confLowM = res.m; res.confHighM = res.m;
+            }
+        }
+        results[k] = res;
     }
-
     return results;
 }
 
 std::vector<MultipleRegressionResult> LogicEngine::performMultipleRegressions(
-    const Dataset& dataset, const std::vector<std::vector<double>>& matrix, double threshold)
+    const Dataset& dataset,
+    const std::vector<std::vector<double>>& matrix,
+    double threshold) 
 {
-    std::vector<MultipleRegressionResult> mlr_results;
+    std::vector<MultipleRegressionResult> results;
+    size_t cols = dataset.getColCount();
     const auto& names = dataset.getColumnNames();
-    size_t cols = names.size();
-    size_t rows = dataset.getRowCount();
+    const auto& columns = dataset.getColumns();
 
-    // Naive Agentic Selection for prototype: 
-    // Pick the most correlated variable as Y, use others > threshold as X.
-    for (size_t yIdx = 0; yIdx < cols; ++yIdx) {
-        std::vector<size_t> xIndices;
-        for (size_t xIdx = 0; xIdx < cols; ++xIdx) {
-            if (xIdx != yIdx && std::abs(matrix[yIdx][xIdx]) >= threshold) {
-                xIndices.push_back(xIdx);
+    #pragma omp parallel for
+    for (size_t i = 0; i < cols; ++i) {
+        std::vector<size_t> independentIndices;
+        for (size_t j = 0; j < cols; ++j) {
+            if (i == j) continue;
+            if (std::abs(matrix[i][j]) >= threshold) {
+                independentIndices.push_back(j);
             }
         }
 
-        if (xIndices.size() > 1) { // Needs at least 2 independents for MLR
-            MathUtils::Matrix X(rows, xIndices.size() + 1); // +1 for intercept
-            MathUtils::Matrix Y(rows, 1);
+        if (independentIndices.empty()) continue;
 
-            std::vector<std::string> indepNames;
-            for (auto xI : xIndices) indepNames.push_back(names[xI]);
+        size_t n = dataset.getRowCount();
+        MathUtils::Matrix X(n, independentIndices.size() + 1);
+        MathUtils::Matrix Y(n, 1);
 
-            const auto& columns = dataset.getColumns();
-
-            for (size_t r = 0; r < rows; ++r) {
-                Y.data[r][0] = columns[yIdx][r];
-                X.data[r][0] = 1.0; // Intercept column
-                for (size_t c = 0; c < xIndices.size(); ++c) {
-                    X.data[r][c + 1] = columns[xIndices[c]][r];
-                }
+        for (size_t r = 0; r < n; ++r) {
+            X.data[r][0] = 1.0; // Intercept
+            for (size_t c = 0; c < independentIndices.size(); ++c) {
+                X.data[r][c + 1] = columns[independentIndices[c]][r];
             }
+            Y.data[r][0] = columns[i][r];
+        }
 
-            std::vector<double> beta = MathUtils::multipleLinearRegression(X, Y);
-            if (!beta.empty()) {
-                mlr_results.push_back({names[yIdx], indepNames, beta});
-            } else {
-                std::cout << "        [Agent Protection] Multi-variable cluster for " << names[yIdx] 
-                          << " contains collinear/singular matrices. MLR aborted gracefully.\n";
-            }
+        auto diag = MathUtils::performMLRWithDiagnostics(X, Y);
+        if (diag.success) {
+            MultipleRegressionResult res;
+            res.dependentFeature = names[i];
+            for (size_t idx : independentIndices) res.independentFeatures.push_back(names[idx]);
+            res.coefficients = diag.coefficients;
+            res.stdErrors = diag.stdErrors;
+            res.tStats = diag.tStats;
+            res.pValues = diag.pValues;
+            res.rSquared = diag.rSquared;
+            res.adjustedRSquared = diag.adjustedRSquared;
+            res.fStatistic = diag.fStatistic;
+            res.modelPValue = diag.modelPValue;
+            
+            #pragma omp critical
+            results.push_back(res);
+        } else {
+            // Log a message if MLR fails for a particular combination
+            #pragma omp critical
+            std::cout << "        [Agent Protection] Multi-variable cluster for " << names[i] 
+                      << " contains collinear/singular matrices. MLR aborted gracefully.\n";
         }
     }
-    return mlr_results;
+
+    // Sort by Adjusted R-Squared descending
+    std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
+        return a.adjustedRSquared > b.adjustedRSquared;
+    });
+
+    return results;
 }
