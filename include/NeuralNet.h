@@ -79,7 +79,7 @@ private:
         Activation activation; // Per-layer activation
     };
 
-    void feedForward(const std::vector<double>& inputValues, Activation act, Activation outputAct, bool isTraining, double dropoutRate = 0.0);
+    void feedForward(const std::vector<double>& inputValues, bool isTraining, double dropoutRate = 0.0);
     void backpropagate(const std::vector<double>& targetValues, const Hyperparameters& hp, size_t t_step);
     
     void computeGradients(const std::vector<double>& targetValues, LossFunction loss);

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <iostream>
 #include <algorithm>
+#include <limits>
 #ifdef USE_OPENMP
 #include <omp.h>
 #endif
@@ -94,21 +95,34 @@ std::vector<RegressionResult> LogicEngine::performSimpleRegressions(
     #endif
     for (size_t k = 0; k < highCorrelations.size(); ++k) {
         const auto& corr = highCorrelations[k];
-        size_t idxX = 0, idxY = 0;
+        size_t idxX = dataset.getColCount(), idxY = dataset.getColCount();
         for (size_t i = 0; i < dataset.getColCount(); ++i) {
             if (dataset.getColumnNames()[i] == corr.feature1) idxX = i;
             if (dataset.getColumnNames()[i] == corr.feature2) idxY = i;
         }
 
-        auto params = MathUtils::simpleLinearRegression(columns[idxX], columns[idxY], stats[idxX], stats[idxY], corr.r);
-        
-        RegressionResult res;
+        RegressionResult res{};
         res.featureX = corr.feature1;
         res.featureY = corr.feature2;
-        res.m = params.first;
-        res.c = params.second;
         res.r = corr.r;
         res.rSquared = corr.r * corr.r;
+        res.m = 0.0;
+        res.c = 0.0;
+        res.stdErrorM = 0.0;
+        res.tStatM = 0.0;
+        res.pValueM = 1.0;
+        res.confLowM = 0.0;
+        res.confHighM = 0.0;
+
+        if (idxX >= dataset.getColCount() || idxY >= dataset.getColCount()) {
+            results[k] = res;
+            continue;
+        }
+
+        auto params = MathUtils::simpleLinearRegression(columns[idxX], columns[idxY], stats[idxX], stats[idxY], corr.r);
+
+        res.m = params.first;
+        res.c = params.second;
 
         // Diagnostics
         size_t n = dataset.getRowCount();
@@ -125,8 +139,13 @@ std::vector<RegressionResult> LogicEngine::performSimpleRegressions(
             
             if (varX_sum > 0) {
                 res.stdErrorM = std::sqrt(s2 / varX_sum);
-                res.tStatM = res.m / res.stdErrorM;
-                res.pValueM = MathUtils::getPValueFromT(res.tStatM, n - 2);
+                if (res.stdErrorM > 0) {
+                    res.tStatM = res.m / res.stdErrorM;
+                    res.pValueM = MathUtils::getPValueFromT(res.tStatM, n - 2);
+                } else {
+                    res.tStatM = 0.0;
+                    res.pValueM = 1.0;
+                }
                 
                 double tCrit = MathUtils::getCriticalT(0.05, n - 2);
                 res.confLowM = res.m - tCrit * res.stdErrorM;

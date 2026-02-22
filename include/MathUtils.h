@@ -1,14 +1,7 @@
 #pragma once
 #include <vector>
 #include <string>
-#include <stdexcept>
 #include <optional>
-
-// Custom Exception for Seldon Engine
-class SeldonException : public std::runtime_error {
-public:
-    explicit SeldonException(const std::string& message) : std::runtime_error(message) {}
-};
 
 // Forward declarations to avoid complex circular includes where possible
 struct ColumnStats;

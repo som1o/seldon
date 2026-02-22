@@ -11,6 +11,7 @@ Seldon is a high-performance, agent-driven Command Line Interface (CLI) analytic
 The Seldon Engine has been completely modernized to handle massive datasets and professional workflows:
 
 - **Extreme Scalability**: Core engines (Stats, Logic, Neural) are now multi-threaded via **OpenMP** and utilize **SIMD vectorization** for high-throughput arithmetic.
+- **Robust CSV Ingestion**: Stateful parser supports quoted/multiline fields, escaped quotes (`""`), BOM handling, malformed-record isolation, duplicate/empty header normalization, and finite-only numeric decoding.
 - **Mathematical Rigor**: Replaced numerical integration with **Lentz's method for Continued Fractions** in `betainc`, providing high-precision p-values for extreme correlations and sample sizes.
 - **Deep Regression Diagnostics**:
   - **Simple Linear**: Standard Errors, t-stats, p-values, and 95% Confidence Intervals.
@@ -25,6 +26,7 @@ The Seldon Engine has been completely modernized to handle massive datasets and 
 ## 🧭 The Seldon Workflow: A Typical Session
 
 1.  **Ingestion & Scouring**: Seldon scours your CSV for numerical density, identifying features with real analytical signal. Real-time progress indicators track ingestion status.
+  - Malformed quoted records are detected and either skipped or surfaced immediately (based on CLI strictness).
 2.  **The Foundation Summary**: View Skewness, Kurtosis, and basic moments in a dynamically formatted, adaptive terminal table.
 3.  **The Bivariate Pivot**: Seldon identifies statistically significant relationships (|r| > threshold, p < 0.05). Findings are presented with full diagnostic payloads.
 4.  **The Predictive Synthesis**: Authorization triggers the neural lattice training. Watch convergence in real-time as the engine detects whether to use MSE for regression or Cross-Entropy for classification.
@@ -52,6 +54,7 @@ Significance is computed via the regularized incomplete beta function. We avoid 
 | `--epochs` | | Neural network training epochs | `300` |
 | `--lr` | | Neural network learning rate | `0.02` |
 | `--impute` | | Missing value handling (`skip`, `zero`, `mean`, `median`) | `zero` |
+| `--delimiter` | | CSV delimiter character (for example `;` or `\t`) | `,` |
 | `--output` | `-o` | Export findings to JSON/CSV | |
 | `--exclude` | | Comma-separated columns to exclude exclusively from Neural Network targets and inputs | |
 | `--batch` | | Non-interactive mode (auto-accept prompts) | `false` |
@@ -62,6 +65,12 @@ Significance is computed via the regularized incomplete beta function. We avoid 
 ## 📝 Model Persistence & Export
 
 Seldon supports high-performance binary storage and structured result exports for integration with Python/R dashboards.
+
+Binary model files include:
+- Signature and explicit format version
+- Topology and activation metadata
+- Scale metadata and parameter tensors
+- Endianness-safe encoding and trailing checksum integrity verification
 
 ```bash
 # Analyze a dataset and export findings to JSON

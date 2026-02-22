@@ -10,10 +10,30 @@
 #include "SeldonExceptions.h"
 
 namespace {
+    constexpr uint32_t kModelFormatVersion = 3;
+    constexpr uint64_t kChecksumOffsetBasis = 1469598103934665603ULL;
+    constexpr uint64_t kChecksumPrime = 1099511628211ULL;
+
+    template<typename T>
+    void swapEndian(T &val);
+
     bool isLittleEndian() {
         uint16_t number = 0x1;
         char *numPtr = reinterpret_cast<char*>(&number);
         return (numPtr[0] == 1);
+    }
+
+    template<typename T>
+    void updateChecksum(uint64_t& checksum, const T& value) {
+        T copy = value;
+        if (!isLittleEndian()) {
+            swapEndian(copy);
+        }
+        const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&copy);
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            checksum ^= static_cast<uint64_t>(bytes[i]);
+            checksum *= kChecksumPrime;
+        }
     }
 
     template<typename T>
@@ -31,11 +51,17 @@ namespace {
             swapEndian(val);
         }
         out.write(reinterpret_cast<const char*>(&val), sizeof(T));
+        if (!out) {
+            throw Seldon::IOException("Binary write failed");
+        }
     }
 
     template<typename T>
     void readLE(std::istream& in, T& val) {
         in.read(reinterpret_cast<char*>(&val), sizeof(T));
+        if (!in) {
+            throw Seldon::NeuralNetException("Binary read failed or model file is truncated");
+        }
         if (!isLittleEndian()) {
             swapEndian(val);
         }
@@ -43,9 +69,17 @@ namespace {
 }
 
 NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
+    if (topology.size() < 2) {
+        throw Seldon::NeuralNetException("Topology must include at least input and output layers");
+    }
+    for (size_t layerSize : topology) {
+        if (layerSize == 0) {
+            throw Seldon::NeuralNetException("Layer size cannot be zero");
+        }
+    }
+
     std::random_device rd;
     rng.seed(rd());
-    std::uniform_real_distribution<> dis(-0.5, 0.5);
 
     for (size_t l = 0; l < topology.size(); ++l) {
         Layer layer;
@@ -90,7 +124,10 @@ double NeuralNet::activate(double x, Activation act) {
     switch (act) {
         case Activation::RELU: return std::max(0.0, x);
         case Activation::TANH: return std::tanh(x);
-        case Activation::SIGMOID: return 1.0 / (1.0 + std::exp(-x));
+        case Activation::SIGMOID: {
+            double clipped = std::clamp(x, -60.0, 60.0);
+            return 1.0 / (1.0 + std::exp(-clipped));
+        }
         default: return x;
     }
 }
@@ -104,18 +141,22 @@ double NeuralNet::activateDerivative(double out, Activation act) {
     }
 }
 
-void NeuralNet::feedForward(const std::vector<double>& inputValues, Activation act, Activation outputAct, bool isTraining, double dropoutRate) {
+void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTraining, double dropoutRate) {
+    if (m_layers.empty()) {
+        throw Seldon::NeuralNetException("Network has no layers");
+    }
+
     size_t inputSize = std::min(inputValues.size(), m_layers[0].size);
     for (size_t i = 0; i < inputSize; ++i) {
         m_layers[0].outputs[i] = inputValues[i];
     }
-
-    std::uniform_real_distribution<> dis(0.0, 1.0);
+    for (size_t i = inputSize; i < m_layers[0].size; ++i) {
+        m_layers[0].outputs[i] = 0.0;
+    }
 
     for (size_t l = 1; l < m_layers.size(); ++l) {
         Layer& current = m_layers[l];
         Layer& prev = m_layers[l - 1];
-        current.activation = (l == m_layers.size() - 1) ? outputAct : act;
 
         #ifdef USE_OPENMP
         #pragma omp parallel for
@@ -153,7 +194,14 @@ void NeuralNet::feedForward(const std::vector<double>& inputValues, Activation a
 }
 
 void NeuralNet::computeGradients(const std::vector<double>& targetValues, LossFunction loss) {
+    if (m_layers.size() < 2 || targetValues.size() != m_layers.back().size) {
+        throw Seldon::NeuralNetException("Target dimensions do not match output layer");
+    }
+
     Layer& outputLayer = m_layers.back();
+    if (loss == LossFunction::CROSS_ENTROPY && outputLayer.activation != Activation::SIGMOID) {
+        throw Seldon::NeuralNetException("Cross-Entropy loss currently requires SIGMOID output activation");
+    }
     for (size_t n = 0; n < outputLayer.size; ++n) {
         if (loss == LossFunction::CROSS_ENTROPY && outputLayer.activation == Activation::SIGMOID) {
             // Simplified gradient for Cross-Entropy + Sigmoid
@@ -164,10 +212,7 @@ void NeuralNet::computeGradients(const std::vector<double>& targetValues, LossFu
         }
     }
 
-    #ifdef USE_OPENMP
-    #pragma omp parallel for
-    #endif
-    for (size_t l = m_layers.size() - 2; l > 0; --l) {
+    for (size_t l = m_layers.size() - 1; l-- > 1;) {
         Layer& hidden = m_layers[l];
         Layer& next = m_layers[l + 1];
 
@@ -243,9 +288,33 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
                       const std::vector<ScaleInfo>& inScales,
                       const std::vector<ScaleInfo>& outScales) 
 {
-    if (X.empty()) return;
+    if (X.empty() || Y.empty()) {
+        throw Seldon::NeuralNetException("Training data cannot be empty");
+    }
+    if (X.size() != Y.size()) {
+        throw Seldon::NeuralNetException("Input and target sample counts must match");
+    }
+    if (hp.batchSize == 0) {
+        throw Seldon::NeuralNetException("Batch size must be greater than zero");
+    }
+
+    const size_t expectedInput = m_layers.front().size;
+    const size_t expectedOutput = m_layers.back().size;
+    for (size_t i = 0; i < X.size(); ++i) {
+        if (X[i].size() != expectedInput) {
+            throw Seldon::NeuralNetException("Input row size does not match network input layer size");
+        }
+        if (Y[i].size() != expectedOutput) {
+            throw Seldon::NeuralNetException("Target row size does not match network output layer size");
+        }
+    }
+
     this->inputScales = inScales;
     this->outputScales = outScales;
+
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        m_layers[l].activation = (l == m_layers.size() - 1) ? hp.outputActivation : hp.activation;
+    }
 
     size_t valSize = static_cast<size_t>(X.size() * hp.valSplit);
     size_t trainSize = X.size() - valSize;
@@ -322,10 +391,11 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X, const std:
     double batchLoss = 0.0;
     t_step++;
     for (size_t b = batchStart; b < batchEnd; ++b) {
-        feedForward(X[indices[b]], hp.activation, hp.outputActivation, true, hp.dropoutRate);
+        feedForward(X[indices[b]], true, hp.dropoutRate);
         backpropagate(Y[indices[b]], hp, t_step);
 
-        for (size_t j = 0; j < Y[indices[b]].size(); ++j) {
+        size_t outputSize = std::min(Y[indices[b]].size(), m_layers.back().outputs.size());
+        for (size_t j = 0; j < outputSize; ++j) {
             double actual = Y[indices[b]][j];
             double pred = m_layers.back().outputs[j];
             if (hp.loss == LossFunction::CROSS_ENTROPY) {
@@ -344,7 +414,7 @@ double NeuralNet::validate(const std::vector<std::vector<double>>& X, const std:
     double valLossSum = 0.0;
     size_t valSize = X.size() - trainSize;
     for (size_t i = trainSize; i < X.size(); ++i) {
-        feedForward(X[indices[i]], hp.activation, hp.outputActivation, false);
+        feedForward(X[indices[i]], false);
         for (size_t j = 0; j < Y[indices[i]].size(); ++j) {
             double actual = Y[indices[i]][j];
             double pred = m_layers.back().outputs[j];
@@ -370,7 +440,7 @@ std::vector<double> NeuralNet::predict(const std::vector<double>& inputValues) {
         }
     }
 
-    feedForward(scaledInput, m_layers[1].activation, m_layers.back().activation, false);
+    feedForward(scaledInput, false);
     
     std::vector<double> result;
     for (size_t i = 0; i < m_layers.back().size; ++i) {
@@ -441,36 +511,58 @@ void NeuralNet::saveModelBinary(const std::string& filename) const {
     const char sig[] = "SELDON_BIN_V2";
     out.write(sig, sizeof(sig));
 
+    writeLE(out, kModelFormatVersion);
+    uint64_t checksum = kChecksumOffsetBasis;
+    updateChecksum(checksum, kModelFormatVersion);
+
     uint64_t topSize = static_cast<uint64_t>(topology.size());
     writeLE(out, topSize);
+    updateChecksum(checksum, topSize);
     for (size_t t : topology) {
-        writeLE(out, static_cast<uint64_t>(t));
+        uint64_t layerWidth = static_cast<uint64_t>(t);
+        writeLE(out, layerWidth);
+        updateChecksum(checksum, layerWidth);
     }
 
     for (const auto& layer : m_layers) {
         int32_t act = static_cast<int32_t>(layer.activation);
         writeLE(out, act);
+        updateChecksum(checksum, act);
     }
 
     uint64_t inS = static_cast<uint64_t>(inputScales.size());
     uint64_t outS = static_cast<uint64_t>(outputScales.size());
     writeLE(out, inS);
     writeLE(out, outS);
+    updateChecksum(checksum, inS);
+    updateChecksum(checksum, outS);
     
     for (const auto& s : inputScales) {
         writeLE(out, s.min);
         writeLE(out, s.max);
+        updateChecksum(checksum, s.min);
+        updateChecksum(checksum, s.max);
     }
     for (const auto& s : outputScales) {
         writeLE(out, s.min);
         writeLE(out, s.max);
+        updateChecksum(checksum, s.min);
+        updateChecksum(checksum, s.max);
     }
 
     for (size_t l = 1; l < m_layers.size(); ++l) {
         const auto& layer = m_layers[l];
-        for (double b : layer.biases) writeLE(out, b);
-        for (double w : layer.weights) writeLE(out, w);
+        for (double b : layer.biases) {
+            writeLE(out, b);
+            updateChecksum(checksum, b);
+        }
+        for (double w : layer.weights) {
+            writeLE(out, w);
+            updateChecksum(checksum, w);
+        }
     }
+
+    writeLE(out, checksum);
 }
 
 void NeuralNet::loadModelBinary(const std::string& filename) {
@@ -479,13 +571,33 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
 
     char sigV2[sizeof("SELDON_BIN_V2")];
     in.read(sigV2, sizeof(sigV2));
+    if (!in) {
+        throw Seldon::NeuralNetException("Failed to read model signature from " + filename);
+    }
     if (std::string(sigV2) == "SELDON_BIN_V2") {
+        uint32_t version = 0;
+        readLE(in, version);
+        if (version != kModelFormatVersion) {
+            throw Seldon::NeuralNetException("Unsupported model version in file: " + filename);
+        }
+
+        uint64_t computedChecksum = kChecksumOffsetBasis;
+        updateChecksum(computedChecksum, version);
+
         uint64_t topSize;
         readLE(in, topSize);
+        updateChecksum(computedChecksum, topSize);
+        if (topSize < 2 || topSize > 1000000) {
+            throw Seldon::NeuralNetException("Invalid topology size in model file: " + filename);
+        }
         std::vector<size_t> top(topSize);
         for (uint64_t i = 0; i < topSize; ++i) {
             uint64_t val;
             readLE(in, val);
+            updateChecksum(computedChecksum, val);
+            if (val == 0 || val > 1000000) {
+                throw Seldon::NeuralNetException("Invalid layer width in model file: " + filename);
+            }
             top[i] = static_cast<size_t>(val);
         }
 
@@ -494,28 +606,47 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
         for (size_t i = 0; i < m_layers.size(); ++i) {
             int32_t act;
             readLE(in, act);
+            updateChecksum(computedChecksum, act);
             m_layers[i].activation = static_cast<Activation>(act);
         }
 
         uint64_t inS, outS;
         readLE(in, inS);
         readLE(in, outS);
+        updateChecksum(computedChecksum, inS);
+        updateChecksum(computedChecksum, outS);
         
         inputScales.resize(inS);
         for (uint64_t i = 0; i < inS; ++i) {
             readLE(in, inputScales[i].min);
             readLE(in, inputScales[i].max);
+            updateChecksum(computedChecksum, inputScales[i].min);
+            updateChecksum(computedChecksum, inputScales[i].max);
         }
         outputScales.resize(outS);
         for (uint64_t i = 0; i < outS; ++i) {
             readLE(in, outputScales[i].min);
             readLE(in, outputScales[i].max);
+            updateChecksum(computedChecksum, outputScales[i].min);
+            updateChecksum(computedChecksum, outputScales[i].max);
         }
 
         for (size_t l = 1; l < m_layers.size(); ++l) {
             auto& layer = m_layers[l];
-            for (double& b : layer.biases) readLE(in, b);
-            for (double& w : layer.weights) readLE(in, w);
+            for (double& b : layer.biases) {
+                readLE(in, b);
+                updateChecksum(computedChecksum, b);
+            }
+            for (double& w : layer.weights) {
+                readLE(in, w);
+                updateChecksum(computedChecksum, w);
+            }
+        }
+
+        uint64_t storedChecksum = 0;
+        readLE(in, storedChecksum);
+        if (storedChecksum != computedChecksum) {
+            throw Seldon::NeuralNetException("Model checksum mismatch (corrupt file): " + filename);
         }
         return;
     } 

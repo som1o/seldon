@@ -6,6 +6,10 @@
 #include <numeric>
 #include <algorithm>
 
+namespace {
+constexpr double kDefaultSignificanceAlpha = 0.05;
+}
+
 // Regularized incomplete beta function I_x(a, b) using continued fractions (Lentz's method)
 static double betainc(double a, double b, double x) {
     if (x < 0.0 || x > 1.0) return NAN;
@@ -109,14 +113,14 @@ Significance MathUtils::calculateSignificance(double r, size_t n) {
     size_t df = n - 2;
     sig.t_stat = r * std::sqrt(static_cast<double>(df) / (1.0 - r * r));
     sig.p_value = getPValueFromT(sig.t_stat, df);
-    sig.is_significant = (sig.p_value < 0.05);
+    sig.is_significant = (sig.p_value < kDefaultSignificanceAlpha);
 
     return sig;
 }
 
 std::optional<double> MathUtils::calculatePearson(const std::vector<double>& x, const std::vector<double>& y, 
                                            const ColumnStats& statsX, const ColumnStats& statsY) {
-    if (x.size() != y.size() || x.empty()) return std::nullopt;
+    if (x.size() != y.size() || x.size() < 2) return std::nullopt;
     if (statsX.stddev == 0 || statsY.stddev == 0) return std::nullopt;
 
     size_t n = x.size();
@@ -316,7 +320,7 @@ std::vector<double> MathUtils::multipleLinearRegression(const Matrix& X, const M
     std::vector<double> beta(n, 0.0);
 
     // Back substitution
-    for (int i = n - 1; i >= 0; --i) {
+    for (size_t i = n; i-- > 0;) {
         double sum = QTY.data[i][0];
         for (size_t j = i + 1; j < n; ++j) {
             sum -= R.data[i][j] * beta[j];
@@ -359,15 +363,17 @@ MLRDiagnostics MathUtils::performMLRWithDiagnostics(const Matrix& X, const Matri
     }
 
     diag.rSquared = (tss > 0) ? (1.0 - rss / tss) : 0.0;
-    diag.adjustedRSquared = 1.0 - (1.0 - diag.rSquared) * (double(n - 1) / (n - k - 1));
+    const size_t dfResidual = n - k - 1;
+    if (dfResidual == 0) return diag;
+    diag.adjustedRSquared = 1.0 - (1.0 - diag.rSquared) * (double(n - 1) / dfResidual);
     
     // F-statistic
     if (rss > 0 && k > 0) {
-        diag.fStatistic = ((tss - rss) / k) / (rss / (n - k - 1));
+        diag.fStatistic = ((tss - rss) / k) / (rss / dfResidual);
         // Model p-value from F(k, n-k-1) - using beta distribution relation
         // F = (d2 * I_x(d1/2, d2/2)) / (d1 * (1 - I_x(d1/2, d2/2))) where x is from F
         // Easier: p-value = betainc(d2/2, d1/2, d2 / (d2 + d1*F))
-        diag.modelPValue = betainc((n - k - 1) / 2.0, k / 2.0, (n - k - 1) / (n - k - 1 + k * diag.fStatistic));
+        diag.modelPValue = betainc(dfResidual / 2.0, k / 2.0, dfResidual / (dfResidual + k * diag.fStatistic));
     } else {
         diag.fStatistic = 0; diag.modelPValue = 1.0;
     }
@@ -380,15 +386,26 @@ MLRDiagnostics MathUtils::performMLRWithDiagnostics(const Matrix& X, const Matri
     
     if (XTX_inv_opt) {
         Matrix XTX_inv = *XTX_inv_opt;
-        double s2 = rss / (n - k - 1);
+        double s2 = rss / dfResidual;
         diag.stdErrors.resize(X.cols);
         diag.tStats.resize(X.cols);
         diag.pValues.resize(X.cols);
         
         for (size_t j = 0; j < X.cols; ++j) {
-            diag.stdErrors[j] = std::sqrt(s2 * XTX_inv.data[j][j]);
-            diag.tStats[j] = diag.coefficients[j] / diag.stdErrors[j];
-            diag.pValues[j] = getPValueFromT(diag.tStats[j], n - k - 1);
+            double variance = s2 * XTX_inv.data[j][j];
+            if (variance < 0 && std::abs(variance) < 1e-15) {
+                variance = 0;
+            }
+            if (variance < 0) return diag;
+
+            diag.stdErrors[j] = std::sqrt(variance);
+            if (diag.stdErrors[j] > 0) {
+                diag.tStats[j] = diag.coefficients[j] / diag.stdErrors[j];
+                diag.pValues[j] = getPValueFromT(diag.tStats[j], dfResidual);
+            } else {
+                diag.tStats[j] = 0.0;
+                diag.pValues[j] = 1.0;
+            }
         }
     } else {
         // Fallback or mark as failed

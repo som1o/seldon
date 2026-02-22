@@ -6,8 +6,62 @@
 #include <limits>
 #include <cmath>
 #include <iomanip>
+#include <stdexcept>
+#include <unordered_set>
+#include <charconv>
+#include <string_view>
+
+namespace {
+constexpr size_t kMinTypeScanRows = 1000;
+constexpr size_t kMaxTypeScanRows = 50000;
+constexpr std::streamsize kLargeDatasetWarningBytes = 500LL * 1024 * 1024;
+
+bool parseFiniteDouble(std::string_view input, double& out) {
+    double parsed = 0.0;
+    const char* begin = input.data();
+    const char* end = begin + input.size();
+    auto [ptr, ec] = std::from_chars(begin, end, parsed, std::chars_format::general);
+    if (ec != std::errc{} || ptr != end || !std::isfinite(parsed)) {
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
+size_t requiredRowWidth(const std::vector<size_t>& indices) {
+    if (indices.empty()) return 0;
+    return *std::max_element(indices.begin(), indices.end()) + 1;
+}
+
+size_t computeAdaptiveScanLimit(bool exhaustiveScan, size_t expectedCols, std::streamsize fileSize) {
+    if (exhaustiveScan) return std::numeric_limits<size_t>::max();
+
+    size_t fileFactor = 0;
+    if (fileSize > 0) {
+        fileFactor = static_cast<size_t>(fileSize / (1024 * 1024));
+    }
+
+    size_t estimate = expectedCols * 256 + fileFactor * 8;
+    return std::clamp(estimate, kMinTypeScanRows, kMaxTypeScanRows);
+}
+
+std::string trimUnquotedField(const std::string& value) {
+    if (value.empty()) return value;
+    size_t start = value.find_first_not_of(" \t");
+    if (start == std::string::npos) return "";
+    size_t end = value.find_last_not_of(" \t");
+    return value.substr(start, end - start + 1);
+}
+}
 
 Dataset::Dataset(const std::string& filename) : filename_(filename) {}
+
+void Dataset::setDelimiter(char delimiter) {
+    if (delimiter == '"' || delimiter == '\n' || delimiter == '\r' || delimiter == '\0') {
+        throw Seldon::DatasetException("Invalid delimiter character");
+    }
+    delimiter_ = delimiter;
+}
 
 void Dataset::analyzeMetadata() {
     std::ifstream file(filename_, std::ios::binary);
@@ -42,10 +96,29 @@ void Dataset::skipBOM(std::istream& is) {
 }
 
 std::vector<std::string> Dataset::readHeader(std::ifstream& file) {
-    auto header = parseCSVLine(file);
-    if (header.empty()) {
+    bool malformed = false;
+    auto header = parseCSVLine(file, &malformed);
+    if (header.empty() || malformed) {
         throw Seldon::DatasetException("Empty or malformed header in " + filename_);
     }
+
+    std::unordered_set<std::string> seen;
+    for (size_t i = 0; i < header.size(); ++i) {
+        if (header[i].empty()) {
+            header[i] = "column_" + std::to_string(i + 1);
+        }
+
+        std::string original = header[i];
+        if (seen.find(header[i]) != seen.end()) {
+            size_t suffix = 2;
+            while (seen.find(original + "_" + std::to_string(suffix)) != seen.end()) {
+                ++suffix;
+            }
+            header[i] = original + "_" + std::to_string(suffix);
+        }
+        seen.insert(header[i]);
+    }
+
     return header;
 }
 
@@ -55,14 +128,20 @@ void Dataset::detectColumnTypes(std::ifstream& file, size_t expectedCols, bool e
                                  bool skipMalformed, size_t& totalSkipped) {
     rowCount = 0;
     totalSkipped = 0;
-    size_t scanLimit = exhaustiveScan ? std::numeric_limits<size_t>::max() : 1000;
+    size_t scanLimit = kMinTypeScanRows;
 
     file.seekg(0, std::ios::end);
     std::streamsize fileSize = file.tellg();
+    scanLimit = computeAdaptiveScanLimit(exhaustiveScan, expectedCols, fileSize);
     file.seekg(0, std::ios::beg);
     skipBOM(file);
-    parseCSVLine(file); // Skip header
+    bool headerMalformed = false;
+    parseCSVLine(file, &headerMalformed); // Skip header
+    if (headerMalformed) {
+        throw Seldon::DatasetException("Malformed CSV header in " + filename_);
+    }
 
+    size_t recordNumber = 1; // header
     while (file.peek() != EOF) {
         std::streamsize currentPos = file.tellg();
         if (rowCount % 100 == 0 && fileSize > 0) {
@@ -70,8 +149,17 @@ void Dataset::detectColumnTypes(std::ifstream& file, size_t expectedCols, bool e
             std::cout << "\r[Agent] Ingesting Dataspace: [" << std::fixed << std::setprecision(1) << progress << "%] " << std::flush;
         }
 
-        auto rawRow = parseCSVLine(file);
+        bool malformed = false;
+        auto rawRow = parseCSVLine(file, &malformed);
+        ++recordNumber;
         if (rawRow.empty()) continue;
+        if (malformed) {
+            totalSkipped++;
+            if (!skipMalformed) {
+                throw Seldon::DatasetException("Malformed quoted field at record " + std::to_string(recordNumber));
+            }
+            continue;
+        }
 
         if (rawRow.size() != expectedCols) {
             bool recovered = false;
@@ -86,7 +174,7 @@ void Dataset::detectColumnTypes(std::ifstream& file, size_t expectedCols, bool e
             if (!recovered) {
                 totalSkipped++;
                 if (!skipMalformed) {
-                    throw Seldon::DatasetException("Column mismatch at row " + std::to_string(rowCount + totalSkipped));
+                    throw Seldon::DatasetException("Column mismatch at record " + std::to_string(recordNumber));
                 }
                 continue;
             }
@@ -99,10 +187,11 @@ void Dataset::detectColumnTypes(std::ifstream& file, size_t expectedCols, bool e
             if (rawRow[i].empty()) {
                 rowValues[i] = std::numeric_limits<double>::quiet_NaN();
             } else {
-                try {
-                    rowValues[i] = std::stod(rawRow[i]);
+                double parsed = 0.0;
+                if (parseFiniteDouble(rawRow[i], parsed)) {
+                    rowValues[i] = parsed;
                     hasValue[i] = true;
-                } catch (...) {
+                } else {
                     if (rowCount + totalSkipped < scanLimit) {
                         isNumeric[i] = false;
                     }
@@ -122,7 +211,7 @@ void Dataset::detectColumnTypes(std::ifstream& file, size_t expectedCols, bool e
         } else {
             totalSkipped++;
             if (!skipMalformed) {
-                throw Seldon::DatasetException("Non-numeric value in numeric column at row " + std::to_string(rowCount + totalSkipped));
+                throw Seldon::DatasetException("Non-numeric value in numeric column at record " + std::to_string(recordNumber));
             }
         }
     }
@@ -215,7 +304,7 @@ void Dataset::loadAuto(bool skipMalformed, bool exhaustiveScan, ImputationStrate
     std::streamsize size = file.tellg();
     file.close();
 
-    if (size > 500 * 1024 * 1024) {
+    if (size > kLargeDatasetWarningBytes) {
         std::cout << "[Agent Warning] Large dataset detected (" << (size / (1024 * 1024)) << " MB). "
                   << "Consider using --chunked mode for out-of-core processing if memory is limited.\n";
     }
@@ -245,7 +334,8 @@ void Dataset::loadChunk(size_t startRow, size_t numRows) {
             rowCount = 0;
             return;
         }
-        parseCSVLine(file);
+        bool ignoredMalformed = false;
+        parseCSVLine(file, &ignoredMalformed);
     }
 
     columns.assign(numericIndices.size(), std::vector<double>());
@@ -253,11 +343,14 @@ void Dataset::loadChunk(size_t startRow, size_t numRows) {
 
     rowCount = 0;
     while (rowCount < numRows && file.peek() != EOF) {
-        auto rawRow = parseCSVLine(file);
+        bool malformed = false;
+        auto rawRow = parseCSVLine(file, &malformed);
         if (rawRow.empty()) continue;
+        if (malformed) continue;
 
-        if (rawRow.size() < numericIndices.size()) {
-            rawRow.resize(numericIndices.size(), "");
+        size_t minWidth = requiredRowWidth(numericIndices);
+        if (rawRow.size() < minWidth) {
+            rawRow.resize(minWidth, "");
         }
 
         for (size_t i = 0; i < numericIndices.size(); ++i) {
@@ -266,9 +359,10 @@ void Dataset::loadChunk(size_t startRow, size_t numRows) {
             if (idx >= rawRow.size() || rawRow[idx].empty()) {
                 val = (i < imputationValues.size()) ? imputationValues[i] : 0.0;
             } else {
-                try {
-                    val = std::stod(rawRow[idx]);
-                } catch (...) {
+                double parsed = 0.0;
+                if (parseFiniteDouble(rawRow[idx], parsed)) {
+                    val = parsed;
+                } else {
                     val = (i < imputationValues.size()) ? imputationValues[i] : 0.0;
                 }
             }
@@ -319,11 +413,14 @@ bool Dataset::fetchNextChunk(size_t chunkSize) {
 
     rowCount = 0;
     while (rowCount < chunkSize && streamFile.peek() != EOF) {
-        auto rawRow = parseCSVLine(streamFile);
+        bool malformed = false;
+        auto rawRow = parseCSVLine(streamFile, &malformed);
         if (rawRow.empty()) continue;
+        if (malformed) continue;
 
-        if (rawRow.size() < numericIndices.size()) {
-            rawRow.resize(numericIndices.size(), "");
+        size_t minWidth = requiredRowWidth(numericIndices);
+        if (rawRow.size() < minWidth) {
+            rawRow.resize(minWidth, "");
         }
 
         for (size_t i = 0; i < numericIndices.size(); ++i) {
@@ -332,9 +429,10 @@ bool Dataset::fetchNextChunk(size_t chunkSize) {
             if (idx >= rawRow.size() || rawRow[idx].empty()) {
                 val = (i < imputationValues.size()) ? imputationValues[i] : 0.0;
             } else {
-                try {
-                    val = std::stod(rawRow[idx]);
-                } catch (...) {
+                double parsed = 0.0;
+                if (parseFiniteDouble(rawRow[idx], parsed)) {
+                    val = parsed;
+                } else {
                     val = (i < imputationValues.size()) ? imputationValues[i] : 0.0;
                 }
             }
@@ -352,61 +450,78 @@ void Dataset::closeStream() {
     }
 }
 
-std::vector<std::string> Dataset::parseCSVLine(std::istream& is) {
+std::vector<std::string> Dataset::parseCSVLine(std::istream& is, bool* malformed, size_t* consumedLines) {
+    if (malformed) *malformed = false;
+    if (consumedLines) *consumedLines = 0;
     if (is.peek() == EOF) return {};
-    
+
     std::vector<std::string> row;
+    std::vector<bool> fieldQuoted;
     std::string val;
-    bool in_quotes = false;
+    bool inQuotes = false;
+    bool currentFieldQuoted = false;
+    bool hasRecordData = false;
+    bool hadDelimiter = false;
     char c;
-    bool has_content = false;
 
     while (is.get(c)) {
-        has_content = true;
         if (c == '"') {
-            if (in_quotes && is.peek() == '"') {
-                val += '"';
-                is.get(); // Consume next escaped quote
+            if (!inQuotes && val.empty()) {
+                inQuotes = true;
+                currentFieldQuoted = true;
+                hasRecordData = true;
+            } else if (inQuotes) {
+                if (is.peek() == '"') {
+                    val += '"';
+                    is.get();
+                } else {
+                    inQuotes = false;
+                }
             } else {
-                in_quotes = !in_quotes;
+                val += c;
+                hasRecordData = true;
             }
-        } else if (c == ',' && !in_quotes) {
-            row.push_back(val);
+        } else if (c == delimiter_ && !inQuotes) {
+            row.push_back(currentFieldQuoted ? val : trimUnquotedField(val));
+            fieldQuoted.push_back(currentFieldQuoted);
             val.clear();
+            currentFieldQuoted = false;
+            hadDelimiter = true;
+            hasRecordData = true;
         } else if (c == '\r') {
-            if (is.peek() == '\n') is.get(); // Handle CRLF
-            if (in_quotes) {
-                val += '\n'; // Normalize multiline line endings to LF
+            if (is.peek() == '\n') is.get();
+            if (consumedLines) ++(*consumedLines);
+            if (inQuotes) {
+                val += '\n';
             } else {
                 break;
             }
         } else if (c == '\n') {
-            if (in_quotes) {
+            if (consumedLines) ++(*consumedLines);
+            if (inQuotes) {
                 val += '\n';
             } else {
                 break;
             }
         } else {
             val += c;
+            hasRecordData = true;
         }
-    }
-    
-    // Final value after last comma or newline
-    if (has_content || !row.empty()) {
-        row.push_back(val);
     }
 
-    // Trim whitespace only for non-empty fields and handle potential surrounding spaces outside quotes
-    for (auto& v : row) {
-        if (v.empty()) continue;
-        size_t start = v.find_first_not_of(" \t");
-        size_t end = v.find_last_not_of(" \t");
-        if (start == std::string::npos) {
-            v.clear();
-        } else {
-            v = v.substr(start, end - start + 1);
-        }
+    if (inQuotes && malformed) {
+        *malformed = true;
     }
+
+    if (hasRecordData || hadDelimiter || !val.empty()) {
+        row.push_back(currentFieldQuoted ? val : trimUnquotedField(val));
+        fieldQuoted.push_back(currentFieldQuoted);
+    }
+
+    if (row.size() == 1 && row[0].empty() && !fieldQuoted[0] && !hadDelimiter) {
+        return {};
+    }
+
     return row;
 }
 
@@ -432,10 +547,16 @@ void Dataset::calculateImputations(const std::vector<std::vector<double>>& rawNu
             for (double v : validValues) sum += v;
             imputationValues[i] = sum / validValues.size();
         } else if (strategy == ImputationStrategy::MEDIAN) {
-            std::sort(validValues.begin(), validValues.end());
             size_t sz = validValues.size();
-            if (sz % 2 == 0) imputationValues[i] = (validValues[sz / 2 - 1] + validValues[sz / 2]) / 2.0;
-            else imputationValues[i] = validValues[sz / 2];
+            size_t mid = sz / 2;
+            std::nth_element(validValues.begin(), validValues.begin() + mid, validValues.end());
+            double upper = validValues[mid];
+            if (sz % 2 == 0) {
+                std::nth_element(validValues.begin(), validValues.begin() + (mid - 1), validValues.begin() + mid);
+                imputationValues[i] = (validValues[mid - 1] + upper) / 2.0;
+            } else {
+                imputationValues[i] = upper;
+            }
         }
     }
 }

@@ -96,9 +96,13 @@ void TerminalUI::printNeuralNetInit(size_t inputs, size_t hidden, size_t outputs
 void TerminalUI::printSynthesisReport(const std::string& targetName, const std::vector<std::string>& inputNames, const std::vector<double>& syntheticOutput) {
     std::cout << "\n============================================ NARRATIVE SYNTHESIS ===========================================\n";
     std::cout << "[Agent] Deep prediction matrices complete. Analysis of feature intersections finalized.\n\n";
-    
-    std::cout << "    [Result] Predicted Value for \"" << targetName << "\": " 
-              << std::fixed << std::setprecision(4) << syntheticOutput[0] << "\n\n";
+
+    if (syntheticOutput.empty()) {
+        std::cout << "    [Result] No prediction output generated for \"" << targetName << "\".\n\n";
+    } else {
+        std::cout << "    [Result] Predicted Value for \"" << targetName << "\": " 
+                  << std::fixed << std::setprecision(4) << syntheticOutput[0] << "\n\n";
+    }
 
     std::cout << "    [Context] This projection is synthesized based on the following feature set:\n";
     for (const auto& name : inputNames) {

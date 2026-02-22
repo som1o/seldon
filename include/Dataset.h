@@ -51,6 +51,8 @@ public:
     void closeStream();
     bool isStreamOpen() const { return streamFile.is_open(); }
     void analyzeMetadata(); // New: pass 0 to detect types and names
+    void setDelimiter(char delimiter);
+    char getDelimiter() const { return delimiter_; }
 
 private:
     std::string filename_;
@@ -66,9 +68,10 @@ private:
     // Metadata cache
     std::vector<std::string> allColumnNames;
     std::vector<bool> isNumeric;
+    char delimiter_ = ',';
 
     // Helper methods for decomposition
-    std::vector<std::string> parseCSVLine(std::istream& is);
+    std::vector<std::string> parseCSVLine(std::istream& is, bool* malformed = nullptr, size_t* consumedLines = nullptr);
     void skipBOM(std::istream& file);
     std::vector<std::string> readHeader(std::ifstream& file);
     void detectColumnTypes(std::ifstream& file, size_t expectedCols, bool exhaustiveScan, 

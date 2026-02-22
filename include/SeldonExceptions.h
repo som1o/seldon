@@ -26,6 +26,11 @@ public:
     explicit NeuralNetException(const std::string& message) : SeldonException("NeuralNet Error: " + message) {}
 };
 
+class ConfigurationException : public SeldonException {
+public:
+    explicit ConfigurationException(const std::string& message) : SeldonException("Configuration Error: " + message) {}
+};
+
 } // namespace Seldon
 
 #endif // SELDON_EXCEPTIONS_H
