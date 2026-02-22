@@ -5,9 +5,36 @@
 #include <iostream>
 #include <numeric>
 #include <algorithm>
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
 
 namespace {
 constexpr double kDefaultSignificanceAlpha = 0.05;
+
+double clamp01(double v) {
+    if (v < 0.0) return 0.0;
+    if (v > 1.0) return 1.0;
+    return v;
+}
+
+double midpointIntegrateBetaRegularized(double a, double b, double x, size_t intervals = 4096) {
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+
+    const double logBeta = std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b);
+    const double h = x / static_cast<double>(intervals);
+    double sum = 0.0;
+
+    for (size_t i = 0; i < intervals; ++i) {
+        double t = (static_cast<double>(i) + 0.5) * h;
+        t = std::clamp(t, 1e-15, 1.0 - 1e-15);
+        double logPdf = (a - 1.0) * std::log(t) + (b - 1.0) * std::log(1.0 - t) - logBeta;
+        sum += std::exp(logPdf);
+    }
+
+    return clamp01(sum * h);
+}
 }
 
 // Regularized incomplete beta function I_x(a, b) using continued fractions (Lentz's method)
@@ -29,7 +56,7 @@ static double betainc(double a, double b, double x) {
     const double tiny = 1e-30;
     const double eps = 1e-15;
 
-    for (int i = 1; i <= 200; ++i) {
+    for (int i = 1; i <= 300; ++i) {
         double m = i / 2.0;
         double numerator;
         if (i % 2 == 0) {
@@ -51,7 +78,8 @@ static double betainc(double a, double b, double x) {
         if (std::abs(delta - 1.0) < eps) return front * f;
     }
 
-    return front * f; // Fallback if max iterations reached
+    // Fallback path for non-convergence/extreme parameters.
+    return midpointIntegrateBetaRegularized(a, b, x);
 }
 
 // Two-tailed p-value from t-statistic using analytical beta distribution
@@ -166,11 +194,17 @@ MathUtils::Matrix MathUtils::Matrix::transpose() const {
 MathUtils::Matrix MathUtils::Matrix::multiply(const Matrix& other) const {
     if (cols != other.rows) throw std::invalid_argument("Matrix dimensions mismatch for multiplication.");
     Matrix result(rows, other.cols);
+    Matrix otherT = other.transpose();
+
+    #ifdef USE_OPENMP
+    #pragma omp parallel for
+    #endif
     for (size_t r = 0; r < rows; ++r) {
+        const auto& leftRow = data[r];
+        auto& outRow = result.data[r];
         for (size_t c = 0; c < other.cols; ++c) {
-            for (size_t k = 0; k < cols; ++k) {
-                result.data[r][c] += data[r][k] * other.data[k][c];
-            }
+            const auto& rightRow = otherT.data[c];
+            outRow[c] = std::inner_product(leftRow.begin(), leftRow.end(), rightRow.begin(), 0.0);
         }
     }
     return result;

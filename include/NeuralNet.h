@@ -44,6 +44,8 @@ public:
 
     // Forward pass prediction (handles internal scaling if scales are loaded)
     std::vector<double> predict(const std::vector<double>& inputValues);
+    const std::vector<double>& getTrainLossHistory() const { return trainLossHistory; }
+    const std::vector<double>& getValLossHistory() const { return valLossHistory; }
 
     // Explainability
     std::vector<double> calculateFeatureImportance(const std::vector<std::vector<double>>& X, 
@@ -102,6 +104,8 @@ private:
     std::vector<size_t> topology;
     std::vector<ScaleInfo> inputScales;
     std::vector<ScaleInfo> outputScales;
+    std::vector<double> trainLossHistory;
+    std::vector<double> valLossHistory;
 
     // Persistent RNG for performance and consistency
     std::mt19937 rng;

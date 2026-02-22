@@ -311,6 +311,8 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
 
     this->inputScales = inScales;
     this->outputScales = outScales;
+    trainLossHistory.clear();
+    valLossHistory.clear();
 
     for (size_t l = 1; l < m_layers.size(); ++l) {
         m_layers[l].activation = (l == m_layers.size() - 1) ? hp.outputActivation : hp.activation;
@@ -341,6 +343,8 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
 
         double trainLoss = runEpoch(X, Y, indices, trainSize, hp, currentLR, t_step);
         double valLoss = valSize > 0 ? validate(X, Y, indices, trainSize, hp) : 0.0;
+        trainLossHistory.push_back(trainLoss);
+        valLossHistory.push_back(valLoss);
 
         if (hp.verbose && (epoch % std::max(size_t(1), hp.epochs / 10) == 0 || epoch == hp.epochs - 1)) {
             std::cout << "[Epoch " << epoch << "] Train Loss: " << trainLoss << " | Val Loss: " << valLoss << std::endl;

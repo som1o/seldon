@@ -26,18 +26,39 @@ struct MLRDiagnostics {
 
 class MathUtils {
 public:
-    // Pearson Correlation Coefficient calculation
+    /**
+     * @brief Computes Pearson's correlation coefficient between two numeric vectors.
+     * @pre x.size() == y.size() and size >= 2.
+     * @pre statsX/stddev and statsY/stddev correspond to x and y and are non-zero.
+     * @post Returns std::nullopt when correlation is undefined.
+     */
     static std::optional<double> calculatePearson(const std::vector<double>& x, const std::vector<double>& y, 
                                           const ColumnStats& statsX, const ColumnStats& statsY);
 
-    // Calculate statistical significance for a given Pearson r and sample size n
+    /**
+     * @brief Computes t-statistic and p-value significance metadata for Pearson r.
+     * @pre n is sample size used to compute r.
+     * @post Returns non-significant result for n <= 2.
+     */
     static Significance calculateSignificance(double r, size_t n);
 
-    // Primitive statistical functions
+    /**
+     * @brief Two-tailed p-value from t-statistic and degrees of freedom.
+     * @pre df >= 0.
+     */
     static double getPValueFromT(double t, size_t df);
+
+    /**
+     * @brief Approximates critical t value for two-tailed alpha.
+     * @pre 0 < alpha < 1 and df >= 0.
+     */
     static double getCriticalT(double alpha, size_t df); // Two-tailed
 
-    // Simple Linear Regression: y = mx + c. Returns {slope(m), intercept(c)}
+    /**
+     * @brief Computes simple linear regression parameters y = m*x + c.
+     * @pre statsX/stddev and statsY/stddev correspond to x and y.
+     * @post Returns {0,0} when slope is undefined.
+     */
     static std::pair<double, double> simpleLinearRegression(const std::vector<double>& x, const std::vector<double>& y,
                                                             const ColumnStats& statsX, const ColumnStats& statsY, double pearsonR);
 
@@ -49,17 +70,51 @@ public:
 
         Matrix(size_t r, size_t c) : rows(r), cols(c), data(r, std::vector<double>(c, 0.0)) {}
 
+        /**
+         * @brief Builds identity matrix I(n).
+         * @pre n >= 0.
+         */
         static Matrix identity(size_t n);
+
+        /**
+         * @brief Returns transpose of current matrix.
+         */
         Matrix transpose() const;
+
+        /**
+         * @brief Matrix multiplication this * other.
+         * @pre this->cols == other.rows.
+         * @throws std::invalid_argument on shape mismatch.
+         */
         Matrix multiply(const Matrix& other) const;
+
+        /**
+         * @brief Inverts a square matrix using Gaussian elimination.
+         * @pre rows == cols.
+         * @post Returns std::nullopt for singular/near-singular matrices.
+         * @throws std::invalid_argument when matrix is not square.
+         */
         std::optional<Matrix> inverse() const; // Using Gaussian Elimination
+
+        /**
+         * @brief Computes Householder QR decomposition: A = Q*R.
+         * @pre Q and R are output matrices and will be overwritten.
+         */
         void qrDecomposition(Matrix& Q, Matrix& R) const;
     };
 
-    // Multiple Linear Regression using Normal Equation: beta = (X^T * X)^-1 * X^T * Y
-    // Returns the vector of beta coefficients.
+    /**
+     * @brief Solves multiple linear regression coefficients from design matrix X and target Y.
+     * @pre X.rows == Y.rows.
+     * @post Returns empty vector for underdetermined or ill-conditioned problems.
+     * @throws std::invalid_argument when row dimensions mismatch.
+     */
     static std::vector<double> multipleLinearRegression(const Matrix& X, const Matrix& Y);
 
-    // Advanced version with full statistical diagnostics
+    /**
+     * @brief Performs MLR and returns coefficients with diagnostics.
+     * @pre X.rows == Y.rows and residual degrees of freedom > 0.
+     * @post success=false when regression cannot be solved robustly.
+     */
     static MLRDiagnostics performMLRWithDiagnostics(const Matrix& X, const Matrix& Y);
 };
