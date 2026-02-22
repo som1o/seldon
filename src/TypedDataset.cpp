@@ -1,4 +1,5 @@
 #include "TypedDataset.h"
+#include "CSVUtils.h"
 #include "SeldonExceptions.h"
 #include <algorithm>
 #include <charconv>
@@ -7,7 +8,6 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
-#include <unordered_set>
 
 TypedDataset::TypedDataset(std::string filename, char delimiter)
     : filename_(std::move(filename)), delimiter_(delimiter) {}
@@ -52,98 +52,21 @@ bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) 
 }
 
 std::vector<std::string> TypedDataset::parseCSVLine(std::istream& is, bool& malformed, size_t& consumedLines) const {
-    malformed = false;
-    consumedLines = 0;
-    if (is.peek() == EOF) return {};
-
-    std::vector<std::string> row;
-    std::vector<bool> quoted;
-    std::string cell;
-    bool inQuotes = false;
-    bool fieldQuoted = false;
-    bool seenData = false;
-    bool seenDelimiter = false;
-    char c;
-
-    while (is.get(c)) {
-        if (c == '"') {
-            if (!inQuotes && cell.empty()) {
-                inQuotes = true;
-                fieldQuoted = true;
-                seenData = true;
-            } else if (inQuotes) {
-                if (is.peek() == '"') {
-                    cell.push_back('"');
-                    is.get();
-                } else {
-                    inQuotes = false;
-                }
-            } else {
-                cell.push_back(c);
-                seenData = true;
-            }
-        } else if (c == delimiter_ && !inQuotes) {
-            row.push_back(fieldQuoted ? cell : trim(cell));
-            quoted.push_back(fieldQuoted);
-            cell.clear();
-            fieldQuoted = false;
-            seenDelimiter = true;
-            seenData = true;
-        } else if (c == '\n') {
-            consumedLines++;
-            if (inQuotes) cell.push_back('\n');
-            else break;
-        } else if (c == '\r') {
-            if (is.peek() == '\n') is.get();
-            consumedLines++;
-            if (inQuotes) cell.push_back('\n');
-            else break;
-        } else {
-            cell.push_back(c);
-            seenData = true;
-        }
-    }
-
-    if (inQuotes) malformed = true;
-
-    if (seenData || seenDelimiter || !cell.empty()) {
-        row.push_back(fieldQuoted ? cell : trim(cell));
-        quoted.push_back(fieldQuoted);
-    }
-
-    if (row.size() == 1 && row[0].empty() && !seenDelimiter && !quoted[0]) return {};
-    return row;
+    return CSVUtils::parseCSVLine(is, delimiter_, &malformed, &consumedLines);
 }
 
 void TypedDataset::load() {
     std::ifstream in(filename_, std::ios::binary);
     if (!in) throw Seldon::IOException("Could not open file: " + filename_);
 
-    // BOM skip
-    char bom[3];
-    if (in.read(bom, 3)) {
-        if (!((unsigned char)bom[0] == 0xEF && (unsigned char)bom[1] == 0xBB && (unsigned char)bom[2] == 0xBF)) {
-            in.clear();
-            in.seekg(0);
-        }
-    } else {
-        in.clear();
-        in.seekg(0);
-    }
+    CSVUtils::skipBOM(in);
 
     bool malformed = false;
     size_t consumedLines = 0;
     auto header = parseCSVLine(in, malformed, consumedLines);
     if (malformed || header.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
 
-    std::unordered_set<std::string> seen;
-    for (size_t i = 0; i < header.size(); ++i) {
-        if (header[i].empty()) header[i] = "column_" + std::to_string(i + 1);
-        std::string base = header[i];
-        int suffix = 2;
-        while (seen.count(header[i])) header[i] = base + "_" + std::to_string(suffix++);
-        seen.insert(header[i]);
-    }
+    header = CSVUtils::normalizeHeader(header);
 
     std::vector<std::vector<std::string>> raw(header.size());
     size_t record = 1;

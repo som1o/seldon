@@ -1,10 +1,8 @@
 #pragma once
+#include "Statistics.h"
 #include <vector>
 #include <string>
 #include <optional>
-
-// Forward declarations to avoid complex circular includes where possible
-struct ColumnStats;
 
 struct Significance {
     double t_stat;

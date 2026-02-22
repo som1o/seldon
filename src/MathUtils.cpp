@@ -1,5 +1,5 @@
 #include "MathUtils.h"
-#include "StatsEngine.h" // Needed for ColumnStats
+#include "Statistics.h"
 #include <cmath>
 #include <stdexcept>
 #include <iostream>

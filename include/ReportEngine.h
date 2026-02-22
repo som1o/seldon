@@ -11,6 +11,5 @@ public:
     void save(const std::string& filePath) const;
 
 private:
-    static std::string escapeHtml(const std::string& text);
     std::string body_;
 };

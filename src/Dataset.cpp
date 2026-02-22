@@ -1,4 +1,5 @@
 #include "Dataset.h"
+#include "CSVUtils.h"
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -7,7 +8,6 @@
 #include <cmath>
 #include <iomanip>
 #include <stdexcept>
-#include <unordered_set>
 #include <charconv>
 #include <string_view>
 
@@ -45,13 +45,6 @@ size_t computeAdaptiveScanLimit(bool exhaustiveScan, size_t expectedCols, std::s
     return std::clamp(estimate, kMinTypeScanRows, kMaxTypeScanRows);
 }
 
-std::string trimUnquotedField(const std::string& value) {
-    if (value.empty()) return value;
-    size_t start = value.find_first_not_of(" \t");
-    if (start == std::string::npos) return "";
-    size_t end = value.find_last_not_of(" \t");
-    return value.substr(start, end - start + 1);
-}
 }
 
 Dataset::Dataset(const std::string& filename) : filename_(filename) {}
@@ -67,7 +60,7 @@ void Dataset::analyzeMetadata() {
     std::ifstream file(filename_, std::ios::binary);
     if (!file.is_open()) throw Seldon::IOException("Could not open file " + filename_);
     
-    skipBOM(file);
+    CSVUtils::skipBOM(file);
     allColumnNames = readHeader(file);
     size_t expectedCols = allColumnNames.size();
     isNumeric.assign(expectedCols, true);
@@ -84,42 +77,16 @@ void Dataset::analyzeMetadata() {
 }
 
 void Dataset::skipBOM(std::istream& is) {
-    char bom[3];
-    if (is.read(bom, 3)) {
-        if (!((unsigned char)bom[0] == 0xEF && (unsigned char)bom[1] == 0xBB && (unsigned char)bom[2] == 0xBF)) {
-            is.seekg(0);
-        }
-    } else {
-        is.clear();
-        is.seekg(0);
-    }
+    CSVUtils::skipBOM(is);
 }
 
 std::vector<std::string> Dataset::readHeader(std::ifstream& file) {
     bool malformed = false;
-    auto header = parseCSVLine(file, &malformed);
+    auto header = CSVUtils::parseCSVLine(file, delimiter_, &malformed);
     if (header.empty() || malformed) {
         throw Seldon::DatasetException("Empty or malformed header in " + filename_);
     }
-
-    std::unordered_set<std::string> seen;
-    for (size_t i = 0; i < header.size(); ++i) {
-        if (header[i].empty()) {
-            header[i] = "column_" + std::to_string(i + 1);
-        }
-
-        std::string original = header[i];
-        if (seen.find(header[i]) != seen.end()) {
-            size_t suffix = 2;
-            while (seen.find(original + "_" + std::to_string(suffix)) != seen.end()) {
-                ++suffix;
-            }
-            header[i] = original + "_" + std::to_string(suffix);
-        }
-        seen.insert(header[i]);
-    }
-
-    return header;
+    return CSVUtils::normalizeHeader(header);
 }
 
 void Dataset::detectColumnTypes(std::ifstream& file, size_t expectedCols, bool exhaustiveScan, 
@@ -134,9 +101,9 @@ void Dataset::detectColumnTypes(std::ifstream& file, size_t expectedCols, bool e
     std::streamsize fileSize = file.tellg();
     scanLimit = computeAdaptiveScanLimit(exhaustiveScan, expectedCols, fileSize);
     file.seekg(0, std::ios::beg);
-    skipBOM(file);
+    CSVUtils::skipBOM(file);
     bool headerMalformed = false;
-    parseCSVLine(file, &headerMalformed); // Skip header
+    CSVUtils::parseCSVLine(file, delimiter_, &headerMalformed); // Skip header
     if (headerMalformed) {
         throw Seldon::DatasetException("Malformed CSV header in " + filename_);
     }
@@ -150,7 +117,7 @@ void Dataset::detectColumnTypes(std::ifstream& file, size_t expectedCols, bool e
         }
 
         bool malformed = false;
-        auto rawRow = parseCSVLine(file, &malformed);
+        auto rawRow = CSVUtils::parseCSVLine(file, delimiter_, &malformed);
         ++recordNumber;
         if (rawRow.empty()) continue;
         if (malformed) {
@@ -277,10 +244,14 @@ void Dataset::processImputations(const std::vector<std::vector<double>>& rawData
 }
 
 void Dataset::load(bool skipMalformed, bool exhaustiveScan, ImputationStrategy strategy) {
-    if (allColumnNames.empty()) analyzeMetadata();
-
     std::ifstream file(filename_, std::ios::binary);
     if (!file.is_open()) throw Seldon::IOException("Could not open file " + filename_);
+
+    if (allColumnNames.empty()) {
+        CSVUtils::skipBOM(file);
+        allColumnNames = readHeader(file);
+        isNumeric.assign(allColumnNames.size(), true);
+    }
     
     size_t expectedCols = allColumnNames.size();
     std::vector<bool> hasValue(expectedCols, false);
@@ -316,7 +287,7 @@ void Dataset::loadChunk(size_t startRow, size_t numRows) {
     std::ifstream file(filename_, std::ios::binary);
     if (!file.is_open()) throw Seldon::IOException("Could not open file " + filename_);
 
-    skipBOM(file);
+    CSVUtils::skipBOM(file);
     auto allColNames = readHeader(file);
 
     if (numericIndices.empty()) {
@@ -335,7 +306,7 @@ void Dataset::loadChunk(size_t startRow, size_t numRows) {
             return;
         }
         bool ignoredMalformed = false;
-        parseCSVLine(file, &ignoredMalformed);
+        CSVUtils::parseCSVLine(file, delimiter_, &ignoredMalformed);
     }
 
     columns.assign(numericIndices.size(), std::vector<double>());
@@ -344,7 +315,7 @@ void Dataset::loadChunk(size_t startRow, size_t numRows) {
     rowCount = 0;
     while (rowCount < numRows && file.peek() != EOF) {
         bool malformed = false;
-        auto rawRow = parseCSVLine(file, &malformed);
+        auto rawRow = CSVUtils::parseCSVLine(file, delimiter_, &malformed);
         if (rawRow.empty()) continue;
         if (malformed) continue;
 
@@ -380,7 +351,7 @@ void Dataset::openStream() {
     if (streamFile.is_open()) streamFile.close();
     streamFile.open(filename_, std::ios::binary);
     if (!streamFile.is_open()) throw Seldon::IOException("Could not open file " + filename_);
-    skipBOM(streamFile);
+    CSVUtils::skipBOM(streamFile);
     
     if (allColumnNames.empty()) {
         allColumnNames = readHeader(streamFile);
@@ -414,7 +385,7 @@ bool Dataset::fetchNextChunk(size_t chunkSize) {
     rowCount = 0;
     while (rowCount < chunkSize && streamFile.peek() != EOF) {
         bool malformed = false;
-        auto rawRow = parseCSVLine(streamFile, &malformed);
+        auto rawRow = CSVUtils::parseCSVLine(streamFile, delimiter_, &malformed);
         if (rawRow.empty()) continue;
         if (malformed) continue;
 
@@ -451,78 +422,7 @@ void Dataset::closeStream() {
 }
 
 std::vector<std::string> Dataset::parseCSVLine(std::istream& is, bool* malformed, size_t* consumedLines) {
-    if (malformed) *malformed = false;
-    if (consumedLines) *consumedLines = 0;
-    if (is.peek() == EOF) return {};
-
-    std::vector<std::string> row;
-    std::vector<bool> fieldQuoted;
-    std::string val;
-    bool inQuotes = false;
-    bool currentFieldQuoted = false;
-    bool hasRecordData = false;
-    bool hadDelimiter = false;
-    char c;
-
-    while (is.get(c)) {
-        if (c == '"') {
-            if (!inQuotes && val.empty()) {
-                inQuotes = true;
-                currentFieldQuoted = true;
-                hasRecordData = true;
-            } else if (inQuotes) {
-                if (is.peek() == '"') {
-                    val += '"';
-                    is.get();
-                } else {
-                    inQuotes = false;
-                }
-            } else {
-                val += c;
-                hasRecordData = true;
-            }
-        } else if (c == delimiter_ && !inQuotes) {
-            row.push_back(currentFieldQuoted ? val : trimUnquotedField(val));
-            fieldQuoted.push_back(currentFieldQuoted);
-            val.clear();
-            currentFieldQuoted = false;
-            hadDelimiter = true;
-            hasRecordData = true;
-        } else if (c == '\r') {
-            if (is.peek() == '\n') is.get();
-            if (consumedLines) ++(*consumedLines);
-            if (inQuotes) {
-                val += '\n';
-            } else {
-                break;
-            }
-        } else if (c == '\n') {
-            if (consumedLines) ++(*consumedLines);
-            if (inQuotes) {
-                val += '\n';
-            } else {
-                break;
-            }
-        } else {
-            val += c;
-            hasRecordData = true;
-        }
-    }
-
-    if (inQuotes && malformed) {
-        *malformed = true;
-    }
-
-    if (hasRecordData || hadDelimiter || !val.empty()) {
-        row.push_back(currentFieldQuoted ? val : trimUnquotedField(val));
-        fieldQuoted.push_back(currentFieldQuoted);
-    }
-
-    if (row.size() == 1 && row[0].empty() && !fieldQuoted[0] && !hadDelimiter) {
-        return {};
-    }
-
-    return row;
+    return CSVUtils::parseCSVLine(is, delimiter_, malformed, consumedLines);
 }
 
 void Dataset::calculateImputations(const std::vector<std::vector<double>>& rawNumericData, 

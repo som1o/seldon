@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -11,7 +12,7 @@ struct PlotConfig {
 
 struct AutoConfig {
     std::string datasetPath;
-    std::string reportFile = "seldon_report.html";
+    std::string reportFile = "neural_synthesis.txt";
     std::string assetsDir = "seldon_report_assets";
     std::string targetColumn;
     char delimiter = ',';
@@ -25,6 +26,13 @@ struct AutoConfig {
 
     std::string scalingMethod = "auto";     // auto|zscore|minmax|none
     int kfold = 5;
+
+    bool plotUnivariate = false;
+    bool plotOverall = false;
+    bool plotBivariateSignificant = true;
+    bool verboseAnalysis = true;
+    uint32_t neuralSeed = 1337;
+    double gradientClipNorm = 5.0;
 
     PlotConfig plot;
 

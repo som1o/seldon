@@ -7,7 +7,7 @@ Seldon is a C++ automated analytics engine that performs end-to-end data process
 - Automated EDA plotting via gnuplot
 - Baseline model benchmarking (linear, ridge, tree-stump)
 - Neural-network training with sensible defaults
-- Unified HTML report generation
+- Unified text report generation
 
 ## Build
 
@@ -15,6 +15,13 @@ Seldon is a C++ automated analytics engine that performs end-to-end data process
 mkdir -p build
 cd build
 cmake ..
+cmake --build . -j
+```
+
+Legacy compatibility build (optional):
+
+```bash
+cmake -DSELDON_ENABLE_LEGACY=ON ..
 cmake --build . -j
 ```
 
@@ -29,7 +36,14 @@ Optional:
 ```bash
 ./seldon /path/to/data.csv --config config.yaml
 ./seldon /path/to/data.csv --target sales --delimiter ';'
+./seldon /path/to/data.csv --plots bivariate,univariate,overall
+./seldon /path/to/data.csv --neural-seed 1337 --gradient-clip 5.0
 ```
+
+Extended documentation:
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/USAGE.md](docs/USAGE.md)
 
 ## Architecture
 
@@ -85,20 +99,27 @@ Optional:
 
 ### Plotting and Reporting
 - `src/GnuplotEngine.cpp` / `include/GnuplotEngine.h`
-  - Generates histogram, bar, scatter, line, heatmap
+  - Generates PNG plots in dedicated folders (`univariate`, `bivariate`, `overall`)
   - Safe id/path handling and script/value escaping
+  - Automatically removes intermediate `.dat` / `.plt` files
 
 - `src/ReportEngine.cpp` / `include/ReportEngine.h`
-  - Unified HTML report templating
-  - HTML escaping for robust rendering
+  - Plain-text report writer with section/table formatting
 
 ## Output
 
 By default, each run generates:
 
-- `seldon_report.html`
-- `seldon_report_assets/` (all generated plot files and intermediate gnuplot files)
-- `seldon_model.seldon` (trained neural model)
+- `univaraite.txt` (univariate summary)
+- `bivariate.txt` (all pair combinations + final significant table)
+- `neural_synthesis.txt` (detailed neural lattice training trace + synthesis)
+- `final_analysis.txt` (significant findings only, selected by neural decision engine)
+- `seldon_report_assets/bivariate/` (PNG plots for selected significant bivariate results)
+
+When supervised plotting is explicitly enabled, it also generates:
+
+- `seldon_report_assets/univariate/` (univariate histograms/category distributions)
+- `seldon_report_assets/overall/` (overall missingness/heatmap/loss trend plots)
 
 ## Config File (YAML/JSON-like key:value)
 
@@ -106,7 +127,7 @@ Example:
 
 ```yaml
 target: sales
-report: seldon_report.html
+report: neural_synthesis.txt
 assets_dir: seldon_report_assets
 delimiter: ,
 outlier_method: iqr
@@ -116,6 +137,13 @@ kfold: 5
 plot_format: png
 plot_width: 1280
 plot_height: 720
+plot_univariate: false
+plot_overall: false
+plot_bivariate_significant: true
+verbose_analysis: true
+neural_seed: 1337
+gradient_clip_norm: 5.0
+plots: bivariate
 exclude: id,notes
 impute.sales: median
 impute.region: mode
@@ -135,6 +163,13 @@ Supported scalar keys:
 - `plot_format` (`png`|`svg`|`pdf`)
 - `plot_width`
 - `plot_height`
+- `plot_univariate` (`true`|`false`)
+- `plot_overall` (`true`|`false`)
+- `plot_bivariate_significant` (`true`|`false`)
+- `verbose_analysis` (`true`|`false`)
+- `neural_seed` (unsigned integer)
+- `gradient_clip_norm` (>= 0)
+- `plots` (comma-separated profile: `none`, `bivariate`, `univariate`, `overall`, `all`)
 - `exclude` (comma-separated)
 - `impute.<columnName>`
 
@@ -156,6 +191,7 @@ Seldon intentionally favors a strong automated foundation over advanced model co
 
 - Decision tree baseline currently uses a stump for speed and robustness.
 - Config parser supports practical YAML/JSON-like key:value files, not full spec-complete parsing.
+- `TypedDataset` is the primary path; legacy `Dataset`/`LogicEngine`/`StatsEngine`/`TerminalUI` modules remain for compatibility, are excluded from default builds, and are candidates for future retirement.
 
 ## License
 

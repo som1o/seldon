@@ -4,6 +4,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 
 namespace {
 std::string trim(const std::string& s) {
@@ -48,9 +49,74 @@ int parseIntStrict(const std::string& value, const std::string& key, int minValu
     }
 }
 
+uint32_t parseUIntStrict(const std::string& value, const std::string& key) {
+    try {
+        size_t pos = 0;
+        unsigned long parsed = std::stoul(value, &pos);
+        if (pos != value.size()) {
+            throw Seldon::ConfigurationException("Invalid unsigned integer for " + key + ": " + value);
+        }
+        return static_cast<uint32_t>(parsed);
+    } catch (const Seldon::SeldonException&) {
+        throw;
+    } catch (const std::exception&) {
+        throw Seldon::ConfigurationException("Invalid unsigned integer for " + key + ": " + value);
+    }
+}
+
+double parseDoubleStrict(const std::string& value, const std::string& key, double minValue) {
+    try {
+        size_t pos = 0;
+        double parsed = std::stod(value, &pos);
+        if (pos != value.size()) {
+            throw Seldon::ConfigurationException("Invalid number for " + key + ": " + value);
+        }
+        if (parsed < minValue) {
+            throw Seldon::ConfigurationException("Value for " + key + " must be >= " + std::to_string(minValue));
+        }
+        return parsed;
+    } catch (const Seldon::SeldonException&) {
+        throw;
+    } catch (const std::exception&) {
+        throw Seldon::ConfigurationException("Invalid number for " + key + ": " + value);
+    }
+}
+
 std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
+}
+
+bool parseBoolStrict(const std::string& value, const std::string& key) {
+    std::string v = lower(trim(value));
+    if (v == "1" || v == "true" || v == "yes" || v == "on") return true;
+    if (v == "0" || v == "false" || v == "no" || v == "off") return false;
+    throw Seldon::ConfigurationException("Invalid boolean for " + key + ": " + value);
+}
+
+void applyPlotModes(AutoConfig& config, const std::string& value) {
+    config.plotUnivariate = false;
+    config.plotOverall = false;
+    config.plotBivariateSignificant = false;
+
+    for (const auto& tokenRaw : splitCSV(value)) {
+        const std::string token = lower(trim(tokenRaw));
+        if (token == "none") {
+            config.plotUnivariate = false;
+            config.plotOverall = false;
+            config.plotBivariateSignificant = false;
+        } else if (token == "all") {
+            config.plotUnivariate = true;
+            config.plotOverall = true;
+            config.plotBivariateSignificant = true;
+        } else if (token == "univariate") {
+            config.plotUnivariate = true;
+        } else if (token == "overall") {
+            config.plotOverall = true;
+        } else if (token == "bivariate" || token == "significant") {
+            config.plotBivariateSignificant = true;
+        }
+    }
 }
 
 void assignKeyValue(AutoConfig& config, const std::string& key, const std::string& value) {
@@ -69,13 +135,20 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
     else if (key == "plot_format") config.plot.format = lower(value);
     else if (key == "plot_width") config.plot.width = parseIntStrict(value, "plot_width", 320);
     else if (key == "plot_height") config.plot.height = parseIntStrict(value, "plot_height", 240);
+    else if (key == "plot_univariate") config.plotUnivariate = parseBoolStrict(value, "plot_univariate");
+    else if (key == "plot_overall") config.plotOverall = parseBoolStrict(value, "plot_overall");
+    else if (key == "plot_bivariate_significant") config.plotBivariateSignificant = parseBoolStrict(value, "plot_bivariate_significant");
+    else if (key == "verbose_analysis") config.verboseAnalysis = parseBoolStrict(value, "verbose_analysis");
+    else if (key == "neural_seed") config.neuralSeed = parseUIntStrict(value, "neural_seed");
+    else if (key == "gradient_clip_norm") config.gradientClipNorm = parseDoubleStrict(value, "gradient_clip_norm", 0.0);
+    else if (key == "plots") applyPlotModes(config, value);
     else if (key == "exclude") config.excludedColumns = splitCSV(value);
 }
 }
 
 AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     if (argc < 2) {
-        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,]");
+        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--verbose-analysis true|false] [--neural-seed N] [--gradient-clip N]");
     }
 
     AutoConfig config;
@@ -92,6 +165,20 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             std::string v = argv[++i];
             if (v.size() != 1) throw Seldon::ConfigurationException("--delimiter expects a single character");
             config.delimiter = v[0];
+        } else if (arg == "--plots" && i + 1 < argc) {
+            applyPlotModes(config, argv[++i]);
+        } else if (arg == "--plot-univariate" && i + 1 < argc) {
+            config.plotUnivariate = parseBoolStrict(argv[++i], "--plot-univariate");
+        } else if (arg == "--plot-overall" && i + 1 < argc) {
+            config.plotOverall = parseBoolStrict(argv[++i], "--plot-overall");
+        } else if (arg == "--plot-bivariate" && i + 1 < argc) {
+            config.plotBivariateSignificant = parseBoolStrict(argv[++i], "--plot-bivariate");
+        } else if (arg == "--verbose-analysis" && i + 1 < argc) {
+            config.verboseAnalysis = parseBoolStrict(argv[++i], "--verbose-analysis");
+        } else if (arg == "--neural-seed" && i + 1 < argc) {
+            config.neuralSeed = parseUIntStrict(argv[++i], "--neural-seed");
+        } else if (arg == "--gradient-clip" && i + 1 < argc) {
+            config.gradientClipNorm = parseDoubleStrict(argv[++i], "--gradient-clip", 0.0);
         }
     }
 

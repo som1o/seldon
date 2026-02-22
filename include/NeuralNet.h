@@ -31,10 +31,13 @@ public:
         double valSplit = 0.2;
         int earlyStoppingPatience = 10;
         double minDelta = 1e-4;       // Minimum improvement for early stopping
+        double gradientClipNorm = 5.0;
+        uint32_t seed = 1337;
         bool verbose = true;
     };
 
     NeuralNet(std::vector<size_t> topology);
+    void setSeed(uint32_t seed);
     
     // Train the network using advanced features
     void train(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
@@ -106,6 +109,8 @@ private:
     std::vector<ScaleInfo> outputScales;
     std::vector<double> trainLossHistory;
     std::vector<double> valLossHistory;
+    uint32_t seedState = 1337;
+    uint64_t forwardCounter = 0;
 
     // Persistent RNG for performance and consistency
     std::mt19937 rng;

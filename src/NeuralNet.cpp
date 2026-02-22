@@ -66,6 +66,13 @@ namespace {
             swapEndian(val);
         }
     }
+
+    uint64_t splitmix64(uint64_t x) {
+        x += 0x9e3779b97f4a7c15ULL;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        return x ^ (x >> 31);
+    }
 }
 
 NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
@@ -78,8 +85,7 @@ NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
         }
     }
 
-    std::random_device rd;
-    rng.seed(rd());
+    rng.seed(seedState);
 
     for (size_t l = 0; l < topology.size(); ++l) {
         Layer layer;
@@ -120,6 +126,11 @@ NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
     }
 }
 
+void NeuralNet::setSeed(uint32_t seed) {
+    seedState = seed;
+    rng.seed(seedState);
+}
+
 double NeuralNet::activate(double x, Activation act) {
     switch (act) {
         case Activation::RELU: return std::max(0.0, x);
@@ -154,6 +165,7 @@ void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTrain
         m_layers[0].outputs[i] = 0.0;
     }
 
+    ++forwardCounter;
     for (size_t l = 1; l < m_layers.size(); ++l) {
         Layer& current = m_layers[l];
         Layer& prev = m_layers[l - 1];
@@ -174,11 +186,13 @@ void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTrain
             double out = activate(sum, current.activation);
 
             if (isTraining && l < m_layers.size() - 1 && dropoutRate > 0.0) {
-                // Thread-local RNG to avoid critical section contention
-                static thread_local std::mt19937 t_rng(std::random_device{}());
-                std::uniform_real_distribution<> t_dis(0.0, 1.0);
+                uint64_t key = static_cast<uint64_t>(seedState);
+                key ^= (static_cast<uint64_t>(l) << 48);
+                key ^= (static_cast<uint64_t>(n) << 24);
+                key ^= forwardCounter;
+                double u = (splitmix64(key) & 0xFFFFFF) / static_cast<double>(0x1000000);
 
-                if (t_dis(t_rng) < dropoutRate) {
+                if (u < dropoutRate) {
                     current.outputs[n] = 0.0;
                     current.dropMask[n] = true;
                 } else {
@@ -280,6 +294,21 @@ void NeuralNet::applyOptimization(const Hyperparameters& hp, size_t t_step) {
 
 void NeuralNet::backpropagate(const std::vector<double>& targetValues, const Hyperparameters& hp, size_t t_step) {
     computeGradients(targetValues, hp.loss);
+
+    if (hp.gradientClipNorm > 0.0) {
+        double sqNorm = 0.0;
+        for (size_t l = 1; l < m_layers.size(); ++l) {
+            for (double g : m_layers[l].gradients) sqNorm += g * g;
+        }
+        double norm = std::sqrt(sqNorm);
+        if (norm > hp.gradientClipNorm && norm > 1e-12) {
+            double scale = hp.gradientClipNorm / norm;
+            for (size_t l = 1; l < m_layers.size(); ++l) {
+                for (double& g : m_layers[l].gradients) g *= scale;
+            }
+        }
+    }
+
     applyOptimization(hp, t_step);
 }
 
@@ -311,6 +340,8 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
 
     this->inputScales = inScales;
     this->outputScales = outScales;
+    setSeed(hp.seed);
+    forwardCounter = 0;
     trainLossHistory.clear();
     valLossHistory.clear();
 
@@ -346,8 +377,8 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
         trainLossHistory.push_back(trainLoss);
         valLossHistory.push_back(valLoss);
 
-        if (hp.verbose && (epoch % std::max(size_t(1), hp.epochs / 10) == 0 || epoch == hp.epochs - 1)) {
-            std::cout << "[Epoch " << epoch << "] Train Loss: " << trainLoss << " | Val Loss: " << valLoss << std::endl;
+        if (hp.verbose) {
+            std::cout << "[Epoch " << (epoch + 1) << "/" << hp.epochs << "] Train Loss: " << trainLoss << " | Val Loss: " << valLoss << std::endl;
         }
 
         if (valSize > 0) {

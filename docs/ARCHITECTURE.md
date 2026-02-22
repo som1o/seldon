@@ -1,0 +1,52 @@
+# Seldon Architecture
+
+## Overview
+Seldon is organized as a deterministic analytics pipeline centered on `TypedDataset`.
+
+1. **Ingestion**: CSV parsing + typed inference (`numeric`, `categorical`, `datetime`)
+2. **Preprocessing**: missing handling, outlier processing, scaling
+3. **Statistics & Decisioning**:
+   - Univariate statistical profiling
+   - Bivariate significance analysis
+   - Neural-lattice relevance scoring
+4. **Reporting**:
+   - `univaraite.txt`
+   - `bivariate.txt`
+   - `neural_synthesis.txt`
+   - `final_analysis.txt`
+5. **Plotting (Supervised)**:
+   - `seldon_report_assets/univariate`
+   - `seldon_report_assets/bivariate`
+   - `seldon_report_assets/overall`
+
+## Core Modules
+- `AutomationPipeline`: end-to-end orchestration
+- `TypedDataset`: typed storage and row-aligned transformations
+- `CSVUtils`: shared CSV line parser/BOM/header normalization
+- `Preprocessor`: missing/outlier/scaling transformations
+- `MathUtils`: statistical significance and matrix math
+- `NeuralNet`: feed-forward network with deterministic seed + gradient clipping
+- `GnuplotEngine`: optional PNG plotting backend
+- `ReportEngine`: plain-text report writer
+
+## Design Notes
+- `TypedDataset` is the main production dataset representation.
+- Legacy `Dataset` remains for compatibility/streaming workflows, but parser logic is now centralized in `CSVUtils`.
+- Pearson correlation in pipeline delegates to `MathUtils` to avoid duplicated statistical formulas.
+- Plot generation gracefully degrades when `gnuplot` is unavailable; analysis reports are still fully generated.
+
+## Known Cleanup Items
+- `Dataset` + `LogicEngine`/`StatsEngine`/`TerminalUI` legacy paths are still present for compatibility but are not the primary automation path.
+- Default builds now exclude these legacy modules; opt-in via `-DSELDON_ENABLE_LEGACY=ON` when needed.
+- A future major cleanup can retire legacy-only execution paths once streaming and benchmark dependencies are fully migrated to `TypedDataset`.
+- Implementation files are intentionally concise; additional inline comments can be added over time around highly numerical sections if desired.
+
+## Determinism & Numerical Safety
+- Neural training supports fixed seed control (`neural_seed`) for reproducibility.
+- Global gradient clipping (`gradient_clip_norm`) mitigates unstable updates.
+- Statistical significance is computed consistently through `MathUtils`.
+
+## Extension Points
+- Replace `GnuplotEngine` with another plotting backend while preserving report contract.
+- Introduce richer model ensembles in `BenchmarkEngine`.
+- Expand typed datetime feature engineering in `TypedDataset` + preprocessing stage.

@@ -3,29 +3,24 @@ project(Seldon VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-include_directories(include)
+option(SELDON_ENABLE_LEGACY "Build legacy Dataset/LogicEngine/StatsEngine/TerminalUI modules" OFF)
 
 file(GLOB SOURCES "src/*.cpp")
-
-# Find and enable OpenMP (Optional)
-find_package(OpenMP)
-
-# Seldon Application
-add_executable(seldon ${SOURCES})
-
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(seldon PUBLIC OpenMP::OpenMP_CXX)
-    target_compile_definitions(seldon PRIVATE USE_OPENMP)
+list(FILTER SOURCES EXCLUDE REGEX "src/tests\\.cpp$")
+if(NOT SELDON_ENABLE_LEGACY)
+    list(FILTER SOURCES EXCLUDE REGEX "src/Dataset\\.cpp$")
+    list(FILTER SOURCES EXCLUDE REGEX "src/LogicEngine\\.cpp$")
+    list(FILTER SOURCES EXCLUDE REGEX "src/StatsEngine\\.cpp$")
+    list(FILTER SOURCES EXCLUDE REGEX "src/TerminalUI\\.cpp$")
 endif()
 
-# Seldon Tests
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tests.cpp")
-    set(TEST_SOURCES src/tests.cpp src/Dataset.cpp src/MathUtils.cpp)
-    add_executable(seldon_tests ${TEST_SOURCES})
-    if(OpenMP_CXX_FOUND)
-        target_link_libraries(seldon_tests PUBLIC OpenMP::OpenMP_CXX)
-        target_compile_definitions(seldon_tests PRIVATE USE_OPENMP)
-    endif()
-    target_include_directories(seldon_tests PRIVATE include)
+add_executable(seldon ${SOURCES})
+target_include_directories(seldon PRIVATE include)
+
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(seldon PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_definitions(seldon PRIVATE USE_OPENMP)
 endif()
