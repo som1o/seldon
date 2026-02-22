@@ -1,3 +1,0 @@
-/home/muktadir/Documents/GitHub/seldon/build/CMakeFiles/seldon.dir
-/home/muktadir/Documents/GitHub/seldon/build/CMakeFiles/edit_cache.dir
-/home/muktadir/Documents/GitHub/seldon/build/CMakeFiles/rebuild_cache.dir
