@@ -4,12 +4,28 @@
 #include <cctype>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <unordered_map>
 
 namespace {
 using NumVec = std::vector<double>;
 using StrVec = std::vector<std::string>;
 using TimeVec = std::vector<int64_t>;
+
+bool isBinarySeries(const NumVec& values) {
+    bool seenZero = false;
+    bool seenOne = false;
+    for (double v : values) {
+        if (std::abs(v) <= 1e-9) {
+            seenZero = true;
+        } else if (std::abs(v - 1.0) <= 1e-9) {
+            seenOne = true;
+        } else {
+            return false;
+        }
+    }
+    return seenZero || seenOne;
+}
 
 std::string toLower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
@@ -165,6 +181,7 @@ void capOutliers(NumVec& values, const std::vector<bool>& flags) {
 
 PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config) {
     PreprocessReport report;
+    report.originalRowCount = data.rowCount();
 
     // missing counts + imputation
     for (auto& col : data.columns()) {
@@ -217,6 +234,17 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
         if (col.type != ColumnType::NUMERIC) continue;
         auto& values = std::get<NumVec>(col.values);
         if (values.empty()) continue;
+
+        if (!config.targetColumn.empty() && col.name == config.targetColumn && isBinarySeries(values)) {
+            ScalingParams params;
+            params.method = ScalingMethod::NONE;
+            auto mm = std::minmax_element(values.begin(), values.end());
+            params.min = *mm.first;
+            params.max = *mm.second;
+            params.mean = std::accumulate(values.begin(), values.end(), 0.0) / static_cast<double>(values.size());
+            report.scaling[col.name] = params;
+            continue;
+        }
 
         auto mm = std::minmax_element(values.begin(), values.end());
         double minv = *mm.first;

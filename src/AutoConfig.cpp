@@ -132,6 +132,12 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
     else if (key == "outlier_action") config.outlierAction = lower(value);
     else if (key == "scaling") config.scalingMethod = lower(value);
     else if (key == "kfold") config.kfold = parseIntStrict(value, "kfold", 2);
+    else if (key == "max_feature_missing_ratio") {
+        config.maxFeatureMissingRatio = parseDoubleStrict(value, "max_feature_missing_ratio", -1.0);
+        if (config.maxFeatureMissingRatio > 1.0 || config.maxFeatureMissingRatio < -1.0) {
+            throw Seldon::ConfigurationException("max_feature_missing_ratio must be -1 or within [0,1]");
+        }
+    }
     else if (key == "plot_format") config.plot.format = lower(value);
     else if (key == "plot_width") config.plot.width = parseIntStrict(value, "plot_width", 320);
     else if (key == "plot_height") config.plot.height = parseIntStrict(value, "plot_height", 240);
@@ -142,13 +148,25 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
     else if (key == "neural_seed") config.neuralSeed = parseUIntStrict(value, "neural_seed");
     else if (key == "gradient_clip_norm") config.gradientClipNorm = parseDoubleStrict(value, "gradient_clip_norm", 0.0);
     else if (key == "plots") applyPlotModes(config, value);
+    else if (key == "target_strategy") config.targetStrategy = lower(value);
+    else if (key == "feature_strategy") config.featureStrategy = lower(value);
+    else if (key == "neural_strategy") config.neuralStrategy = lower(value);
+    else if (key == "bivariate_strategy") config.bivariateStrategy = lower(value);
     else if (key == "exclude") config.excludedColumns = splitCSV(value);
+    else if (key == "feature_min_variance") config.tuning.featureMinVariance = parseDoubleStrict(value, "feature_min_variance", 0.0);
+    else if (key == "feature_leakage_corr_threshold") config.tuning.featureLeakageCorrThreshold = parseDoubleStrict(value, "feature_leakage_corr_threshold", 0.0);
+    else if (key == "feature_missing_q3_offset") config.tuning.featureMissingQ3Offset = parseDoubleStrict(value, "feature_missing_q3_offset", 0.0);
+    else if (key == "feature_missing_floor") config.tuning.featureMissingAdaptiveMin = parseDoubleStrict(value, "feature_missing_floor", 0.0);
+    else if (key == "feature_missing_ceiling") config.tuning.featureMissingAdaptiveMax = parseDoubleStrict(value, "feature_missing_ceiling", 0.0);
+    else if (key == "feature_aggressive_delta") config.tuning.featureAggressiveDelta = parseDoubleStrict(value, "feature_aggressive_delta", 0.0);
+    else if (key == "feature_lenient_delta") config.tuning.featureLenientDelta = parseDoubleStrict(value, "feature_lenient_delta", 0.0);
+    else if (key == "bivariate_selection_quantile") config.tuning.bivariateSelectionQuantileOverride = parseDoubleStrict(value, "bivariate_selection_quantile", -1.0);
 }
 }
 
 AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     if (argc < 2) {
-        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--verbose-analysis true|false] [--neural-seed N] [--gradient-clip N]");
+        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--verbose-analysis true|false] [--neural-seed N] [--gradient-clip N] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--bivariate-selection-quantile 0..1]");
     }
 
     AutoConfig config;
@@ -179,6 +197,25 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.neuralSeed = parseUIntStrict(argv[++i], "--neural-seed");
         } else if (arg == "--gradient-clip" && i + 1 < argc) {
             config.gradientClipNorm = parseDoubleStrict(argv[++i], "--gradient-clip", 0.0);
+        } else if (arg == "--max-feature-missing-ratio" && i + 1 < argc) {
+            config.maxFeatureMissingRatio = parseDoubleStrict(argv[++i], "--max-feature-missing-ratio", -1.0);
+            if (config.maxFeatureMissingRatio > 1.0 || config.maxFeatureMissingRatio < -1.0) {
+                throw Seldon::ConfigurationException("--max-feature-missing-ratio must be -1 or within [0,1]");
+            }
+        } else if (arg == "--target-strategy" && i + 1 < argc) {
+            config.targetStrategy = lower(argv[++i]);
+        } else if (arg == "--feature-strategy" && i + 1 < argc) {
+            config.featureStrategy = lower(argv[++i]);
+        } else if (arg == "--neural-strategy" && i + 1 < argc) {
+            config.neuralStrategy = lower(argv[++i]);
+        } else if (arg == "--bivariate-strategy" && i + 1 < argc) {
+            config.bivariateStrategy = lower(argv[++i]);
+        } else if (arg == "--feature-min-variance" && i + 1 < argc) {
+            config.tuning.featureMinVariance = parseDoubleStrict(argv[++i], "--feature-min-variance", 0.0);
+        } else if (arg == "--feature-leakage-corr-threshold" && i + 1 < argc) {
+            config.tuning.featureLeakageCorrThreshold = parseDoubleStrict(argv[++i], "--feature-leakage-corr-threshold", 0.0);
+        } else if (arg == "--bivariate-selection-quantile" && i + 1 < argc) {
+            config.tuning.bivariateSelectionQuantileOverride = parseDoubleStrict(argv[++i], "--bivariate-selection-quantile", -1.0);
         }
     }
 
@@ -189,6 +226,32 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
 
     if (config.datasetPath.empty()) {
         throw Seldon::ConfigurationException("Dataset path is required");
+    }
+
+    const auto isIn = [](const std::string& value, const std::vector<std::string>& allowed) {
+        return std::find(allowed.begin(), allowed.end(), value) != allowed.end();
+    };
+    if (!isIn(config.targetStrategy, {"auto", "quality", "max_variance", "last_numeric"})) {
+        throw Seldon::ConfigurationException("--target-strategy must be one of: auto, quality, max_variance, last_numeric");
+    }
+    if (!isIn(config.featureStrategy, {"auto", "adaptive", "aggressive", "lenient"})) {
+        throw Seldon::ConfigurationException("--feature-strategy must be one of: auto, adaptive, aggressive, lenient");
+    }
+    if (!isIn(config.neuralStrategy, {"auto", "fast", "balanced", "expressive"})) {
+        throw Seldon::ConfigurationException("--neural-strategy must be one of: auto, fast, balanced, expressive");
+    }
+    if (!isIn(config.bivariateStrategy, {"auto", "balanced", "corr_heavy", "importance_heavy"})) {
+        throw Seldon::ConfigurationException("--bivariate-strategy must be one of: auto, balanced, corr_heavy, importance_heavy");
+    }
+    if (config.tuning.featureLeakageCorrThreshold < 0.0 || config.tuning.featureLeakageCorrThreshold > 1.0) {
+        throw Seldon::ConfigurationException("--feature-leakage-corr-threshold must be within [0,1]");
+    }
+    if (config.tuning.featureMissingAdaptiveMin > config.tuning.featureMissingAdaptiveMax) {
+        throw Seldon::ConfigurationException("feature_missing_floor must be <= feature_missing_ceiling");
+    }
+    if (config.tuning.bivariateSelectionQuantileOverride != -1.0 &&
+        (config.tuning.bivariateSelectionQuantileOverride < 0.0 || config.tuning.bivariateSelectionQuantileOverride > 1.0)) {
+        throw Seldon::ConfigurationException("bivariate_selection_quantile must be -1 or within [0,1]");
     }
 
     return config;
@@ -240,6 +303,32 @@ AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig&
 
     if (config.scalingMethod != "auto" && config.scalingMethod != "zscore" && config.scalingMethod != "minmax" && config.scalingMethod != "none") {
         throw Seldon::ConfigurationException("scaling must be auto, zscore, minmax, or none");
+    }
+
+    const auto isIn = [](const std::string& value, const std::vector<std::string>& allowed) {
+        return std::find(allowed.begin(), allowed.end(), value) != allowed.end();
+    };
+    if (!isIn(config.targetStrategy, {"auto", "quality", "max_variance", "last_numeric"})) {
+        throw Seldon::ConfigurationException("target_strategy must be one of: auto, quality, max_variance, last_numeric");
+    }
+    if (!isIn(config.featureStrategy, {"auto", "adaptive", "aggressive", "lenient"})) {
+        throw Seldon::ConfigurationException("feature_strategy must be one of: auto, adaptive, aggressive, lenient");
+    }
+    if (!isIn(config.neuralStrategy, {"auto", "fast", "balanced", "expressive"})) {
+        throw Seldon::ConfigurationException("neural_strategy must be one of: auto, fast, balanced, expressive");
+    }
+    if (!isIn(config.bivariateStrategy, {"auto", "balanced", "corr_heavy", "importance_heavy"})) {
+        throw Seldon::ConfigurationException("bivariate_strategy must be one of: auto, balanced, corr_heavy, importance_heavy");
+    }
+    if (config.tuning.featureLeakageCorrThreshold < 0.0 || config.tuning.featureLeakageCorrThreshold > 1.0) {
+        throw Seldon::ConfigurationException("feature_leakage_corr_threshold must be within [0,1]");
+    }
+    if (config.tuning.featureMissingAdaptiveMin > config.tuning.featureMissingAdaptiveMax) {
+        throw Seldon::ConfigurationException("feature_missing_floor must be <= feature_missing_ceiling");
+    }
+    if (config.tuning.bivariateSelectionQuantileOverride != -1.0 &&
+        (config.tuning.bivariateSelectionQuantileOverride < 0.0 || config.tuning.bivariateSelectionQuantileOverride > 1.0)) {
+        throw Seldon::ConfigurationException("bivariate_selection_quantile must be -1 or within [0,1]");
     }
 
     return config;

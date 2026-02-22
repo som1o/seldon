@@ -16,6 +16,7 @@ struct ScalingParams {
 };
 
 struct PreprocessReport {
+    size_t originalRowCount = 0;
     std::unordered_map<std::string, size_t> missingCounts;
     std::unordered_map<std::string, size_t> outlierCounts;
     std::unordered_map<std::string, std::vector<bool>> outlierFlags;

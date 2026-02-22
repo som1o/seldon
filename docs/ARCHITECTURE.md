@@ -10,7 +10,7 @@ Seldon is organized as a deterministic analytics pipeline centered on `TypedData
    - Bivariate significance analysis
    - Neural-lattice relevance scoring
 4. **Reporting**:
-   - `univaraite.txt`
+   - `univariate.txt`
    - `bivariate.txt`
    - `neural_synthesis.txt`
    - `final_analysis.txt`
@@ -31,15 +31,8 @@ Seldon is organized as a deterministic analytics pipeline centered on `TypedData
 
 ## Design Notes
 - `TypedDataset` is the main production dataset representation.
-- Legacy `Dataset` remains for compatibility/streaming workflows, but parser logic is now centralized in `CSVUtils`.
 - Pearson correlation in pipeline delegates to `MathUtils` to avoid duplicated statistical formulas.
 - Plot generation gracefully degrades when `gnuplot` is unavailable; analysis reports are still fully generated.
-
-## Known Cleanup Items
-- `Dataset` + `LogicEngine`/`StatsEngine`/`TerminalUI` legacy paths are still present for compatibility but are not the primary automation path.
-- Default builds now exclude these legacy modules; opt-in via `-DSELDON_ENABLE_LEGACY=ON` when needed.
-- A future major cleanup can retire legacy-only execution paths once streaming and benchmark dependencies are fully migrated to `TypedDataset`.
-- Implementation files are intentionally concise; additional inline comments can be added over time around highly numerical sections if desired.
 
 ## Determinism & Numerical Safety
 - Neural training supports fixed seed control (`neural_seed`) for reproducibility.

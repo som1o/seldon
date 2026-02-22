@@ -55,7 +55,7 @@ private:
     size_t rowCount_ = 0;
     std::vector<TypedColumn> columns_;
 
-    std::vector<std::string> parseCSVLine(std::istream& is, bool& malformed, size_t& consumedLines) const;
+    std::vector<std::string> parseCSVLine(std::istream& is, bool& malformed) const;
     static bool parseDouble(const std::string& v, double& out);
     static bool parseDateTime(const std::string& v, int64_t& outUnixSeconds);
     static std::string trim(const std::string& s);

@@ -1,5 +1,19 @@
 # Usage Guide
 
+## Build (with OpenMP)
+```bash
+mkdir -p build
+cd build
+cmake -DSELDON_ENABLE_OPENMP=ON ..
+cmake --build . -j
+```
+
+Disable OpenMP explicitly when needed:
+
+```bash
+cmake -DSELDON_ENABLE_OPENMP=OFF ..
+```
+
 ## Basic Run
 ```bash
 ./seldon /path/to/data.csv
@@ -24,9 +38,17 @@ Plots are opt-in by mode.
 ./seldon /path/to/data.csv --neural-seed 1337 --gradient-clip 5.0
 ```
 
+## Heuristic Tuning (Advanced)
+```bash
+./seldon /path/to/data.csv \
+	--feature-min-variance 1e-10 \
+	--feature-leakage-corr-threshold 0.995 \
+	--bivariate-selection-quantile 0.65
+```
+
 ## Outputs
 Always generated:
-- `univaraite.txt`
+- `univariate.txt`
 - `bivariate.txt`
 - `neural_synthesis.txt`
 - `final_analysis.txt`

@@ -139,6 +139,7 @@ double NeuralNet::activate(double x, Activation act) {
             double clipped = std::clamp(x, -60.0, 60.0);
             return 1.0 / (1.0 + std::exp(-clipped));
         }
+        case Activation::LINEAR: return x;
         default: return x;
     }
 }
@@ -148,6 +149,7 @@ double NeuralNet::activateDerivative(double out, Activation act) {
         case Activation::RELU: return out > 0 ? 1.0 : 0.0;
         case Activation::TANH: return 1.0 - out * out;
         case Activation::SIGMOID: return out * (1.0 - out);
+        case Activation::LINEAR: return 1.0;
         default: return 1.0;
     }
 }
@@ -230,25 +232,33 @@ void NeuralNet::computeGradients(const std::vector<double>& targetValues, LossFu
         Layer& hidden = m_layers[l];
         Layer& next = m_layers[l + 1];
 
+        std::fill(hidden.gradients.begin(), hidden.gradients.end(), 0.0);
+
+        for (size_t nn = 0; nn < next.size; ++nn) {
+            double next_grad = next.gradients[nn];
+            size_t weightOffset = nn * hidden.size;
+            #ifdef USE_OPENMP
+            #pragma omp simd
+            #endif
+            for (size_t n = 0; n < hidden.size; ++n) {
+                hidden.gradients[n] += next.weights[weightOffset + n] * next_grad;
+            }
+        }
+
         for (size_t n = 0; n < hidden.size; ++n) {
             if (hidden.dropMask[n]) {
                 hidden.gradients[n] = 0.0;
-                continue;
+            } else {
+                hidden.gradients[n] *= activateDerivative(hidden.outputs[n], hidden.activation);
             }
-            double dow = 0.0;
-            #ifdef USE_OPENMP
-            #pragma omp simd reduction(+:dow)
-            #endif
-            for (size_t nn = 0; nn < next.size; ++nn) {
-                dow += next.weights[nn * hidden.size + n] * next.gradients[nn];
-            }
-            hidden.gradients[n] = dow * activateDerivative(hidden.outputs[n], hidden.activation);
         }
     }
 }
 
 void NeuralNet::applyOptimization(const Hyperparameters& hp, size_t t_step) {
     const double beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8;
+    const double beta1_t = 1.0 - std::pow(beta1, t_step);
+    const double beta2_t = 1.0 - std::pow(beta2, t_step);
 
     for (size_t l = 1; l < m_layers.size(); ++l) {
         Layer& current = m_layers[l];
@@ -263,8 +273,8 @@ void NeuralNet::applyOptimization(const Hyperparameters& hp, size_t t_step) {
             if (hp.optimizer == Optimizer::ADAM) {
                 current.m_biases[n] = beta1 * current.m_biases[n] + (1.0 - beta1) * grad_bias;
                 current.v_biases[n] = beta2 * current.v_biases[n] + (1.0 - beta2) * grad_bias * grad_bias;
-                double m_hat = current.m_biases[n] / (1.0 - std::pow(beta1, t_step));
-                double v_hat = current.v_biases[n] / (1.0 - std::pow(beta2, t_step));
+                double m_hat = current.m_biases[n] / beta1_t;
+                double v_hat = current.v_biases[n] / beta2_t;
                 current.biases[n] -= hp.learningRate * (m_hat / (std::sqrt(v_hat) + epsilon));
             } else {
                 current.biases[n] -= hp.learningRate * grad_bias;
@@ -281,8 +291,8 @@ void NeuralNet::applyOptimization(const Hyperparameters& hp, size_t t_step) {
                 if (hp.optimizer == Optimizer::ADAM) {
                     current.m_weights[weightOffset + pn] = beta1 * current.m_weights[weightOffset + pn] + (1.0 - beta1) * grad_w;
                     current.v_weights[weightOffset + pn] = beta2 * current.v_weights[weightOffset + pn] + (1.0 - beta2) * grad_w * grad_w;
-                    double m_hat = current.m_weights[weightOffset + pn] / (1.0 - std::pow(beta1, t_step));
-                    double v_hat = current.v_weights[weightOffset + pn] / (1.0 - std::pow(beta2, t_step));
+                    double m_hat = current.m_weights[weightOffset + pn] / beta1_t;
+                    double v_hat = current.v_weights[weightOffset + pn] / beta2_t;
                     current.weights[weightOffset + pn] -= hp.learningRate * (m_hat / (std::sqrt(v_hat) + epsilon));
                 } else {
                     current.weights[weightOffset + pn] -= hp.learningRate * grad_w;
@@ -496,37 +506,63 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
                                                size_t trials) {
     if (X.empty() || Y.empty() || X.size() != Y.size()) return {};
     size_t numFeatures = X[0].size();
+    size_t outDim = Y[0].size();
     std::vector<double> importances(numFeatures, 0.0);
+    std::vector<double> fallbackSensitivity(numFeatures, 0.0);
+
+    if (trials == 0) trials = 1;
 
     // Calculate baseline error (MSE)
-    auto getError = [&](const std::vector<std::vector<double>>& dataX) {
+    auto getError = [&](const std::vector<std::vector<double>>& dataX,
+                        std::vector<std::vector<double>>* predsOut = nullptr) {
         double totalError = 0.0;
+        if (predsOut) predsOut->assign(dataX.size(), std::vector<double>(outDim, 0.0));
         for (size_t i = 0; i < dataX.size(); ++i) {
             auto p = predict(dataX[i]);
-            for (size_t j = 0; j < p.size(); ++j) {
+            for (size_t j = 0; j < outDim && j < p.size(); ++j) {
                 double diff = p[j] - Y[i][j];
                 totalError += diff * diff;
+                if (predsOut) {
+                    (*predsOut)[i][j] = p[j];
+                }
             }
         }
-        return totalError / (dataX.size() * Y[0].size());
+        return totalError / (dataX.size() * outDim);
     };
 
-    double baselineError = getError(X);
+    std::vector<std::vector<double>> baselinePred;
+    double baselineError = getError(X, &baselinePred);
 
     for (size_t f = 0; f < numFeatures; ++f) {
         double featureErrorSum = 0.0;
+        double sensitivitySum = 0.0;
         for (size_t t = 0; t < trials; ++t) {
             std::vector<std::vector<double>> shuffledX = X;
             std::vector<double> featureVals;
             for (const auto& row : X) featureVals.push_back(row[f]);
             std::shuffle(featureVals.begin(), featureVals.end(), rng);
             for (size_t i = 0; i < X.size(); ++i) shuffledX[i][f] = featureVals[i];
-            
-            featureErrorSum += getError(shuffledX);
+
+            std::vector<std::vector<double>> shuffledPred;
+            featureErrorSum += getError(shuffledX, &shuffledPred);
+            for (size_t i = 0; i < shuffledPred.size(); ++i) {
+                for (size_t j = 0; j < outDim; ++j) {
+                    sensitivitySum += std::abs(shuffledPred[i][j] - baselinePred[i][j]);
+                }
+            }
         }
+
         // Importance = how much error increased when feature was destroyed
         importances[f] = (featureErrorSum / (double)trials) - baselineError;
         if (importances[f] < 0) importances[f] = 0; // Clip noise
+        fallbackSensitivity[f] = sensitivitySum / static_cast<double>(trials * X.size() * outDim);
+    }
+
+    // If loss-based importances collapse to zero, fall back to prediction sensitivity.
+    double sumLoss = 0.0;
+    for (double v : importances) sumLoss += v;
+    if (sumLoss <= 1e-12) {
+        importances = fallbackSensitivity;
     }
 
     // Normalize to percentages
@@ -534,6 +570,9 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
     for (double v : importances) sum += v;
     if (sum > 0) {
         for (double& v : importances) v /= sum;
+    } else if (!importances.empty()) {
+        double uniform = 1.0 / static_cast<double>(importances.size());
+        for (double& v : importances) v = uniform;
     }
 
     return importances;

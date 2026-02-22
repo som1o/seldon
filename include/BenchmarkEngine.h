@@ -8,6 +8,7 @@ struct BenchmarkResult {
     double rmse = 0.0;
     double r2 = 0.0;
     double accuracy = 0.0;
+    bool hasAccuracy = false;
     std::vector<double> actual;
     std::vector<double> predicted;
     std::vector<double> featureImportance;

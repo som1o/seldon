@@ -7,7 +7,7 @@
 // Advanced, dependency-free Dense Feed-Forward Neural Network
 class NeuralNet {
 public:
-    enum class Activation { SIGMOID, RELU, TANH };
+    enum class Activation { SIGMOID, RELU, TANH, LINEAR };
     enum class LossFunction { MSE, CROSS_ENTROPY };
     enum class Optimizer { SGD, ADAM };
 
