@@ -421,6 +421,9 @@ struct PairInsight {
 
 struct NeuralAnalysis {
     size_t inputNodes = 0;
+    size_t numericInputNodes = 0;
+    size_t categoricalEncodedNodes = 0;
+    size_t categoricalColumnsUsed = 0;
     size_t hiddenNodes = 0;
     size_t outputNodes = 0;
     bool binaryTarget = false;
@@ -437,6 +440,105 @@ struct NeuralAnalysis {
     std::vector<double> trainLoss;
     std::vector<double> valLoss;
     std::vector<double> featureImportance;
+    double categoricalImportanceShare = 0.0;
+};
+
+struct DataHealthSummary {
+    double score = 0.0;
+    std::string band = "limited";
+    double completeness = 0.0;
+    double numericCoverage = 0.0;
+    double featureRetention = 0.0;
+    double statYield = 0.0;
+    double selectedYield = 0.0;
+    double trainingStability = 0.5;
+};
+
+double safeRatio(size_t numerator, size_t denominator) {
+    if (denominator == 0) return 0.0;
+    return std::clamp(static_cast<double>(numerator) / static_cast<double>(denominator), 0.0, 1.0);
+}
+
+std::string healthBandFromScore(double score) {
+    if (score >= 85.0) return "excellent";
+    if (score >= 70.0) return "strong";
+    if (score >= 55.0) return "moderate";
+    if (score >= 40.0) return "weak";
+    return "limited";
+}
+
+DataHealthSummary computeDataHealthSummary(const TypedDataset& data,
+                                           const PreprocessReport& prep,
+                                           const NeuralAnalysis& neural,
+                                           size_t retainedFeatureCount,
+                                           size_t pairsEvaluated,
+                                           size_t statSigCount,
+                                           size_t selectedPairCount) {
+    DataHealthSummary out;
+
+    size_t totalMissing = 0;
+    for (const auto& kv : prep.missingCounts) totalMissing += kv.second;
+
+    const size_t rows = std::max<size_t>(1, data.rowCount());
+    const size_t cols = std::max<size_t>(1, data.colCount());
+    const size_t numericCols = data.numericColumnIndices().size();
+    const size_t totalCells = rows * cols;
+
+    out.completeness = 1.0 - safeRatio(totalMissing, totalCells);
+    out.numericCoverage = safeRatio(numericCols, cols);
+
+    const size_t possibleFeatures = (numericCols > 0) ? (numericCols - 1) : 0;
+    out.featureRetention = (possibleFeatures == 0)
+        ? 0.0
+        : safeRatio(retainedFeatureCount, possibleFeatures);
+
+    if (pairsEvaluated > 0) {
+        const double expectedStat = std::log1p(static_cast<double>(std::max<size_t>(1, pairsEvaluated / 4)));
+        const double expectedSelected = std::log1p(static_cast<double>(std::max<size_t>(1, pairsEvaluated / 10)));
+        out.statYield = expectedStat <= 0.0
+            ? 0.0
+            : std::clamp(std::log1p(static_cast<double>(statSigCount)) / expectedStat, 0.0, 1.0);
+        out.selectedYield = expectedSelected <= 0.0
+            ? 0.0
+            : std::clamp(std::log1p(static_cast<double>(selectedPairCount)) / expectedSelected, 0.0, 1.0);
+    }
+
+    out.trainingStability = 0.5;
+    if (!neural.trainLoss.empty()) {
+        double trainStart = neural.trainLoss.front();
+        double trainEnd = neural.trainLoss.back();
+        double baseline = std::max(1e-9, std::abs(trainStart));
+        double improvement = (trainStart - trainEnd) / baseline;
+        double convergence = std::clamp(0.5 + 0.5 * improvement, 0.0, 1.0);
+
+        if (!neural.valLoss.empty() && neural.valLoss.size() == neural.trainLoss.size()) {
+            double valEnd = neural.valLoss.back();
+            double gap = std::abs(valEnd - trainEnd) / std::max(1e-9, std::abs(trainEnd) + 1e-9);
+            double generalization = std::clamp(1.0 - gap, 0.0, 1.0);
+            out.trainingStability = 0.7 * convergence + 0.3 * generalization;
+        } else {
+            out.trainingStability = convergence;
+        }
+    }
+
+    const double score01 =
+        0.30 * out.completeness +
+        0.10 * out.numericCoverage +
+        0.15 * out.featureRetention +
+        0.20 * out.statYield +
+        0.15 * out.selectedYield +
+        0.10 * out.trainingStability;
+
+    out.score = std::clamp(score01 * 100.0, 0.0, 100.0);
+    out.band = healthBandFromScore(out.score);
+    return out;
+}
+
+struct EncodedNeuralMatrix {
+    std::vector<std::vector<double>> X;
+    std::vector<int> sourceNumericFeaturePos;
+    size_t categoricalEncodedNodes = 0;
+    size_t categoricalColumnsUsed = 0;
 };
 
 using NumericStatsCache = std::unordered_map<size_t, ColumnStats>;
@@ -487,6 +589,77 @@ std::vector<double> computeFeatureTargetAbsCorr(const TypedDataset& data,
         const ColumnStats xStats = (xIt != statsCache.end()) ? xIt->second : Statistics::calculateStats(x);
         out[i] = std::abs(MathUtils::calculatePearson(x, y, xStats, yStats).value_or(0.0));
     }
+    return out;
+}
+
+EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
+                                             int targetIdx,
+                                             const std::vector<int>& numericFeatureIdx,
+                                             const AutoConfig& config) {
+    EncodedNeuralMatrix out;
+    out.X.assign(data.rowCount(), std::vector<double>{});
+
+    const std::unordered_set<std::string> excluded(config.excludedColumns.begin(), config.excludedColumns.end());
+
+    for (size_t featurePos = 0; featurePos < numericFeatureIdx.size(); ++featurePos) {
+        int idx = numericFeatureIdx[featurePos];
+        if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
+        if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
+        const auto& values = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
+        for (size_t r = 0; r < out.X.size() && r < values.size(); ++r) {
+            out.X[r].push_back(values[r]);
+        }
+        out.sourceNumericFeaturePos.push_back(static_cast<int>(featurePos));
+    }
+
+    constexpr size_t kMaxOneHotPerColumn = 24;
+    const auto categoricalIdx = data.categoricalColumnIndices();
+    for (size_t idx : categoricalIdx) {
+        if (static_cast<int>(idx) == targetIdx) continue;
+        const std::string& columnName = data.columns()[idx].name;
+        if (excluded.find(columnName) != excluded.end()) continue;
+
+        const auto& values = std::get<std::vector<std::string>>(data.columns()[idx].values);
+        if (values.empty()) continue;
+
+        std::unordered_map<std::string, size_t> freq;
+        for (const auto& v : values) {
+            if (!v.empty()) freq[v]++;
+        }
+        if (freq.empty()) continue;
+
+        std::vector<std::pair<std::string, size_t>> categories(freq.begin(), freq.end());
+        std::sort(categories.begin(), categories.end(), [](const auto& a, const auto& b) {
+            if (a.second == b.second) return a.first < b.first;
+            return a.second > b.second;
+        });
+
+        const size_t keepCount = std::min(kMaxOneHotPerColumn, categories.size());
+        if (keepCount == 0) continue;
+
+        std::unordered_set<std::string> kept;
+        kept.reserve(keepCount);
+        for (size_t i = 0; i < keepCount; ++i) {
+            const std::string& label = categories[i].first;
+            kept.insert(label);
+            for (size_t r = 0; r < out.X.size() && r < values.size(); ++r) {
+                out.X[r].push_back(values[r] == label ? 1.0 : 0.0);
+            }
+            out.sourceNumericFeaturePos.push_back(-1);
+            out.categoricalEncodedNodes++;
+        }
+
+        if (categories.size() > keepCount) {
+            for (size_t r = 0; r < out.X.size() && r < values.size(); ++r) {
+                out.X[r].push_back(kept.find(values[r]) == kept.end() ? 1.0 : 0.0);
+            }
+            out.sourceNumericFeaturePos.push_back(-1);
+            out.categoricalEncodedNodes++;
+        }
+
+        out.categoricalColumnsUsed++;
+    }
+
     return out;
 }
 
@@ -923,7 +1096,10 @@ void addBenchmarkSection(ReportEngine& report, const std::vector<BenchmarkResult
     report.addTable("Baseline Benchmark (k-fold)", {"Rank", "Model", "RMSE", "R2", "Accuracy"}, benchRows);
 }
 
-void addDatasetHealthTable(ReportEngine& report, const TypedDataset& data, const PreprocessReport& prep) {
+void addDatasetHealthTable(ReportEngine& report,
+                           const TypedDataset& data,
+                           const PreprocessReport& prep,
+                           const DataHealthSummary& health) {
     size_t totalMissing = 0;
     size_t totalOutliers = 0;
     for (const auto& kv : prep.missingCounts) totalMissing += kv.second;
@@ -936,7 +1112,10 @@ void addDatasetHealthTable(ReportEngine& report, const TypedDataset& data, const
         {"Categorical Columns", std::to_string(data.categoricalColumnIndices().size())},
         {"Datetime Columns", std::to_string(data.datetimeColumnIndices().size())},
         {"Total Missing Cells", std::to_string(totalMissing)},
-        {"Total Outlier Flags", std::to_string(totalOutliers)}
+        {"Total Outlier Flags", std::to_string(totalOutliers)},
+        {"Data Health Score (0-100)", toFixed(health.score, 1)},
+        {"Data Health Band", health.band},
+        {"Signal Yield (selected/evaluated)", toFixed(100.0 * health.selectedYield, 1) + "%"}
     });
 }
 
@@ -968,7 +1147,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
                                  bool fastModeEnabled,
                                  size_t fastSampleRows) {
     NeuralAnalysis analysis;
-    analysis.inputNodes = featureIdx.size();
+    analysis.numericInputNodes = featureIdx.size();
     analysis.outputNodes = 1;
     analysis.binaryTarget = binaryTarget;
     analysis.outputActivation = binaryTarget ? "sigmoid" : "linear";
@@ -987,18 +1166,26 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
 
     const auto& y = std::get<std::vector<double>>(data.columns()[targetIdx].values);
 
-    std::vector<std::vector<double>> Xnn(data.rowCount(), std::vector<double>(featureIdx.size(), 0.0));
+    EncodedNeuralMatrix encoded = buildEncodedNeuralInputs(data, targetIdx, featureIdx, config);
+    std::vector<std::vector<double>> Xnn = std::move(encoded.X);
     std::vector<std::vector<double>> Ynn(data.rowCount(), std::vector<double>(1, 0.0));
 
     for (size_t r = 0; r < data.rowCount(); ++r) {
-        for (size_t c = 0; c < featureIdx.size(); ++c) {
-            const auto& fv = std::get<std::vector<double>>(data.columns()[featureIdx[c]].values);
-            Xnn[r][c] = fv[r];
-        }
         Ynn[r][0] = y[r];
     }
 
-    size_t inputNodes = featureIdx.size();
+    size_t inputNodes = Xnn.empty() ? 0 : Xnn.front().size();
+    analysis.inputNodes = inputNodes;
+    analysis.categoricalColumnsUsed = encoded.categoricalColumnsUsed;
+    analysis.categoricalEncodedNodes = encoded.categoricalEncodedNodes;
+
+    if (inputNodes == 0) {
+        analysis.policyUsed = "none_no_encoded_features";
+        analysis.featureImportance.assign(featureIdx.size(), 0.0);
+        analysis.trainingRowsUsed = data.rowCount();
+        return analysis;
+    }
+
     size_t outputNodes = 1;
     size_t baseHidden = std::clamp<size_t>(
         static_cast<size_t>(std::llround(std::sqrt(static_cast<double>(std::max<size_t>(1, inputNodes) * std::max<size_t>(8, data.rowCount() / 6))))),
@@ -1112,7 +1299,28 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     analysis.trainingRowsUsed = Xnn.size();
     analysis.trainLoss = nn.getTrainLossHistory();
     analysis.valLoss = nn.getValLossHistory();
-    analysis.featureImportance = nn.calculateFeatureImportance(Xnn, Ynn, inputNodes > 10 ? 7 : 5);
+    const std::vector<double> rawImportance = nn.calculateFeatureImportance(Xnn, Ynn, inputNodes > 10 ? 7 : 5);
+    analysis.featureImportance.assign(featureIdx.size(), 0.0);
+
+    double totalImportance = 0.0;
+    double categoricalImportance = 0.0;
+    for (size_t i = 0; i < rawImportance.size(); ++i) {
+        const double imp = std::max(0.0, rawImportance[i]);
+        totalImportance += imp;
+
+        if (i < encoded.sourceNumericFeaturePos.size()) {
+            int numericPos = encoded.sourceNumericFeaturePos[i];
+            if (numericPos >= 0 && static_cast<size_t>(numericPos) < analysis.featureImportance.size()) {
+                analysis.featureImportance[static_cast<size_t>(numericPos)] += imp;
+            } else {
+                categoricalImportance += imp;
+            }
+        }
+    }
+    analysis.categoricalImportanceShare = (totalImportance > config.tuning.numericEpsilon)
+        ? (categoricalImportance / totalImportance)
+        : 0.0;
+
     return analysis;
 }
 
@@ -1328,12 +1536,14 @@ void addOverallSections(ReportEngine& report,
                         const PreprocessReport& prep,
                         const std::vector<BenchmarkResult>& benchmarks,
                         const NeuralAnalysis& neural,
+                        const DataHealthSummary& health,
                         GnuplotEngine* overallPlotter,
                         bool canPlotOverall,
                         bool verbose,
                         const NumericStatsCache& statsCache) {
     report.addParagraph("Overall analysis aggregates dataset health, model baselines, neural training behavior, and optional global visual diagnostics.");
-    addDatasetHealthTable(report, data, prep);
+    report.addParagraph("Data Health summarizes how much usable signal the engine found after preprocessing, feature selection, statistical filtering, and neural convergence checks.");
+    addDatasetHealthTable(report, data, prep, health);
 
     addBenchmarkSection(report, benchmarks);
     addNeuralLossSummaryTable(report, neural);
@@ -1555,6 +1765,14 @@ int AutomationPipeline::run(const AutoConfig& config) {
     bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "plot"}, allRows);
     bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "plot"}, sigRows);
 
+    const DataHealthSummary dataHealth = computeDataHealthSummary(data,
+                                                                  prep,
+                                                                  neural,
+                                                                  featureIdx.size(),
+                                                                  allRows.size(),
+                                                                  statSigCount,
+                                                                  sigRows.size());
+
     ReportEngine neuralReport;
     neuralReport.addTitle("Neural Synthesis");
     neuralReport.addParagraph("This synthesis captures detailed lattice training traces and how neural relevance influenced bivariate selection.");
@@ -1566,6 +1784,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Feature Strategy", selectedFeatures.strategyUsed},
         {"Feature Missingness Threshold", toFixed(selectedFeatures.missingThresholdUsed, 4)},
         {"Features Retained", std::to_string(featureIdx.size())},
+        {"Categorical Columns Encoded", std::to_string(neural.categoricalColumnsUsed)},
+        {"Categorical One-Hot Nodes", std::to_string(neural.categoricalEncodedNodes)},
         {"Sparse Features Dropped", std::to_string(selectedFeatures.droppedByMissingness.size())},
         {"Neural Strategy", neural.policyUsed},
         {"Fast Mode", fastModeEnabled ? "enabled" : "disabled"},
@@ -1578,6 +1798,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
     neuralReport.addTable("Neural Network Auto-Defaults", {"Setting", "Value"}, {
         {"Neural Policy", neural.policyUsed},
         {"Input Nodes", std::to_string(neural.inputNodes)},
+        {"Numeric Input Nodes", std::to_string(neural.numericInputNodes)},
+        {"Categorical Encoded Nodes", std::to_string(neural.categoricalEncodedNodes)},
         {"Hidden Nodes", std::to_string(neural.hiddenNodes)},
         {"Output Nodes", std::to_string(neural.outputNodes)},
         {"Epochs", std::to_string(neural.epochs)},
@@ -1585,6 +1807,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Validation Split", toFixed(neural.valSplit, 2)},
         {"L2 Lambda", toFixed(neural.l2Lambda, 4)},
         {"Dropout", toFixed(neural.dropoutRate, 4)},
+        {"Categorical Importance Share", toFixed(neural.categoricalImportanceShare, 4)},
         {"Early Stop Patience", std::to_string(neural.earlyStoppingPatience)},
         {"Loss", neural.binaryTarget ? "cross_entropy" : "mse"},
         {"Activation", "relu"},
@@ -1615,6 +1838,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
                        prep,
                        benchmarks,
                        neural,
+                       dataHealth,
                        &plotterOverall,
                        canPlot && runCfg.plotOverall,
                        runCfg.verboseAnalysis,
@@ -1623,7 +1847,19 @@ int AutomationPipeline::run(const AutoConfig& config) {
     ReportEngine finalAnalysis;
     finalAnalysis.addTitle("Final Analysis - Significant Findings Only");
     finalAnalysis.addParagraph("This report contains only neural-net-approved significant findings (dynamic decision engine). Non-selected findings are excluded by design.");
+    finalAnalysis.addParagraph("Data Health Score: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + "). This score estimates discovered signal strength using completeness, retained feature coverage, significant-pair yield, selected-pair yield, and neural training stability.");
     finalAnalysis.addTable("Neural-Selected Significant Bivariate Findings", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "plot"}, sigRows);
+
+    finalAnalysis.addTable("Data Health Signal Card", {"Component", "Value"}, {
+        {"Score (0-100)", toFixed(dataHealth.score, 1)},
+        {"Band", dataHealth.band},
+        {"Completeness", toFixed(100.0 * dataHealth.completeness, 1) + "%"},
+        {"Numeric Coverage", toFixed(100.0 * dataHealth.numericCoverage, 1) + "%"},
+        {"Feature Retention", toFixed(100.0 * dataHealth.featureRetention, 1) + "%"},
+        {"Statistical Yield", toFixed(100.0 * dataHealth.statYield, 1) + "%"},
+        {"Neural-Selected Yield", toFixed(100.0 * dataHealth.selectedYield, 1) + "%"},
+        {"Training Stability", toFixed(100.0 * dataHealth.trainingStability, 1) + "%"}
+    });
 
     std::vector<std::vector<std::string>> topFeatures;
     std::vector<std::pair<std::string, double>> fiPairs;
@@ -1644,7 +1880,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Pairs Evaluated", std::to_string(allRows.size())},
         {"Pairs Statistically Significant", std::to_string(statSigCount)},
         {"Pairs Neural-Selected", std::to_string(sigRows.size())},
-        {"Training Epochs Executed", std::to_string(neural.trainLoss.size())}
+        {"Training Epochs Executed", std::to_string(neural.trainLoss.size())},
+        {"Data Health Score", toFixed(dataHealth.score, 1) + " (" + dataHealth.band + ")"}
     });
 
     saveGeneratedReports(runCfg, univariate, bivariate, neuralReport, finalAnalysis);
