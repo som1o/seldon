@@ -96,6 +96,25 @@ struct AutoConfig {
     uint32_t benchmarkSeed = 1337;
     double gradientClipNorm = 5.0;
 
+    // Neural stability overrides (universal runtime knobs)
+    std::string neuralOptimizer = "lookahead";            // sgd|adam|lookahead
+    std::string neuralLookaheadFastOptimizer = "adam";    // sgd|adam
+    int neuralLookaheadSyncPeriod = 5;
+    double neuralLookaheadAlpha = 0.5;
+    bool neuralUseBatchNorm = true;
+    double neuralBatchNormMomentum = 0.95;
+    double neuralBatchNormEpsilon = 1e-5;
+    bool neuralUseLayerNorm = true;
+    double neuralLayerNormEpsilon = 1e-5;
+    double neuralLrDecay = 0.5;
+    int neuralLrPlateauPatience = 5;
+    int neuralLrCooldownEpochs = 2;
+    int neuralMaxLrReductions = 8;
+    double neuralMinLearningRate = 1e-6;
+    bool neuralUseValidationLossEma = true;
+    double neuralValidationLossEmaBeta = 0.6;
+    double neuralCategoricalInputL2Boost = 3.0;
+
     PlotConfig plot;
     HeuristicTuningConfig tuning;
 

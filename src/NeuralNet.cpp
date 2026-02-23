@@ -80,7 +80,7 @@ NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
     rng.seed(seedState);
 
     for (size_t l = 0; l < topology.size(); ++l) {
-        const Activation activation = (l == topology.size() - 1) ? Activation::SIGMOID : Activation::RELU;
+        const Activation activation = (l == topology.size() - 1) ? Activation::SIGMOID : Activation::GELU;
         const size_t prevSize = (l > 0) ? topology[l - 1] : 0;
         m_layers.emplace_back(topology[l], prevSize, activation, rng);
     }
@@ -89,6 +89,13 @@ NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
 void NeuralNet::setSeed(uint32_t seed) {
     seedState = seed;
     rng.seed(seedState);
+}
+
+void NeuralNet::setInputL2Scales(const std::vector<double>& scales) {
+    if (!m_layers.empty() && m_layers.size() > 1 && !scales.empty() && scales.size() != m_layers[1].prevSize()) {
+        throw Seldon::NeuralNetException("Input L2 scales must match input layer width");
+    }
+    m_inputL2Scales = scales;
 }
 
 void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTraining, double dropoutRate) {
@@ -105,9 +112,23 @@ void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTrain
     }
 
     ++forwardCounter;
+    const bool useBatchNorm = m_useBatchNorm;
+    const double batchNormMomentum = m_batchNormMomentum;
+    const double batchNormEpsilon = m_batchNormEpsilon;
+    const bool useLayerNorm = m_useLayerNorm;
+    const double layerNormEpsilon = m_layerNormEpsilon;
     for (size_t l = 1; l < m_layers.size(); ++l) {
         const bool dropoutEnabled = isTraining && l < m_layers.size() - 1;
-        m_layers[l].forward(m_layers[l - 1], dropoutEnabled, dropoutRate, seedState, forwardCounter + l * 1315423911ULL);
+        m_layers[l].forward(m_layers[l - 1],
+                            dropoutEnabled,
+                            dropoutRate,
+                            useBatchNorm && l < m_layers.size() - 1,
+                            batchNormMomentum,
+                            batchNormEpsilon,
+                            useLayerNorm && l < m_layers.size() - 1,
+                            layerNormEpsilon,
+                            seedState,
+                            forwardCounter + l * 1315423911ULL);
     }
 }
 
@@ -131,8 +152,54 @@ void NeuralNet::computeGradients(const std::vector<double>& targetValues, LossFu
 }
 
 void NeuralNet::applyOptimization(const Hyperparameters& hp, size_t t_step) {
+    NeuralOptimizer fastOptimizer = hp.optimizer;
+    if (hp.optimizer == Optimizer::LOOKAHEAD) {
+        fastOptimizer = hp.lookaheadFastOptimizer;
+        if (fastOptimizer == Optimizer::LOOKAHEAD) {
+            fastOptimizer = Optimizer::ADAM;
+        }
+    }
+
     for (size_t l = 1; l < m_layers.size(); ++l) {
-        m_layers[l].updateParameters(m_layers[l - 1], hp.learningRate, hp.l2Lambda, hp.optimizer, t_step);
+        const std::vector<double>* layerInputL2 = nullptr;
+        if (l == 1 && !m_inputL2Scales.empty()) {
+            layerInputL2 = &m_inputL2Scales;
+        }
+        m_layers[l].updateParameters(m_layers[l - 1], hp.learningRate, hp.l2Lambda, fastOptimizer, t_step, layerInputL2);
+    }
+
+    if (hp.optimizer == Optimizer::LOOKAHEAD) {
+        if (!m_lookaheadInitialized) {
+            m_lookaheadSlowWeights.clear();
+            m_lookaheadSlowBiases.clear();
+            m_lookaheadSlowWeights.reserve(m_layers.size());
+            m_lookaheadSlowBiases.reserve(m_layers.size());
+            for (const auto& layer : m_layers) {
+                m_lookaheadSlowWeights.push_back(layer.weights());
+                m_lookaheadSlowBiases.push_back(layer.biases());
+            }
+            m_lookaheadInitialized = true;
+        }
+
+        const size_t syncPeriod = std::max<size_t>(1, hp.lookaheadSyncPeriod);
+        const double alpha = std::clamp(hp.lookaheadAlpha, 0.0, 1.0);
+        if (t_step % syncPeriod == 0) {
+            for (size_t l = 1; l < m_layers.size(); ++l) {
+                auto& weights = m_layers[l].weights();
+                auto& biases = m_layers[l].biases();
+                auto& slowW = m_lookaheadSlowWeights[l];
+                auto& slowB = m_lookaheadSlowBiases[l];
+
+                for (size_t i = 0; i < weights.size() && i < slowW.size(); ++i) {
+                    slowW[i] += alpha * (weights[i] - slowW[i]);
+                    weights[i] = slowW[i];
+                }
+                for (size_t i = 0; i < biases.size() && i < slowB.size(); ++i) {
+                    slowB[i] += alpha * (biases[i] - slowB[i]);
+                    biases[i] = slowB[i];
+                }
+            }
+        }
     }
 }
 
@@ -140,6 +207,12 @@ void NeuralNet::backpropagate(const std::vector<double>& targetValues, const Hyp
     computeGradients(targetValues, hp.loss);
 
     if (hp.gradientClipNorm > 0.0) {
+        for (size_t l = 1; l < m_layers.size(); ++l) {
+            for (double& g : m_layers[l].gradients()) {
+                g = std::clamp(g, -hp.gradientClipNorm, hp.gradientClipNorm);
+            }
+        }
+
         double sqNorm = 0.0;
         for (size_t l = 1; l < m_layers.size(); ++l) {
             for (double g : m_layers[l].gradients()) sqNorm += g * g;
@@ -184,6 +257,14 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
 
     this->inputScales = inScales;
     this->outputScales = outScales;
+    m_useBatchNorm = hp.useBatchNorm;
+    m_batchNormMomentum = hp.batchNormMomentum;
+    m_batchNormEpsilon = hp.batchNormEpsilon;
+    m_useLayerNorm = hp.useLayerNorm;
+    m_layerNormEpsilon = hp.layerNormEpsilon;
+    m_lookaheadInitialized = false;
+    m_lookaheadSlowWeights.clear();
+    m_lookaheadSlowBiases.clear();
     setSeed(hp.seed);
     forwardCounter = 0;
     trainLossHistory.clear();
@@ -209,6 +290,16 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
     int patienceCounter = 0;
     size_t t_step = 0;
     double currentLR = hp.learningRate;
+    int lrPlateauCounter = 0;
+    int lrCooldownCounter = 0;
+    int lrReductionCount = 0;
+    bool emaInitialized = false;
+    double valLossEma = 0.0;
+    bool hasBestCheckpoint = false;
+    std::vector<std::vector<double>> bestWeights;
+    std::vector<std::vector<double>> bestBiases;
+    bestWeights.resize(m_layers.size());
+    bestBiases.resize(m_layers.size());
 
     for (size_t epoch = 0; epoch < hp.epochs; ++epoch) {
         if (epoch % std::max(size_t(1), hp.epochs / 10) == 0) {
@@ -216,8 +307,21 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
         }
         std::shuffle(indices.begin(), indices.end(), rng);
 
-        double trainLoss = runEpoch(X, Y, indices, trainSize, hp, currentLR, t_step);
+        Hyperparameters currentHp = hp;
+        currentHp.learningRate = currentLR;
+        double trainLoss = runEpoch(X, Y, indices, trainSize, currentHp, t_step);
         double valLoss = valSize > 0 ? validate(X, Y, indices, trainSize, hp) : 0.0;
+        double monitoredValLoss = valLoss;
+        if (valSize > 0 && hp.useValidationLossEma) {
+            const double beta = std::clamp(hp.validationLossEmaBeta, 0.0, 0.999);
+            if (!emaInitialized) {
+                valLossEma = valLoss;
+                emaInitialized = true;
+            } else {
+                valLossEma = beta * valLossEma + (1.0 - beta) * valLoss;
+            }
+            monitoredValLoss = valLossEma;
+        }
         trainLossHistory.push_back(trainLoss);
         valLossHistory.push_back(valLoss);
 
@@ -226,11 +330,39 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
         }
 
         if (valSize > 0) {
-            if (valLoss < (bestValLoss - hp.minDelta)) {
-                bestValLoss = valLoss;
+            if (monitoredValLoss < (bestValLoss - hp.minDelta)) {
+                bestValLoss = monitoredValLoss;
                 patienceCounter = 0;
+                lrPlateauCounter = 0;
+                hasBestCheckpoint = true;
+                for (size_t l = 1; l < m_layers.size(); ++l) {
+                    bestWeights[l] = m_layers[l].weights();
+                    bestBiases[l] = m_layers[l].biases();
+                }
             } else {
                 patienceCounter++;
+                if (lrCooldownCounter > 0) {
+                    lrCooldownCounter--;
+                } else {
+                    lrPlateauCounter++;
+                }
+
+                if (hp.lrDecay > 0.0 && hp.lrDecay < 1.0 && hp.lrPlateauPatience > 0 &&
+                    lrPlateauCounter >= hp.lrPlateauPatience &&
+                    lrReductionCount < hp.maxLrReductions) {
+                    const double nextLR = std::max(hp.minLearningRate, currentLR * hp.lrDecay);
+                    const bool changed = nextLR < currentLR;
+                    currentLR = nextLR;
+                    lrPlateauCounter = 0;
+                    lrCooldownCounter = std::max(0, hp.lrCooldownEpochs);
+                    if (changed) {
+                        lrReductionCount++;
+                    }
+                    if (hp.verbose && changed) {
+                        std::cout << "[Agent] Plateau LR scheduler: reducing learning rate to " << currentLR << std::endl;
+                    }
+                }
+
                 if (patienceCounter >= hp.earlyStoppingPatience) {
                     if (hp.verbose) std::cout << "\n[Agent] Early stopping triggered at epoch " << epoch << std::endl;
                     break;
@@ -238,27 +370,25 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
             }
         }
     }
+
+    if (hasBestCheckpoint) {
+        for (size_t l = 1; l < m_layers.size(); ++l) {
+            m_layers[l].weights() = bestWeights[l];
+            m_layers[l].biases() = bestBiases[l];
+        }
+    }
+
     std::cout << "\r[Agent] Training Neural Lattice: [100%] Complete.          " << std::endl;
 }
 
 double NeuralNet::runEpoch(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
                            const std::vector<size_t>& indices, size_t trainSize, 
-                           const Hyperparameters& hp, double& currentLR, size_t& t_step) {
-    // Learning Rate Scheduling
-    size_t batchesPerEpoch = std::max(size_t(1), trainSize / hp.batchSize);
-    size_t epoch = t_step / batchesPerEpoch;
-    if (epoch > 0 && epoch % hp.lrStepSize == 0 && t_step % batchesPerEpoch == 0) {
-        currentLR *= hp.lrDecay;
-        if (hp.verbose) std::cout << "\n[Agent] Learning rate decayed to " << currentLR << "\n";
-    }
-
-    Hyperparameters currentHp = hp;
-    currentHp.learningRate = currentLR;
+                           const Hyperparameters& hp, size_t& t_step) {
 
     double epochLoss = 0.0;
     for (size_t i = 0; i < trainSize; i += hp.batchSize) {
         size_t currentBatchEnd = std::min(i + hp.batchSize, trainSize);
-        epochLoss += runBatch(X, Y, indices, i, currentBatchEnd, currentHp, t_step);
+        epochLoss += runBatch(X, Y, indices, i, currentBatchEnd, hp, t_step);
     }
     double denom = static_cast<double>(trainSize * m_layers.back().size());
     return denom > 0 ? epochLoss / denom : 0.0;

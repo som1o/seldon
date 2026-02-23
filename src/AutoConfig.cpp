@@ -5,6 +5,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <unordered_set>
 
 namespace {
@@ -25,55 +26,59 @@ std::vector<std::string> splitCSV(const std::string& s) {
     return out;
 }
 
-int parseIntStrict(const std::string& value, const std::string& key, int minValue) {
+template <typename T, typename Parser>
+T parseNumericStrict(const std::string& value,
+                     const std::string& key,
+                     const std::string& errorPrefix,
+                     Parser parser) {
     try {
         size_t pos = 0;
-        int parsed = std::stoi(value, &pos);
+        T parsed = parser(value, &pos);
         if (pos != value.size()) {
-            throw Seldon::ConfigurationException("Invalid integer for " + key + ": " + value);
-        }
-        if (parsed < minValue) {
-            throw Seldon::ConfigurationException("Value for " + key + " must be >= " + std::to_string(minValue));
+            throw Seldon::ConfigurationException(errorPrefix + key + ": " + value);
         }
         return parsed;
     } catch (const Seldon::SeldonException&) {
         throw;
     } catch (const std::exception&) {
-        throw Seldon::ConfigurationException("Invalid integer for " + key + ": " + value);
+        throw Seldon::ConfigurationException(errorPrefix + key + ": " + value);
     }
+}
+
+int parseIntStrict(const std::string& value, const std::string& key, int minValue) {
+    int parsed = parseNumericStrict<int>(
+        value,
+        key,
+        "Invalid integer for ",
+        [](const std::string& v, size_t* pos) { return std::stoi(v, pos); });
+    if (parsed < minValue) {
+        throw Seldon::ConfigurationException("Value for " + key + " must be >= " + std::to_string(minValue));
+    }
+    return parsed;
 }
 
 uint32_t parseUIntStrict(const std::string& value, const std::string& key) {
-    try {
-        size_t pos = 0;
-        unsigned long parsed = std::stoul(value, &pos);
-        if (pos != value.size()) {
-            throw Seldon::ConfigurationException("Invalid unsigned integer for " + key + ": " + value);
-        }
-        return static_cast<uint32_t>(parsed);
-    } catch (const Seldon::SeldonException&) {
-        throw;
-    } catch (const std::exception&) {
-        throw Seldon::ConfigurationException("Invalid unsigned integer for " + key + ": " + value);
+    unsigned long parsed = parseNumericStrict<unsigned long>(
+        value,
+        key,
+        "Invalid unsigned integer for ",
+        [](const std::string& v, size_t* pos) { return std::stoul(v, pos); });
+    if (parsed > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+        throw Seldon::ConfigurationException("Value for " + key + " exceeds uint32 range");
     }
+    return static_cast<uint32_t>(parsed);
 }
 
 double parseDoubleStrict(const std::string& value, const std::string& key, double minValue) {
-    try {
-        size_t pos = 0;
-        double parsed = std::stod(value, &pos);
-        if (pos != value.size()) {
-            throw Seldon::ConfigurationException("Invalid number for " + key + ": " + value);
-        }
-        if (parsed < minValue) {
-            throw Seldon::ConfigurationException("Value for " + key + " must be >= " + std::to_string(minValue));
-        }
-        return parsed;
-    } catch (const Seldon::SeldonException&) {
-        throw;
-    } catch (const std::exception&) {
-        throw Seldon::ConfigurationException("Invalid number for " + key + ": " + value);
+    double parsed = parseNumericStrict<double>(
+        value,
+        key,
+        "Invalid number for ",
+        [](const std::string& v, size_t* pos) { return std::stod(v, pos); });
+    if (parsed < minValue) {
+        throw Seldon::ConfigurationException("Value for " + key + " must be >= " + std::to_string(minValue));
     }
+    return parsed;
 }
 
 bool parseBoolStrict(const std::string& value, const std::string& key) {
@@ -116,76 +121,192 @@ void applyPlotModes(AutoConfig& config, const std::string& value) {
 }
 
 void assignKeyValue(AutoConfig& config, const std::string& key, const std::string& value) {
-    if (key == "target") config.targetColumn = value;
-    else if (key == "dataset") config.datasetPath = value;
-    else if (key == "report") config.reportFile = value;
-    else if (key == "assets_dir") config.assetsDir = value;
-    else if (key == "delimiter") {
+    if (key == "delimiter") {
         if (value.size() != 1) throw Seldon::ConfigurationException("delimiter expects a single character");
         config.delimiter = value[0];
+        return;
     }
-    else if (key == "outlier_method") config.outlierMethod = CommonUtils::toLower(value);
-    else if (key == "outlier_action") config.outlierAction = CommonUtils::toLower(value);
-    else if (key == "scaling") config.scalingMethod = CommonUtils::toLower(value);
-    else if (key == "kfold") config.kfold = parseIntStrict(value, "kfold", 2);
-    else if (key == "max_feature_missing_ratio") {
+    if (key == "max_feature_missing_ratio") {
         config.maxFeatureMissingRatio = parseDoubleStrict(value, "max_feature_missing_ratio", -1.0);
         if (config.maxFeatureMissingRatio > 1.0 || config.maxFeatureMissingRatio < -1.0) {
             throw Seldon::ConfigurationException("max_feature_missing_ratio must be -1 or within [0,1]");
         }
+        return;
     }
-    else if (key == "plot_format") config.plot.format = CommonUtils::toLower(value);
-    else if (key == "plot_width") config.plot.width = parseIntStrict(value, "plot_width", 320);
-    else if (key == "plot_height") config.plot.height = parseIntStrict(value, "plot_height", 240);
-    else if (key == "plot_univariate") config.plotUnivariate = parseBoolStrict(value, "plot_univariate");
-    else if (key == "plot_overall") config.plotOverall = parseBoolStrict(value, "plot_overall");
-    else if (key == "plot_bivariate_significant") config.plotBivariateSignificant = parseBoolStrict(value, "plot_bivariate_significant");
-    else if (key == "generate_html") config.generateHtml = parseBoolStrict(value, "generate_html");
-    else if (key == "verbose_analysis") config.verboseAnalysis = parseBoolStrict(value, "verbose_analysis");
-    else if (key == "neural_seed") config.neuralSeed = parseUIntStrict(value, "neural_seed");
-    else if (key == "benchmark_seed") config.benchmarkSeed = parseUIntStrict(value, "benchmark_seed");
-    else if (key == "gradient_clip_norm") config.gradientClipNorm = parseDoubleStrict(value, "gradient_clip_norm", 0.0);
-    else if (key == "plots") applyPlotModes(config, value);
-    else if (key == "target_strategy") config.targetStrategy = CommonUtils::toLower(value);
-    else if (key == "feature_strategy") config.featureStrategy = CommonUtils::toLower(value);
-    else if (key == "neural_strategy") config.neuralStrategy = CommonUtils::toLower(value);
-    else if (key == "bivariate_strategy") config.bivariateStrategy = CommonUtils::toLower(value);
-    else if (key == "fast_mode") config.fastMode = parseBoolStrict(value, "fast_mode");
-    else if (key == "fast_max_bivariate_pairs") config.fastMaxBivariatePairs = static_cast<size_t>(parseIntStrict(value, "fast_max_bivariate_pairs", 1));
-    else if (key == "fast_neural_sample_rows") config.fastNeuralSampleRows = static_cast<size_t>(parseIntStrict(value, "fast_neural_sample_rows", 1));
-    else if (key == "exclude") config.excludedColumns = splitCSV(value);
-    else if (key == "feature_min_variance") config.tuning.featureMinVariance = parseDoubleStrict(value, "feature_min_variance", 0.0);
-    else if (key == "significance_alpha") config.tuning.significanceAlpha = parseDoubleStrict(value, "significance_alpha", 0.0);
-    else if (key == "outlier_iqr_multiplier") config.tuning.outlierIqrMultiplier = parseDoubleStrict(value, "outlier_iqr_multiplier", 0.0);
-    else if (key == "outlier_z_threshold") config.tuning.outlierZThreshold = parseDoubleStrict(value, "outlier_z_threshold", 0.0);
-    else if (key == "feature_leakage_corr_threshold") config.tuning.featureLeakageCorrThreshold = parseDoubleStrict(value, "feature_leakage_corr_threshold", 0.0);
-    else if (key == "feature_missing_q3_offset") config.tuning.featureMissingQ3Offset = parseDoubleStrict(value, "feature_missing_q3_offset", 0.0);
-    else if (key == "feature_missing_floor") config.tuning.featureMissingAdaptiveMin = parseDoubleStrict(value, "feature_missing_floor", 0.0);
-    else if (key == "feature_missing_ceiling") config.tuning.featureMissingAdaptiveMax = parseDoubleStrict(value, "feature_missing_ceiling", 0.0);
-    else if (key == "feature_aggressive_delta") config.tuning.featureAggressiveDelta = parseDoubleStrict(value, "feature_aggressive_delta", 0.0);
-    else if (key == "feature_lenient_delta") config.tuning.featureLenientDelta = parseDoubleStrict(value, "feature_lenient_delta", 0.0);
-    else if (key == "bivariate_selection_quantile") config.tuning.bivariateSelectionQuantileOverride = parseDoubleStrict(value, "bivariate_selection_quantile", -1.0);
-    else if (key == "coherence_weight_small_dataset") config.tuning.coherenceWeightSmallDataset = parseDoubleStrict(value, "coherence_weight_small_dataset", 0.0);
-    else if (key == "coherence_weight_regular_dataset") config.tuning.coherenceWeightRegularDataset = parseDoubleStrict(value, "coherence_weight_regular_dataset", 0.0);
-    else if (key == "coherence_overfit_penalty_train_ratio") config.tuning.coherenceOverfitPenaltyTrainRatio = parseDoubleStrict(value, "coherence_overfit_penalty_train_ratio", 0.0);
-    else if (key == "coherence_benchmark_penalty_ratio") config.tuning.coherenceBenchmarkPenaltyRatio = parseDoubleStrict(value, "coherence_benchmark_penalty_ratio", 0.0);
-    else if (key == "coherence_penalty_step") config.tuning.coherencePenaltyStep = parseDoubleStrict(value, "coherence_penalty_step", 0.0);
-    else if (key == "coherence_weight_min") config.tuning.coherenceWeightMin = parseDoubleStrict(value, "coherence_weight_min", 0.0);
-    else if (key == "coherence_weight_max") config.tuning.coherenceWeightMax = parseDoubleStrict(value, "coherence_weight_max", 0.0);
-    else if (key == "corr_heavy_max_importance_threshold") config.tuning.corrHeavyMaxImportanceThreshold = parseDoubleStrict(value, "corr_heavy_max_importance_threshold", 0.0);
-    else if (key == "corr_heavy_concentration_threshold") config.tuning.corrHeavyConcentrationThreshold = parseDoubleStrict(value, "corr_heavy_concentration_threshold", 0.0);
-    else if (key == "importance_heavy_max_importance_threshold") config.tuning.importanceHeavyMaxImportanceThreshold = parseDoubleStrict(value, "importance_heavy_max_importance_threshold", 0.0);
-    else if (key == "importance_heavy_concentration_threshold") config.tuning.importanceHeavyConcentrationThreshold = parseDoubleStrict(value, "importance_heavy_concentration_threshold", 0.0);
-    else if (key == "numeric_epsilon") config.tuning.numericEpsilon = parseDoubleStrict(value, "numeric_epsilon", 0.0);
-    else if (key == "beta_fallback_intervals_start") config.tuning.betaFallbackIntervalsStart = static_cast<size_t>(parseIntStrict(value, "beta_fallback_intervals_start", 256));
-    else if (key == "beta_fallback_intervals_max") config.tuning.betaFallbackIntervalsMax = static_cast<size_t>(parseIntStrict(value, "beta_fallback_intervals_max", 512));
-    else if (key == "beta_fallback_tolerance") config.tuning.betaFallbackTolerance = parseDoubleStrict(value, "beta_fallback_tolerance", 0.0);
+    if (key == "plots") {
+        applyPlotModes(config, value);
+        return;
+    }
+    if (key == "exclude") {
+        config.excludedColumns = splitCSV(value);
+        return;
+    }
+
+    struct IntRule {
+        int AutoConfig::*member;
+        int minValue;
+    };
+    struct SizeRule {
+        size_t AutoConfig::*member;
+        int minValue;
+    };
+    struct DoubleRule {
+        double AutoConfig::*member;
+        double minValue;
+    };
+    struct PlotIntRule {
+        int PlotConfig::*member;
+        int minValue;
+    };
+    struct TuningDoubleRule {
+        double HeuristicTuningConfig::*member;
+        double minValue;
+    };
+    struct TuningSizeRule {
+        size_t HeuristicTuningConfig::*member;
+        int minValue;
+    };
+
+    static const std::unordered_map<std::string, std::string AutoConfig::*> rawStringFields = {
+        {"target", &AutoConfig::targetColumn},
+        {"dataset", &AutoConfig::datasetPath},
+        {"report", &AutoConfig::reportFile},
+        {"assets_dir", &AutoConfig::assetsDir}
+    };
+    static const std::unordered_map<std::string, std::string AutoConfig::*> lowerStringFields = {
+        {"outlier_method", &AutoConfig::outlierMethod},
+        {"outlier_action", &AutoConfig::outlierAction},
+        {"scaling", &AutoConfig::scalingMethod},
+        {"neural_optimizer", &AutoConfig::neuralOptimizer},
+        {"neural_lookahead_fast_optimizer", &AutoConfig::neuralLookaheadFastOptimizer},
+        {"target_strategy", &AutoConfig::targetStrategy},
+        {"feature_strategy", &AutoConfig::featureStrategy},
+        {"neural_strategy", &AutoConfig::neuralStrategy},
+        {"bivariate_strategy", &AutoConfig::bivariateStrategy}
+    };
+    static const std::unordered_map<std::string, bool AutoConfig::*> boolFields = {
+        {"plot_univariate", &AutoConfig::plotUnivariate},
+        {"plot_overall", &AutoConfig::plotOverall},
+        {"plot_bivariate_significant", &AutoConfig::plotBivariateSignificant},
+        {"generate_html", &AutoConfig::generateHtml},
+        {"verbose_analysis", &AutoConfig::verboseAnalysis},
+        {"neural_use_batch_norm", &AutoConfig::neuralUseBatchNorm},
+        {"neural_use_layer_norm", &AutoConfig::neuralUseLayerNorm},
+        {"neural_use_validation_loss_ema", &AutoConfig::neuralUseValidationLossEma},
+        {"fast_mode", &AutoConfig::fastMode}
+    };
+    static const std::unordered_map<std::string, uint32_t AutoConfig::*> uintFields = {
+        {"neural_seed", &AutoConfig::neuralSeed},
+        {"benchmark_seed", &AutoConfig::benchmarkSeed}
+    };
+    static const std::unordered_map<std::string, IntRule> intFields = {
+        {"kfold", {&AutoConfig::kfold, 2}},
+        {"neural_lookahead_sync_period", {&AutoConfig::neuralLookaheadSyncPeriod, 1}},
+        {"neural_lr_plateau_patience", {&AutoConfig::neuralLrPlateauPatience, 1}},
+        {"neural_lr_cooldown_epochs", {&AutoConfig::neuralLrCooldownEpochs, 0}},
+        {"neural_max_lr_reductions", {&AutoConfig::neuralMaxLrReductions, 0}}
+    };
+    static const std::unordered_map<std::string, SizeRule> sizeFields = {
+        {"fast_max_bivariate_pairs", {&AutoConfig::fastMaxBivariatePairs, 1}},
+        {"fast_neural_sample_rows", {&AutoConfig::fastNeuralSampleRows, 1}}
+    };
+    static const std::unordered_map<std::string, DoubleRule> doubleFields = {
+        {"gradient_clip_norm", {&AutoConfig::gradientClipNorm, 0.0}},
+        {"neural_lookahead_alpha", {&AutoConfig::neuralLookaheadAlpha, 0.0}},
+        {"neural_batch_norm_momentum", {&AutoConfig::neuralBatchNormMomentum, 0.0}},
+        {"neural_batch_norm_epsilon", {&AutoConfig::neuralBatchNormEpsilon, 1e-12}},
+        {"neural_layer_norm_epsilon", {&AutoConfig::neuralLayerNormEpsilon, 1e-12}},
+        {"neural_lr_decay", {&AutoConfig::neuralLrDecay, 0.0}},
+        {"neural_min_learning_rate", {&AutoConfig::neuralMinLearningRate, 0.0}},
+        {"neural_validation_loss_ema_beta", {&AutoConfig::neuralValidationLossEmaBeta, 0.0}},
+        {"neural_categorical_input_l2_boost", {&AutoConfig::neuralCategoricalInputL2Boost, 0.0}}
+    };
+    static const std::unordered_map<std::string, PlotIntRule> plotIntFields = {
+        {"plot_width", {&PlotConfig::width, 320}},
+        {"plot_height", {&PlotConfig::height, 240}}
+    };
+    static const std::unordered_map<std::string, TuningDoubleRule> tuningDoubleFields = {
+        {"feature_min_variance", {&HeuristicTuningConfig::featureMinVariance, 0.0}},
+        {"significance_alpha", {&HeuristicTuningConfig::significanceAlpha, 0.0}},
+        {"outlier_iqr_multiplier", {&HeuristicTuningConfig::outlierIqrMultiplier, 0.0}},
+        {"outlier_z_threshold", {&HeuristicTuningConfig::outlierZThreshold, 0.0}},
+        {"feature_leakage_corr_threshold", {&HeuristicTuningConfig::featureLeakageCorrThreshold, 0.0}},
+        {"feature_missing_q3_offset", {&HeuristicTuningConfig::featureMissingQ3Offset, 0.0}},
+        {"feature_missing_floor", {&HeuristicTuningConfig::featureMissingAdaptiveMin, 0.0}},
+        {"feature_missing_ceiling", {&HeuristicTuningConfig::featureMissingAdaptiveMax, 0.0}},
+        {"feature_aggressive_delta", {&HeuristicTuningConfig::featureAggressiveDelta, 0.0}},
+        {"feature_lenient_delta", {&HeuristicTuningConfig::featureLenientDelta, 0.0}},
+        {"coherence_weight_small_dataset", {&HeuristicTuningConfig::coherenceWeightSmallDataset, 0.0}},
+        {"coherence_weight_regular_dataset", {&HeuristicTuningConfig::coherenceWeightRegularDataset, 0.0}},
+        {"coherence_overfit_penalty_train_ratio", {&HeuristicTuningConfig::coherenceOverfitPenaltyTrainRatio, 0.0}},
+        {"coherence_benchmark_penalty_ratio", {&HeuristicTuningConfig::coherenceBenchmarkPenaltyRatio, 0.0}},
+        {"coherence_penalty_step", {&HeuristicTuningConfig::coherencePenaltyStep, 0.0}},
+        {"coherence_weight_min", {&HeuristicTuningConfig::coherenceWeightMin, 0.0}},
+        {"coherence_weight_max", {&HeuristicTuningConfig::coherenceWeightMax, 0.0}},
+        {"corr_heavy_max_importance_threshold", {&HeuristicTuningConfig::corrHeavyMaxImportanceThreshold, 0.0}},
+        {"corr_heavy_concentration_threshold", {&HeuristicTuningConfig::corrHeavyConcentrationThreshold, 0.0}},
+        {"importance_heavy_max_importance_threshold", {&HeuristicTuningConfig::importanceHeavyMaxImportanceThreshold, 0.0}},
+        {"importance_heavy_concentration_threshold", {&HeuristicTuningConfig::importanceHeavyConcentrationThreshold, 0.0}},
+        {"numeric_epsilon", {&HeuristicTuningConfig::numericEpsilon, 0.0}},
+        {"beta_fallback_tolerance", {&HeuristicTuningConfig::betaFallbackTolerance, 0.0}},
+        {"bivariate_selection_quantile", {&HeuristicTuningConfig::bivariateSelectionQuantileOverride, -1.0}}
+    };
+    static const std::unordered_map<std::string, TuningSizeRule> tuningSizeFields = {
+        {"beta_fallback_intervals_start", {&HeuristicTuningConfig::betaFallbackIntervalsStart, 256}},
+        {"beta_fallback_intervals_max", {&HeuristicTuningConfig::betaFallbackIntervalsMax, 512}}
+    };
+
+    if (key == "plot_format") {
+        config.plot.format = CommonUtils::toLower(value);
+        return;
+    }
+
+    if (const auto it = rawStringFields.find(key); it != rawStringFields.end()) {
+        config.*(it->second) = value;
+        return;
+    }
+    if (const auto it = lowerStringFields.find(key); it != lowerStringFields.end()) {
+        config.*(it->second) = CommonUtils::toLower(value);
+        return;
+    }
+    if (const auto it = boolFields.find(key); it != boolFields.end()) {
+        config.*(it->second) = parseBoolStrict(value, key);
+        return;
+    }
+    if (const auto it = uintFields.find(key); it != uintFields.end()) {
+        config.*(it->second) = parseUIntStrict(value, key);
+        return;
+    }
+    if (const auto it = intFields.find(key); it != intFields.end()) {
+        config.*(it->second.member) = parseIntStrict(value, key, it->second.minValue);
+        return;
+    }
+    if (const auto it = sizeFields.find(key); it != sizeFields.end()) {
+        config.*(it->second.member) = static_cast<size_t>(parseIntStrict(value, key, it->second.minValue));
+        return;
+    }
+    if (const auto it = doubleFields.find(key); it != doubleFields.end()) {
+        config.*(it->second.member) = parseDoubleStrict(value, key, it->second.minValue);
+        return;
+    }
+    if (const auto it = plotIntFields.find(key); it != plotIntFields.end()) {
+        config.plot.*(it->second.member) = parseIntStrict(value, key, it->second.minValue);
+        return;
+    }
+    if (const auto it = tuningDoubleFields.find(key); it != tuningDoubleFields.end()) {
+        config.tuning.*(it->second.member) = parseDoubleStrict(value, key, it->second.minValue);
+        return;
+    }
+    if (const auto it = tuningSizeFields.find(key); it != tuningSizeFields.end()) {
+        config.tuning.*(it->second.member) = static_cast<size_t>(parseIntStrict(value, key, it->second.minValue));
+        return;
+    }
 }
 }
 
 AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     if (argc < 2) {
-        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1]");
+        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--neural-optimizer sgd|adam|lookahead] [--neural-lookahead-fast-optimizer sgd|adam] [--neural-lookahead-sync-period N] [--neural-lookahead-alpha 0..1] [--neural-use-batch-norm true|false] [--neural-batch-norm-momentum 0..1) [--neural-batch-norm-epsilon >0] [--neural-use-layer-norm true|false] [--neural-layer-norm-epsilon >0] [--neural-lr-decay 0..1] [--neural-lr-plateau-patience N] [--neural-lr-cooldown-epochs N] [--neural-max-lr-reductions N] [--neural-min-learning-rate >=0] [--neural-use-validation-loss-ema true|false] [--neural-validation-loss-ema-beta 0..1] [--neural-categorical-input-l2-boost >=0] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1]");
     }
 
     AutoConfig config;
@@ -220,6 +341,40 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.benchmarkSeed = parseUIntStrict(argv[++i], "--benchmark-seed");
         } else if (arg == "--gradient-clip" && i + 1 < argc) {
             config.gradientClipNorm = parseDoubleStrict(argv[++i], "--gradient-clip", 0.0);
+        } else if (arg == "--neural-optimizer" && i + 1 < argc) {
+            config.neuralOptimizer = CommonUtils::toLower(argv[++i]);
+        } else if (arg == "--neural-lookahead-fast-optimizer" && i + 1 < argc) {
+            config.neuralLookaheadFastOptimizer = CommonUtils::toLower(argv[++i]);
+        } else if (arg == "--neural-lookahead-sync-period" && i + 1 < argc) {
+            config.neuralLookaheadSyncPeriod = parseIntStrict(argv[++i], "--neural-lookahead-sync-period", 1);
+        } else if (arg == "--neural-lookahead-alpha" && i + 1 < argc) {
+            config.neuralLookaheadAlpha = parseDoubleStrict(argv[++i], "--neural-lookahead-alpha", 0.0);
+        } else if (arg == "--neural-use-batch-norm" && i + 1 < argc) {
+            config.neuralUseBatchNorm = parseBoolStrict(argv[++i], "--neural-use-batch-norm");
+        } else if (arg == "--neural-batch-norm-momentum" && i + 1 < argc) {
+            config.neuralBatchNormMomentum = parseDoubleStrict(argv[++i], "--neural-batch-norm-momentum", 0.0);
+        } else if (arg == "--neural-batch-norm-epsilon" && i + 1 < argc) {
+            config.neuralBatchNormEpsilon = parseDoubleStrict(argv[++i], "--neural-batch-norm-epsilon", 1e-12);
+        } else if (arg == "--neural-use-layer-norm" && i + 1 < argc) {
+            config.neuralUseLayerNorm = parseBoolStrict(argv[++i], "--neural-use-layer-norm");
+        } else if (arg == "--neural-layer-norm-epsilon" && i + 1 < argc) {
+            config.neuralLayerNormEpsilon = parseDoubleStrict(argv[++i], "--neural-layer-norm-epsilon", 1e-12);
+        } else if (arg == "--neural-lr-decay" && i + 1 < argc) {
+            config.neuralLrDecay = parseDoubleStrict(argv[++i], "--neural-lr-decay", 0.0);
+        } else if (arg == "--neural-lr-plateau-patience" && i + 1 < argc) {
+            config.neuralLrPlateauPatience = parseIntStrict(argv[++i], "--neural-lr-plateau-patience", 1);
+        } else if (arg == "--neural-lr-cooldown-epochs" && i + 1 < argc) {
+            config.neuralLrCooldownEpochs = parseIntStrict(argv[++i], "--neural-lr-cooldown-epochs", 0);
+        } else if (arg == "--neural-max-lr-reductions" && i + 1 < argc) {
+            config.neuralMaxLrReductions = parseIntStrict(argv[++i], "--neural-max-lr-reductions", 0);
+        } else if (arg == "--neural-min-learning-rate" && i + 1 < argc) {
+            config.neuralMinLearningRate = parseDoubleStrict(argv[++i], "--neural-min-learning-rate", 0.0);
+        } else if (arg == "--neural-use-validation-loss-ema" && i + 1 < argc) {
+            config.neuralUseValidationLossEma = parseBoolStrict(argv[++i], "--neural-use-validation-loss-ema");
+        } else if (arg == "--neural-validation-loss-ema-beta" && i + 1 < argc) {
+            config.neuralValidationLossEmaBeta = parseDoubleStrict(argv[++i], "--neural-validation-loss-ema-beta", 0.0);
+        } else if (arg == "--neural-categorical-input-l2-boost" && i + 1 < argc) {
+            config.neuralCategoricalInputL2Boost = parseDoubleStrict(argv[++i], "--neural-categorical-input-l2-boost", 0.0);
         } else if (arg == "--max-feature-missing-ratio" && i + 1 < argc) {
             config.maxFeatureMissingRatio = parseDoubleStrict(argv[++i], "--max-feature-missing-ratio", -1.0);
             if (config.maxFeatureMissingRatio > 1.0 || config.maxFeatureMissingRatio < -1.0) {
@@ -277,6 +432,24 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     }
     if (!isIn(config.bivariateStrategy, {"auto", "balanced", "corr_heavy", "importance_heavy"})) {
         throw Seldon::ConfigurationException("--bivariate-strategy must be one of: auto, balanced, corr_heavy, importance_heavy");
+    }
+    if (!isIn(config.neuralOptimizer, {"sgd", "adam", "lookahead"})) {
+        throw Seldon::ConfigurationException("--neural-optimizer must be one of: sgd, adam, lookahead");
+    }
+    if (!isIn(config.neuralLookaheadFastOptimizer, {"sgd", "adam"})) {
+        throw Seldon::ConfigurationException("--neural-lookahead-fast-optimizer must be one of: sgd, adam");
+    }
+    if (config.neuralLookaheadAlpha < 0.0 || config.neuralLookaheadAlpha > 1.0) {
+        throw Seldon::ConfigurationException("--neural-lookahead-alpha must be within [0,1]");
+    }
+    if (config.neuralBatchNormMomentum < 0.0 || config.neuralBatchNormMomentum >= 1.0) {
+        throw Seldon::ConfigurationException("--neural-batch-norm-momentum must be within [0,1)");
+    }
+    if (config.neuralLrDecay <= 0.0 || config.neuralLrDecay >= 1.0) {
+        throw Seldon::ConfigurationException("--neural-lr-decay must be within (0,1)");
+    }
+    if (config.neuralValidationLossEmaBeta < 0.0 || config.neuralValidationLossEmaBeta >= 1.0) {
+        throw Seldon::ConfigurationException("--neural-validation-loss-ema-beta must be within [0,1)");
     }
     if (config.tuning.featureLeakageCorrThreshold < 0.0 || config.tuning.featureLeakageCorrThreshold > 1.0) {
         throw Seldon::ConfigurationException("--feature-leakage-corr-threshold must be within [0,1]");
@@ -407,6 +580,24 @@ AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig&
     }
     if (!isIn(config.bivariateStrategy, {"auto", "balanced", "corr_heavy", "importance_heavy"})) {
         throw Seldon::ConfigurationException("bivariate_strategy must be one of: auto, balanced, corr_heavy, importance_heavy");
+    }
+    if (!isIn(config.neuralOptimizer, {"sgd", "adam", "lookahead"})) {
+        throw Seldon::ConfigurationException("neural_optimizer must be one of: sgd, adam, lookahead");
+    }
+    if (!isIn(config.neuralLookaheadFastOptimizer, {"sgd", "adam"})) {
+        throw Seldon::ConfigurationException("neural_lookahead_fast_optimizer must be one of: sgd, adam");
+    }
+    if (config.neuralLookaheadAlpha < 0.0 || config.neuralLookaheadAlpha > 1.0) {
+        throw Seldon::ConfigurationException("neural_lookahead_alpha must be within [0,1]");
+    }
+    if (config.neuralBatchNormMomentum < 0.0 || config.neuralBatchNormMomentum >= 1.0) {
+        throw Seldon::ConfigurationException("neural_batch_norm_momentum must be within [0,1)");
+    }
+    if (config.neuralLrDecay <= 0.0 || config.neuralLrDecay >= 1.0) {
+        throw Seldon::ConfigurationException("neural_lr_decay must be within (0,1)");
+    }
+    if (config.neuralValidationLossEmaBeta < 0.0 || config.neuralValidationLossEmaBeta >= 1.0) {
+        throw Seldon::ConfigurationException("neural_validation_loss_ema_beta must be within [0,1)");
     }
     if (config.tuning.featureLeakageCorrThreshold < 0.0 || config.tuning.featureLeakageCorrThreshold > 1.0) {
         throw Seldon::ConfigurationException("feature_leakage_corr_threshold must be within [0,1]");

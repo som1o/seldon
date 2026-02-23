@@ -39,6 +39,33 @@ Plots are opt-in by mode.
 ./seldon /path/to/data.csv --neural-seed 1337 --benchmark-seed 1337 --gradient-clip 5.0
 ```
 
+Neural training defaults include:
+- GELU hidden activation (instead of ReLU)
+- hidden-layer batch normalization
+- hidden-layer post-activation layer normalization
+- Lookahead optimizer (`k=5`, `alpha=0.5`) with Adam fast weights
+- EMA-smoothed validation-loss plateau scheduler with cooldown and max LR-cut cap (floor `1e-6`)
+- gradient clipping (element clamp + global norm scaling)
+- best-validation checkpoint restore on early stopping
+
+You can override these per dataset from CLI/config:
+- `--neural-optimizer sgd|adam|lookahead`
+- `--neural-lookahead-fast-optimizer sgd|adam`
+- `--neural-lookahead-sync-period N`
+- `--neural-lookahead-alpha 0..1`
+- `--neural-use-batch-norm true|false`
+- `--neural-batch-norm-momentum 0..1` and `--neural-batch-norm-epsilon >0`
+- `--neural-use-layer-norm true|false`
+- `--neural-layer-norm-epsilon >0`
+- `--neural-lr-decay 0..1`
+- `--neural-lr-plateau-patience N`
+- `--neural-lr-cooldown-epochs N`
+- `--neural-max-lr-reductions N`
+- `--neural-min-learning-rate >=0`
+- `--neural-use-validation-loss-ema true|false`
+- `--neural-validation-loss-ema-beta 0..1`
+- `--neural-categorical-input-l2-boost >=0`
+
 Skip neural training entirely (correlation-driven relevance only):
 
 ```bash

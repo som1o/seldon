@@ -35,6 +35,17 @@ std::string toFixed(double v, int prec = 4) {
     return os.str();
 }
 
+std::string activationToString(NeuralNet::Activation activation) {
+    switch (activation) {
+        case NeuralNet::Activation::SIGMOID: return "sigmoid";
+        case NeuralNet::Activation::RELU: return "relu";
+        case NeuralNet::Activation::TANH: return "tanh";
+        case NeuralNet::Activation::LINEAR: return "linear";
+        case NeuralNet::Activation::GELU: return "gelu";
+    }
+    return "unknown";
+}
+
 struct BivariateScoringPolicy {
     std::string name = "balanced";
     double wImportance = 0.50;
@@ -427,6 +438,7 @@ struct NeuralAnalysis {
     size_t hiddenNodes = 0;
     size_t outputNodes = 0;
     bool binaryTarget = false;
+    std::string hiddenActivation;
     std::string outputActivation;
     size_t epochs = 0;
     size_t batchSize = 0;
@@ -715,59 +727,10 @@ std::vector<double> buildCoherentImportance(const TypedDataset& data,
     return normalizeNonNegative(blended);
 }
 
-struct NumericDetailedStats {
-    double mean = 0.0;
-    double median = 0.0;
-    double variance = 0.0;
-    double stddev = 0.0;
-    double skewness = 0.0;
-    double kurtosis = 0.0;
-    double min = 0.0;
-    double max = 0.0;
-    double range = 0.0;
-    double q1 = 0.0;
-    double q3 = 0.0;
-    double iqr = 0.0;
-    double p05 = 0.0;
-    double p95 = 0.0;
-    double mad = 0.0;
-    double coeffVar = 0.0;
-    double sum = 0.0;
-    size_t nonZero = 0;
-};
+using NumericDetailedStats = MathUtils::NumericSummary;
 
 NumericDetailedStats detailedNumeric(const std::vector<double>& values, const ColumnStats* precomputedStats = nullptr) {
-    NumericDetailedStats out;
-    if (values.empty()) return out;
-
-    ColumnStats st = precomputedStats ? *precomputedStats : Statistics::calculateStats(values);
-    out.mean = st.mean;
-    out.median = st.median;
-    out.variance = st.variance;
-    out.stddev = st.stddev;
-    out.skewness = st.skewness;
-    out.kurtosis = st.kurtosis;
-
-    out.min = *std::min_element(values.begin(), values.end());
-    out.max = *std::max_element(values.begin(), values.end());
-    out.range = out.max - out.min;
-
-    out.q1 = CommonUtils::quantileByNth(values, 0.25);
-    out.q3 = CommonUtils::quantileByNth(values, 0.75);
-    out.iqr = out.q3 - out.q1;
-    out.p05 = CommonUtils::quantileByNth(values, 0.05);
-    out.p95 = CommonUtils::quantileByNth(values, 0.95);
-
-    std::vector<double> absDev(values.size(), 0.0);
-    for (size_t i = 0; i < values.size(); ++i) {
-        absDev[i] = std::abs(values[i] - out.median);
-        out.sum += values[i];
-        if (std::abs(values[i]) > 1e-12) out.nonZero++;
-    }
-    out.mad = CommonUtils::quantileByNth(absDev, 0.5);
-
-    if (std::abs(out.mean) > 1e-12) out.coeffVar = out.stddev / std::abs(out.mean);
-    return out;
+    return MathUtils::summarizeNumeric(values, precomputedStats);
 }
 
 std::string plotSubdir(const AutoConfig& cfg, const std::string& name) {
@@ -858,12 +821,16 @@ void addUnivariatePlots(ReportEngine& univariate,
         std::cout << "[Seldon][Univariate] Generating supervised univariate plots...\n";
     }
 
+    auto logGeneratedPlot = [&](const std::string& img) {
+        if (runCfg.verboseAnalysis) std::cout << "[Seldon][Univariate] Plot generated: " << img << "\n";
+    };
+
     for (size_t idx : data.numericColumnIndices()) {
         const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
         std::string img = plotterUnivariate.histogram("uni_hist_" + std::to_string(idx), vals, "Histogram: " + data.columns()[idx].name);
         if (!img.empty()) {
             univariate.addImage("Histogram: " + data.columns()[idx].name, img);
-            if (runCfg.verboseAnalysis) std::cout << "[Seldon][Univariate] Plot generated: " << img << "\n";
+            logGeneratedPlot(img);
         }
     }
 
@@ -883,7 +850,7 @@ void addUnivariatePlots(ReportEngine& univariate,
         std::string img = plotterUnivariate.bar("uni_cat_" + std::to_string(idx), labels, counts, "Category Frequencies: " + data.columns()[idx].name);
         if (!img.empty()) {
             univariate.addImage("Category Plot: " + data.columns()[idx].name, img);
-            if (runCfg.verboseAnalysis) std::cout << "[Seldon][Univariate] Plot generated: " << img << "\n";
+            logGeneratedPlot(img);
         }
     }
 }
@@ -937,6 +904,10 @@ void addUnivariateDetailedSection(ReportEngine& report,
         std::cout << "[Seldon][Univariate] Starting per-column statistical profiling...\n";
     }
 
+    auto logVerbose = [&](const std::string& line) {
+        if (verbose) std::cout << line << "\n";
+    };
+
     for (const auto& col : data.columns()) {
         const size_t missing = prep.missingCounts.count(col.name) ? prep.missingCounts.at(col.name) : 0;
         const size_t outliers = prep.outlierCounts.count(col.name) ? prep.outlierCounts.at(col.name) : 0;
@@ -972,15 +943,13 @@ void addUnivariateDetailedSection(ReportEngine& report,
                 std::to_string(missing),
                 std::to_string(outliers)
             });
-            if (verbose) {
-                std::cout << "[Seldon][Univariate] Numeric " << col.name
-                          << " | n=" << vals.size()
-                          << " mean=" << toFixed(st.mean)
-                          << " std=" << toFixed(st.stddev)
-                          << " iqr=" << toFixed(st.iqr)
-                          << " missing=" << missing
-                          << " outliers=" << outliers << "\n";
-            }
+            logVerbose("[Seldon][Univariate] Numeric " + col.name
+                       + " | n=" + std::to_string(vals.size())
+                       + " mean=" + toFixed(st.mean)
+                       + " std=" + toFixed(st.stddev)
+                       + " iqr=" + toFixed(st.iqr)
+                       + " missing=" + std::to_string(missing)
+                       + " outliers=" + std::to_string(outliers));
         } else if (col.type == ColumnType::CATEGORICAL) {
             const auto& vals = std::get<std::vector<std::string>>(col.values);
             std::map<std::string, size_t> freq;
@@ -1021,13 +990,11 @@ void addUnivariateDetailedSection(ReportEngine& report,
                 categoricalRows.push_back({col.name, top[i].first, std::to_string(top[i].second), toFixed(static_cast<double>(top[i].second) / static_cast<double>(std::max<size_t>(1, vals.size())), 6)});
             }
 
-            if (verbose) {
-                std::cout << "[Seldon][Univariate] Categorical " << col.name
-                          << " | unique=" << freq.size()
-                          << " mode='" << mode << "'"
-                          << " mode_ratio=" << toFixed(modeRatio, 6)
-                          << " missing=" << missing << "\n";
-            }
+            logVerbose("[Seldon][Univariate] Categorical " + col.name
+                       + " | unique=" + std::to_string(freq.size())
+                       + " mode='" + mode + "'"
+                       + " mode_ratio=" + toFixed(modeRatio, 6)
+                       + " missing=" + std::to_string(missing));
         } else {
             const auto& vals = std::get<std::vector<int64_t>>(col.values);
             int64_t minTs = vals.empty() ? 0 : *std::min_element(vals.begin(), vals.end());
@@ -1056,12 +1023,10 @@ void addUnivariateDetailedSection(ReportEngine& report,
                 std::to_string(missing),
                 "-"
             });
-            if (verbose) {
-                std::cout << "[Seldon][Univariate] Datetime " << col.name
-                          << " | min_ts=" << minTs
-                          << " max_ts=" << maxTs
-                          << " missing=" << missing << "\n";
-            }
+            logVerbose("[Seldon][Univariate] Datetime " + col.name
+                       + " | min_ts=" + std::to_string(minTs)
+                       + " max_ts=" + std::to_string(maxTs)
+                       + " missing=" + std::to_string(missing));
         }
     }
 
@@ -1150,7 +1115,8 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     analysis.numericInputNodes = featureIdx.size();
     analysis.outputNodes = 1;
     analysis.binaryTarget = binaryTarget;
-    analysis.outputActivation = binaryTarget ? "sigmoid" : "linear";
+    analysis.hiddenActivation = "n/a";
+    analysis.outputActivation = activationToString(binaryTarget ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR);
     analysis.trainingRowsTotal = data.rowCount();
 
     if (featureIdx.empty()) {
@@ -1267,20 +1233,51 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
 
     NeuralNet nn({inputNodes, hidden, outputNodes});
     NeuralNet::Hyperparameters hp;
+
+    auto toOptimizer = [](const std::string& name) {
+        const std::string n = CommonUtils::toLower(name);
+        if (n == "sgd") return NeuralNet::Optimizer::SGD;
+        if (n == "adam") return NeuralNet::Optimizer::ADAM;
+        return NeuralNet::Optimizer::LOOKAHEAD;
+    };
+
     hp.epochs = dynamicEpochs;
     hp.batchSize = dynamicBatch;
     hp.earlyStoppingPatience = dynamicPatience;
-    hp.lrStepSize = 50;
-    hp.lrDecay = 0.5;
+    hp.lrDecay = config.neuralLrDecay;
+    hp.lrPlateauPatience = config.neuralLrPlateauPatience;
+    hp.lrCooldownEpochs = config.neuralLrCooldownEpochs;
+    hp.maxLrReductions = config.neuralMaxLrReductions;
+    hp.minLearningRate = config.neuralMinLearningRate;
+    hp.useValidationLossEma = config.neuralUseValidationLossEma;
+    hp.validationLossEmaBeta = config.neuralValidationLossEmaBeta;
     hp.dropoutRate = dynamicDropout;
     hp.valSplit = (Xnn.size() < 80) ? 0.30 : 0.20;
     hp.l2Lambda = (Xnn.size() < 80) ? 0.010 : 0.001;
-    hp.activation = NeuralNet::Activation::RELU;
+    hp.categoricalInputL2Boost = config.neuralCategoricalInputL2Boost;
+    hp.activation = NeuralNet::Activation::GELU;
     hp.outputActivation = binaryTarget ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
+    hp.useBatchNorm = config.neuralUseBatchNorm;
+    hp.batchNormMomentum = config.neuralBatchNormMomentum;
+    hp.batchNormEpsilon = config.neuralBatchNormEpsilon;
+    hp.useLayerNorm = config.neuralUseLayerNorm;
+    hp.layerNormEpsilon = config.neuralLayerNormEpsilon;
+    hp.optimizer = toOptimizer(config.neuralOptimizer);
+    hp.lookaheadFastOptimizer = toOptimizer(config.neuralLookaheadFastOptimizer);
+    hp.lookaheadSyncPeriod = static_cast<size_t>(std::max(1, config.neuralLookaheadSyncPeriod));
+    hp.lookaheadAlpha = config.neuralLookaheadAlpha;
     hp.loss = binaryTarget ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
     hp.verbose = verbose;
     hp.seed = config.neuralSeed;
     hp.gradientClipNorm = config.gradientClipNorm;
+
+    std::vector<double> inputL2Scales(inputNodes, 1.0);
+    for (size_t i = 0; i < inputL2Scales.size() && i < encoded.sourceNumericFeaturePos.size(); ++i) {
+        if (encoded.sourceNumericFeaturePos[i] < 0) {
+            inputL2Scales[i] = hp.categoricalInputL2Boost;
+        }
+    }
+    nn.setInputL2Scales(inputL2Scales);
 
     nn.train(Xnn, Ynn, hp);
 
@@ -1288,7 +1285,8 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     analysis.hiddenNodes = hidden;
     analysis.outputNodes = outputNodes;
     analysis.binaryTarget = binaryTarget;
-    analysis.outputActivation = binaryTarget ? "sigmoid" : "linear";
+    analysis.hiddenActivation = activationToString(hp.activation);
+    analysis.outputActivation = activationToString(hp.outputActivation);
     analysis.epochs = hp.epochs;
     analysis.batchSize = hp.batchSize;
     analysis.valSplit = hp.valSplit;
@@ -1460,18 +1458,24 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             return p;
     };
 
-    if (verbose) {
-        for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
+    auto appendPairsForRange = [&](size_t startAPos, size_t endAPos, std::vector<PairInsight>& out, bool emitVerboseRows) {
+        for (size_t aPos = startAPos; aPos < endAPos; ++aPos) {
             for (size_t bPos = aPos + 1; bPos < evalNumericIdx.size(); ++bPos) {
                 PairInsight p = buildPair(aPos, bPos);
-                std::cout << "[Seldon][Bivariate] " << p.featureA << " vs " << p.featureB
-                          << " | r=" << toFixed(p.r, 6)
-                          << " p=" << toFixed(p.pValue, 8)
-                          << " t=" << toFixed(p.tStat, 6)
-                          << " neural=" << toFixed(p.neuralScore, 8) << "\n";
-                pairs.push_back(std::move(p));
+                if (emitVerboseRows) {
+                    std::cout << "[Seldon][Bivariate] " << p.featureA << " vs " << p.featureB
+                              << " | r=" << toFixed(p.r, 6)
+                              << " p=" << toFixed(p.pValue, 8)
+                              << " t=" << toFixed(p.tStat, 6)
+                              << " neural=" << toFixed(p.neuralScore, 8) << "\n";
+                }
+                out.push_back(std::move(p));
             }
         }
+    };
+
+    if (verbose) {
+        appendPairsForRange(0, evalNumericIdx.size(), pairs, true);
     } else {
         #ifdef USE_OPENMP
         #pragma omp parallel
@@ -1483,9 +1487,7 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             #pragma omp for schedule(dynamic)
             #endif
             for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
-                for (size_t bPos = aPos + 1; bPos < evalNumericIdx.size(); ++bPos) {
-                    localPairs.push_back(buildPair(aPos, bPos));
-                }
+                appendPairsForRange(aPos, aPos + 1, localPairs, false);
             }
 
             #ifdef USE_OPENMP
@@ -1810,7 +1812,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Categorical Importance Share", toFixed(neural.categoricalImportanceShare, 4)},
         {"Early Stop Patience", std::to_string(neural.earlyStoppingPatience)},
         {"Loss", neural.binaryTarget ? "cross_entropy" : "mse"},
-        {"Activation", "relu"},
+        {"Hidden Activation", neural.hiddenActivation},
         {"Output Activation", neural.outputActivation}
     });
 

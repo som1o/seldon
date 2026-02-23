@@ -1,4 +1,5 @@
 #include "MathUtils.h"
+#include "CommonUtils.h"
 #include "Statistics.h"
 #include <cmath>
 #include <stdexcept>
@@ -296,76 +297,132 @@ MathUtils::Matrix MathUtils::Matrix::multiply(const Matrix& other) const {
     Matrix otherT = other.transpose();
 
     #ifdef USE_OPENMP
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(static)
     #endif
     for (size_t r = 0; r < rows; ++r) {
         const auto& leftRow = data[r];
         auto& outRow = result.data[r];
         for (size_t c = 0; c < other.cols; ++c) {
             const auto& rightRow = otherT.data[c];
-            outRow[c] = std::inner_product(leftRow.begin(), leftRow.end(), rightRow.begin(), 0.0);
+            double sum = 0.0;
+            #ifdef USE_OPENMP
+            #pragma omp simd reduction(+:sum)
+            #endif
+            for (size_t k = 0; k < cols; ++k) {
+                sum += leftRow[k] * rightRow[k];
+            }
+            outRow[c] = sum;
         }
     }
     return result;
 }
 
-// Basic implementation of Full Pivoting Gaussian Elimination for Matrix Inversion
 std::optional<MathUtils::Matrix> MathUtils::Matrix::inverse() const {
     if (rows != cols) throw std::invalid_argument("Only square matrices can be inverted.");
-    size_t n = rows;
-    Matrix augmented(n, 2 * n);
+    const size_t n = rows;
+    Matrix work = *this;
+    Matrix inv = Matrix::identity(n);
+    std::vector<size_t> colPerm(n, 0);
+    std::iota(colPerm.begin(), colPerm.end(), 0);
 
-    // Create [Matrix | Identity]
+    double scale = 0.0;
     for (size_t i = 0; i < n; ++i) {
         for (size_t j = 0; j < n; ++j) {
-            augmented.data[i][j] = data[i][j];
-            augmented.data[i][j + n] = (i == j) ? 1.0 : 0.0;
+            scale = std::max(scale, std::abs(work.data[i][j]));
         }
     }
+    if (scale <= gNumericEpsilon) return std::nullopt;
+    const double pivotTolerance = std::max(gNumericEpsilon, gNumericEpsilon * scale * static_cast<double>(n));
 
-    // Gaussian elimination with partial pivoting
     for (size_t i = 0; i < n; ++i) {
-        // Find pivot
-        size_t maxRow = i;
-        for (size_t k = i + 1; k < n; ++k) {
-            if (std::abs(augmented.data[k][i]) > std::abs(augmented.data[maxRow][i])) {
-                maxRow = k;
-            }
-        }
-
-        // Swap rows
-        std::swap(augmented.data[i], augmented.data[maxRow]);
-
-        // Check for singularity
-        if (std::abs(augmented.data[i][i]) < 1e-12) {
-            return std::nullopt; 
-        }
-
-        // Divide pivot row by pivot value
-        double pivot = augmented.data[i][i];
-        for (size_t j = i; j < 2 * n; ++j) {
-            augmented.data[i][j] /= pivot;
-        }
-
-        // Eliminate column entries in other rows
-        for (size_t k = 0; k < n; ++k) {
-            if (k != i) {
-                double factor = augmented.data[k][i];
-                for (size_t j = i; j < 2 * n; ++j) {
-                    augmented.data[k][j] -= factor * augmented.data[i][j];
+        size_t pivotRow = i;
+        size_t pivotCol = i;
+        double pivotAbs = 0.0;
+        for (size_t r = i; r < n; ++r) {
+            for (size_t c = i; c < n; ++c) {
+                const double v = std::abs(work.data[r][c]);
+                if (v > pivotAbs) {
+                    pivotAbs = v;
+                    pivotRow = r;
+                    pivotCol = c;
                 }
             }
         }
-    }
+        if (pivotAbs <= pivotTolerance) return std::nullopt;
 
-    // Extract inverted matrix
-    Matrix result(n, n);
-    for (size_t i = 0; i < n; ++i) {
+        if (pivotRow != i) {
+            std::swap(work.data[i], work.data[pivotRow]);
+            std::swap(inv.data[i], inv.data[pivotRow]);
+        }
+
+        if (pivotCol != i) {
+            for (size_t r = 0; r < n; ++r) {
+                std::swap(work.data[r][i], work.data[r][pivotCol]);
+            }
+            std::swap(colPerm[i], colPerm[pivotCol]);
+        }
+
+        const double pivot = work.data[i][i];
         for (size_t j = 0; j < n; ++j) {
-            result.data[i][j] = augmented.data[i][j + n];
+            work.data[i][j] /= pivot;
+            inv.data[i][j] /= pivot;
+        }
+
+        for (size_t r = 0; r < n; ++r) {
+            if (r == i) continue;
+            const double factor = work.data[r][i];
+            if (std::abs(factor) <= pivotTolerance) {
+                work.data[r][i] = 0.0;
+                continue;
+            }
+            for (size_t c = 0; c < n; ++c) {
+                work.data[r][c] -= factor * work.data[i][c];
+                inv.data[r][c] -= factor * inv.data[i][c];
+            }
+            work.data[r][i] = 0.0;
         }
     }
+
+    Matrix result(n, n);
+    for (size_t i = 0; i < n; ++i) {
+        result.data[colPerm[i]] = inv.data[i];
+    }
     return result;
+}
+
+MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>& values,
+                                                      const ColumnStats* precomputedStats) {
+    NumericSummary out;
+    if (values.empty()) return out;
+
+    const ColumnStats stats = precomputedStats ? *precomputedStats : Statistics::calculateStats(values);
+    out.mean = stats.mean;
+    out.median = stats.median;
+    out.variance = stats.variance;
+    out.stddev = stats.stddev;
+    out.skewness = stats.skewness;
+    out.kurtosis = stats.kurtosis;
+
+    out.min = *std::min_element(values.begin(), values.end());
+    out.max = *std::max_element(values.begin(), values.end());
+    out.range = out.max - out.min;
+
+    out.q1 = CommonUtils::quantileByNth(values, 0.25);
+    out.q3 = CommonUtils::quantileByNth(values, 0.75);
+    out.iqr = out.q3 - out.q1;
+    out.p05 = CommonUtils::quantileByNth(values, 0.05);
+    out.p95 = CommonUtils::quantileByNth(values, 0.95);
+
+    std::vector<double> absDev(values.size(), 0.0);
+    for (size_t i = 0; i < values.size(); ++i) {
+        absDev[i] = std::abs(values[i] - out.median);
+        out.sum += values[i];
+        if (std::abs(values[i]) > 1e-12) out.nonZero++;
+    }
+    out.mad = CommonUtils::quantileByNth(absDev, 0.5);
+
+    if (std::abs(out.mean) > 1e-12) out.coeffVar = out.stddev / std::abs(out.mean);
+    return out;
 }
 
 /**

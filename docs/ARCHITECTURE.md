@@ -26,7 +26,7 @@ Seldon is organized as a deterministic analytics pipeline centered on `TypedData
 - `CSVUtils`: shared CSV line parser/BOM/header normalization
 - `Preprocessor`: missing/outlier/scaling transformations
 - `MathUtils`: statistical significance and matrix math
-- `NeuralNet`: feed-forward network with deterministic seed + gradient clipping
+- `NeuralNet`: feed-forward network with deterministic seed, GELU hidden activation, batch normalization, post-activation layer normalization, adaptive LR-on-plateau decay, Lookahead optimizer support, and gradient clipping
 - `GnuplotEngine`: optional PNG plotting backend
 - `ReportEngine`: markdown report writer
 
@@ -40,7 +40,14 @@ Seldon is organized as a deterministic analytics pipeline centered on `TypedData
 
 ## Determinism & Numerical Safety
 - Neural training supports fixed seed control (`neural_seed`) for reproducibility.
-- Global gradient clipping (`gradient_clip_norm`) mitigates unstable updates.
+- GELU hidden activations reduce dead-neuron behavior compared with plain ReLU.
+- Hidden-layer batch normalization re-centers activations with running mean/variance.
+- Hidden-layer post-activation layer normalization dampens variance drift across lattice states.
+- Lookahead optimizer keeps slow-moving shadow weights synchronized from fast updates for jitter reduction.
+- Validation-plateau scheduler monitors EMA-smoothed validation loss, applies cooldown between LR cuts, and caps reductions per run (floor at `1e-6`).
+- Gradient clipping (`gradient_clip_norm`) applies both element-wise clamping and global norm scaling.
+- Backprop uses pre-activation derivatives and explicit dropout scaling to keep gradient flow mathematically consistent across activations.
+- Early stopping restores best validation checkpointed weights/biases before inference/reporting.
 - Statistical significance is computed consistently through `MathUtils`.
 - Incomplete beta fallback controls are configurable (`beta_fallback_*`, `numeric_epsilon`).
 

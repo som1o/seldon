@@ -4,8 +4,8 @@
 #include <random>
 #include <vector>
 
-enum class NeuralActivation { SIGMOID, RELU, TANH, LINEAR };
-enum class NeuralOptimizer { SGD, ADAM };
+enum class NeuralActivation { SIGMOID, RELU, TANH, LINEAR, GELU };
+enum class NeuralOptimizer { SGD, ADAM, LOOKAHEAD };
 
 class DenseLayer {
 public:
@@ -36,6 +36,11 @@ public:
     void forward(const DenseLayer& prev,
                  bool isTraining,
                  double dropoutRate,
+                 bool useBatchNorm,
+                 double batchNormMomentum,
+                 double batchNormEpsilon,
+                 bool useLayerNorm,
+                 double layerNormEpsilon,
                  uint32_t seedState,
                  uint64_t forwardCounter);
 
@@ -47,11 +52,12 @@ public:
                           double learningRate,
                           double l2Lambda,
                           NeuralOptimizer optimizer,
-                          size_t tStep);
+                          size_t tStep,
+                          const std::vector<double>* inputL2Scales = nullptr);
 
 private:
     static double activate(double x, NeuralActivation activation);
-    static double activateDerivative(double out, NeuralActivation activation);
+    static double activateDerivativeFromInput(double x, NeuralActivation activation);
 
     size_t m_size = 0;
     size_t m_prevSize = 0;
@@ -59,6 +65,7 @@ private:
     std::vector<double> m_biases;
     std::vector<double> m_weights;
     std::vector<double> m_gradients;
+    std::vector<double> m_activationInputs;
 
     std::vector<double> m_mWeights;
     std::vector<double> m_vWeights;
@@ -66,5 +73,14 @@ private:
     std::vector<double> m_vBiases;
 
     std::vector<uint8_t> m_dropMask;
+    std::vector<double> m_dropoutScale;
+
+    std::vector<double> m_bnRunningMean;
+    std::vector<double> m_bnRunningVar;
+    std::vector<double> m_bnGamma;
+    std::vector<double> m_bnBeta;
+    std::vector<double> m_bnBackpropScale;
+    std::vector<double> m_lnBackpropScale;
+
     NeuralActivation m_activation = NeuralActivation::RELU;
 };

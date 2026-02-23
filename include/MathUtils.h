@@ -24,6 +24,27 @@ struct MLRDiagnostics {
 
 class MathUtils {
 public:
+    struct NumericSummary {
+        double mean = 0.0;
+        double median = 0.0;
+        double variance = 0.0;
+        double stddev = 0.0;
+        double skewness = 0.0;
+        double kurtosis = 0.0;
+        double min = 0.0;
+        double max = 0.0;
+        double range = 0.0;
+        double q1 = 0.0;
+        double q3 = 0.0;
+        double iqr = 0.0;
+        double p05 = 0.0;
+        double p95 = 0.0;
+        double mad = 0.0;
+        double coeffVar = 0.0;
+        double sum = 0.0;
+        size_t nonZero = 0;
+    };
+
     static void setSignificanceAlpha(double alpha);
     static double getSignificanceAlpha();
     static void setNumericTuning(double numericEpsilon,
@@ -67,6 +88,14 @@ public:
     static std::pair<double, double> simpleLinearRegression(const std::vector<double>& x, const std::vector<double>& y,
                                                             const ColumnStats& statsX, const ColumnStats& statsY, double pearsonR);
 
+    /**
+     * @brief Computes consistent descriptive numeric stats used across reports.
+     * @pre values may be empty.
+     * @post Returns zero-initialized summary for empty input.
+     */
+    static NumericSummary summarizeNumeric(const std::vector<double>& values,
+                                           const ColumnStats* precomputedStats = nullptr);
+
     // Basic Matrix operations for Multiple Linear Regression
     struct Matrix {
         std::vector<std::vector<double>> data;
@@ -94,12 +123,12 @@ public:
         Matrix multiply(const Matrix& other) const;
 
         /**
-         * @brief Inverts a square matrix using Gaussian elimination.
+         * @brief Inverts a square matrix using full-pivot Gauss-Jordan elimination.
          * @pre rows == cols.
          * @post Returns std::nullopt for singular/near-singular matrices.
          * @throws std::invalid_argument when matrix is not square.
          */
-        std::optional<Matrix> inverse() const; // Using Gaussian Elimination
+        std::optional<Matrix> inverse() const;
 
         /**
          * @brief Computes Householder QR decomposition: A = Q*R.
