@@ -50,7 +50,12 @@ std::vector<std::string> parseCSVLine(std::istream& is, char delimiter, bool* ma
                     val += '"';
                     is.get();
                 } else {
-                    inQuotes = false;
+                    int next = is.peek();
+                    if (next == EOF || next == delimiter || next == '\n' || next == '\r') {
+                        inQuotes = false;
+                    } else {
+                        val += c;
+                    }
                 }
             } else {
                 val += c;

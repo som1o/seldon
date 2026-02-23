@@ -4,8 +4,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <numeric>
+#include <tuple>
+#include <utility>
 #include <unordered_map>
 
 namespace {
@@ -13,6 +16,46 @@ using NumVec = std::vector<double>;
 using StrVec = std::vector<std::string>;
 using TimeVec = std::vector<int64_t>;
 using MissingMask = ::MissingMask;
+
+int64_t floorDiv(int64_t value, int64_t divisor) {
+    int64_t q = value / divisor;
+    int64_t r = value % divisor;
+    if (r != 0 && ((r > 0) != (divisor > 0))) {
+        --q;
+    }
+    return q;
+}
+
+std::tuple<int, unsigned, unsigned> civilFromDays(int64_t z) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = static_cast<unsigned>(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int y = static_cast<int>(yoe) + static_cast<int>(era) * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    const unsigned d = doy - (153 * mp + 2) / 5 + 1;
+    const unsigned m = mp + (mp < 10 ? 3 : -9);
+    y += (m <= 2);
+    return {y, m, d};
+}
+
+int dayOfWeekFromUnixSeconds(int64_t unixSeconds) {
+    const int64_t days = floorDiv(unixSeconds, 86400);
+    int weekday = static_cast<int>((days + 4) % 7);
+    if (weekday < 0) weekday += 7;
+    return weekday; // 0=Sunday, 6=Saturday
+}
+
+std::string uniqueColumnName(const TypedDataset& data, const std::string& base) {
+    if (data.findColumnIndex(base) < 0) return base;
+    int suffix = 2;
+    while (true) {
+        std::string candidate = base + "_" + std::to_string(suffix);
+        if (data.findColumnIndex(candidate) < 0) return candidate;
+        ++suffix;
+    }
+}
 
 void validateImputationStrategy(const std::string& strategy, ColumnType type, const std::string& columnName) {
     const std::string m = CommonUtils::toLower(strategy);
@@ -128,6 +171,76 @@ void imputeDatetime(TimeVec& values, MissingMask& missing, const std::string& me
     }
 }
 
+void addTemporalDateFeatures(TypedDataset& data, const AutoConfig& config) {
+    const auto datetimeIndices = data.datetimeColumnIndices();
+    if (datetimeIndices.empty()) return;
+
+    std::vector<TypedColumn> engineered;
+    engineered.reserve(datetimeIndices.size() * 3);
+
+    for (size_t idx : datetimeIndices) {
+        const auto& srcCol = data.columns()[idx];
+        const auto& rawValues = std::get<TimeVec>(srcCol.values);
+        const MissingMask& rawMissing = srcCol.missing;
+
+        std::string strategy = "auto";
+        auto it = config.columnImputation.find(srcCol.name);
+        if (it != config.columnImputation.end()) strategy = it->second;
+        validateImputationStrategy(strategy, ColumnType::DATETIME, srcCol.name);
+
+        TimeVec imputedValues = rawValues;
+        MissingMask imputedMissing = rawMissing;
+        imputeDatetime(imputedValues, imputedMissing, strategy);
+
+        std::vector<double> dayOfWeek(imputedValues.size(), std::numeric_limits<double>::quiet_NaN());
+        std::vector<double> month(imputedValues.size(), std::numeric_limits<double>::quiet_NaN());
+        std::vector<double> isWeekend(imputedValues.size(), std::numeric_limits<double>::quiet_NaN());
+        MissingMask derivedMissing(imputedValues.size(), static_cast<uint8_t>(0));
+
+        for (size_t r = 0; r < imputedValues.size(); ++r) {
+            if (r < imputedMissing.size() && imputedMissing[r]) {
+                derivedMissing[r] = static_cast<uint8_t>(1);
+                continue;
+            }
+
+            const int64_t ts = imputedValues[r];
+            const int weekday = dayOfWeekFromUnixSeconds(ts);
+            const int64_t days = floorDiv(ts, 86400);
+            const auto [year, monthValue, day] = civilFromDays(days);
+            (void)year;
+            (void)day;
+
+            dayOfWeek[r] = static_cast<double>(weekday);
+            month[r] = static_cast<double>(monthValue);
+            isWeekend[r] = (weekday == 0 || weekday == 6) ? 1.0 : 0.0;
+        }
+
+        TypedColumn dowCol;
+        dowCol.name = uniqueColumnName(data, srcCol.name + "_DayOfWeek");
+        dowCol.type = ColumnType::NUMERIC;
+        dowCol.values = std::move(dayOfWeek);
+        dowCol.missing = derivedMissing;
+        engineered.push_back(std::move(dowCol));
+
+        TypedColumn monthCol;
+        monthCol.name = uniqueColumnName(data, srcCol.name + "_Month");
+        monthCol.type = ColumnType::NUMERIC;
+        monthCol.values = std::move(month);
+        monthCol.missing = derivedMissing;
+        engineered.push_back(std::move(monthCol));
+
+        TypedColumn weekendCol;
+        weekendCol.name = uniqueColumnName(data, srcCol.name + "_IsWeekend");
+        weekendCol.type = ColumnType::NUMERIC;
+        weekendCol.values = std::move(isWeekend);
+        weekendCol.missing = std::move(derivedMissing);
+        engineered.push_back(std::move(weekendCol));
+    }
+
+    auto& columns = data.columns();
+    columns.insert(columns.end(), std::make_move_iterator(engineered.begin()), std::make_move_iterator(engineered.end()));
+}
+
 std::vector<bool> detectOutliersIQR(const NumVec& values, double iqrMultiplier) {
     std::vector<bool> flags(values.size(), false);
     if (values.size() < 4) return flags;
@@ -222,6 +335,8 @@ void capOutliers(NumVec& values, const std::vector<bool>& flags) {
 PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config) {
     PreprocessReport report;
     report.originalRowCount = data.rowCount();
+
+    addTemporalDateFeatures(data, config);
 
     // Outlier flags are computed from observed raw numeric values before imputation.
     std::unordered_map<std::string, std::vector<bool>> detectedFlags;

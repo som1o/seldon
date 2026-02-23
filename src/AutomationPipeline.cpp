@@ -1466,6 +1466,97 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     analysis.categoricalColumnsUsed = encoded.categoricalColumnsUsed;
     analysis.categoricalEncodedNodes = encoded.categoricalEncodedNodes;
 
+    auto applyAdaptiveSparsity = [&](size_t maxColumns) {
+        if (Xnn.empty() || Xnn.front().empty()) return;
+        const size_t cols = Xnn.front().size();
+        if (cols <= maxColumns || maxColumns == 0) return;
+
+        struct ColScore {
+            size_t idx = 0;
+            double score = 0.0;
+        };
+
+        std::vector<ColScore> scores;
+        scores.reserve(cols);
+
+        const size_t rows = std::min(Xnn.size(), Ynn.size());
+        double yMean = 0.0;
+        for (size_t r = 0; r < rows; ++r) yMean += Ynn[r][0];
+        yMean /= std::max<size_t>(1, rows);
+
+        double yVar = 0.0;
+        for (size_t r = 0; r < rows; ++r) {
+            const double d = Ynn[r][0] - yMean;
+            yVar += d * d;
+        }
+        yVar = std::max(yVar, 1e-12);
+
+        for (size_t c = 0; c < cols; ++c) {
+            double xMean = 0.0;
+            for (size_t r = 0; r < rows; ++r) xMean += Xnn[r][c];
+            xMean /= std::max<size_t>(1, rows);
+
+            double xVar = 0.0;
+            double cov = 0.0;
+            for (size_t r = 0; r < rows; ++r) {
+                const double dx = Xnn[r][c] - xMean;
+                const double dy = Ynn[r][0] - yMean;
+                xVar += dx * dx;
+                cov += dx * dy;
+            }
+
+            double score = 0.0;
+            if (xVar > 1e-12) {
+                score = std::abs(cov) / std::sqrt(xVar * yVar);
+            }
+            if (!std::isfinite(score)) score = 0.0;
+            scores.push_back({c, score});
+        }
+
+        std::sort(scores.begin(), scores.end(), [](const ColScore& a, const ColScore& b) {
+            if (a.score == b.score) return a.idx < b.idx;
+            return a.score > b.score;
+        });
+        scores.resize(maxColumns);
+        std::sort(scores.begin(), scores.end(), [](const ColScore& a, const ColScore& b) { return a.idx < b.idx; });
+
+        std::vector<std::vector<double>> squeezedX(Xnn.size(), std::vector<double>{});
+        for (size_t r = 0; r < Xnn.size(); ++r) {
+            squeezedX[r].reserve(scores.size());
+            for (const auto& sc : scores) {
+                squeezedX[r].push_back(Xnn[r][sc.idx]);
+            }
+        }
+
+        std::vector<int> squeezedSource;
+        squeezedSource.reserve(scores.size());
+        for (const auto& sc : scores) {
+            if (sc.idx < encoded.sourceNumericFeaturePos.size()) {
+                squeezedSource.push_back(encoded.sourceNumericFeaturePos[sc.idx]);
+            } else {
+                squeezedSource.push_back(-1);
+            }
+        }
+
+        Xnn = std::move(squeezedX);
+        encoded.sourceNumericFeaturePos = std::move(squeezedSource);
+    };
+
+    if (inputNodes > 0) {
+        const double dofRatio = static_cast<double>(data.rowCount()) / static_cast<double>(std::max<size_t>(1, inputNodes));
+        if (dofRatio < 10.0) {
+            const size_t squeezeCap = std::clamp<size_t>(data.rowCount() / 10, 4, std::max<size_t>(4, inputNodes));
+            applyAdaptiveSparsity(squeezeCap);
+            inputNodes = Xnn.empty() ? 0 : Xnn.front().size();
+            analysis.inputNodes = inputNodes;
+        }
+    }
+
+    analysis.categoricalEncodedNodes = static_cast<size_t>(std::count_if(
+        encoded.sourceNumericFeaturePos.begin(),
+        encoded.sourceNumericFeaturePos.end(),
+        [](int v) { return v < 0; }));
+
     if (inputNodes == 0) {
         analysis.policyUsed = "none_no_encoded_features";
         analysis.featureImportance.assign(featureIdx.size(), 0.0);
@@ -1513,7 +1604,9 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     std::string policyName = requested;
     if (requested == "auto") {
         double complexity = std::log1p(static_cast<double>(data.rowCount())) * std::sqrt(static_cast<double>(std::max<size_t>(1, inputNodes)));
-        if (complexity < 10.0) policyName = "fast";
+        if (static_cast<double>(data.rowCount()) < 10.0 * static_cast<double>(std::max<size_t>(1, inputNodes))) {
+            policyName = "fast";
+        } else if (complexity < 10.0) policyName = "fast";
         else if (complexity > 22.0) policyName = "expressive";
         else policyName = "balanced";
     }
@@ -1552,6 +1645,14 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         dynamicDropout = std::max(dynamicDropout, 0.10);
     }
 
+    if (static_cast<double>(Xnn.size()) < 10.0 * static_cast<double>(std::max<size_t>(1, inputNodes))) {
+        const size_t rowDrivenCap = std::clamp<size_t>(Xnn.size() / 3, 4, 20);
+        hidden = std::min(hidden, rowDrivenCap);
+        dynamicEpochs = std::min<size_t>(dynamicEpochs, 120);
+        dynamicPatience = std::min(dynamicPatience, 7);
+        dynamicDropout = std::max(dynamicDropout, 0.12);
+    }
+
     NeuralNet nn({inputNodes, hidden, outputNodes});
     NeuralNet::Hyperparameters hp;
 
@@ -1573,7 +1674,12 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     hp.useValidationLossEma = config.neuralUseValidationLossEma;
     hp.validationLossEmaBeta = config.neuralValidationLossEmaBeta;
     hp.dropoutRate = dynamicDropout;
-    hp.valSplit = (Xnn.size() < 80) ? 0.30 : 0.20;
+    double desiredValSplit = (Xnn.size() < 80) ? 0.30 : 0.20;
+    if (Xnn.size() >= 16) {
+        const size_t minValRows = std::min<size_t>(std::max<size_t>(8, Xnn.size() / 5), Xnn.size() - 8);
+        desiredValSplit = std::max(desiredValSplit, static_cast<double>(minValRows) / static_cast<double>(Xnn.size()));
+    }
+    hp.valSplit = std::clamp(desiredValSplit, 0.10, 0.40);
     hp.l2Lambda = (Xnn.size() < 80) ? 0.010 : 0.001;
     hp.categoricalInputL2Boost = config.neuralCategoricalInputL2Boost;
     hp.activation = NeuralNet::Activation::GELU;
@@ -1645,6 +1751,67 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     analysis.categoricalImportanceShare = (totalImportance > config.tuning.numericEpsilon)
         ? (categoricalImportance / totalImportance)
         : 0.0;
+
+    auto isStrictMonotonicIndexLike = [&](const std::vector<double>& values) {
+        if (values.size() < 6) return false;
+
+        size_t finiteCount = 0;
+        bool increasing = true;
+        bool decreasing = true;
+        std::vector<double> diffs;
+        diffs.reserve(values.size() - 1);
+
+        for (size_t i = 1; i < values.size(); ++i) {
+            const double prev = values[i - 1];
+            const double cur = values[i];
+            if (!std::isfinite(prev) || !std::isfinite(cur)) return false;
+            ++finiteCount;
+
+            const double d = cur - prev;
+            if (d <= 0.0) increasing = false;
+            if (d >= 0.0) decreasing = false;
+            diffs.push_back(std::abs(d));
+        }
+
+        if (finiteCount + 1 != values.size()) return false;
+        if (!increasing && !decreasing) return false;
+
+        const double meanStep = std::accumulate(diffs.begin(), diffs.end(), 0.0) / std::max<size_t>(1, diffs.size());
+        if (meanStep <= 1e-12) return false;
+
+        double stepVar = 0.0;
+        for (double d : diffs) {
+            const double dd = d - meanStep;
+            stepVar += dd * dd;
+        }
+        stepVar /= std::max<size_t>(1, diffs.size() - 1);
+        const double stepStd = std::sqrt(stepVar);
+
+        const double relStepStd = stepStd / meanStep;
+        return relStepStd <= 0.10;
+    };
+
+    bool reweightApplied = false;
+    for (size_t featurePos = 0; featurePos < featureIdx.size() && featurePos < analysis.featureImportance.size(); ++featurePos) {
+        const int colIdx = featureIdx[featurePos];
+        if (colIdx < 0 || static_cast<size_t>(colIdx) >= data.columns().size()) continue;
+        if (data.columns()[static_cast<size_t>(colIdx)].type != ColumnType::NUMERIC) continue;
+
+        const auto& vals = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(colIdx)].values);
+        if (!isStrictMonotonicIndexLike(vals)) continue;
+
+        analysis.featureImportance[featurePos] *= 0.10;
+        reweightApplied = true;
+    }
+
+    if (reweightApplied) {
+        const double adjustedSum = std::accumulate(analysis.featureImportance.begin(), analysis.featureImportance.end(), 0.0);
+        if (adjustedSum > config.tuning.numericEpsilon) {
+            for (double& imp : analysis.featureImportance) {
+                imp /= adjustedSum;
+            }
+        }
+    }
 
     return analysis;
 }

@@ -268,7 +268,14 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
         m_layers[l].setActivation((l == m_layers.size() - 1) ? hp.outputActivation : hp.activation);
     }
 
-    size_t valSize = static_cast<size_t>(X.size() * hp.valSplit);
+    size_t valSize = static_cast<size_t>(std::llround(static_cast<double>(X.size()) * hp.valSplit));
+    if (X.size() >= 16) {
+        const size_t minValRows = std::min<size_t>(8, X.size() / 2);
+        valSize = std::max(valSize, minValRows);
+    }
+    if (X.size() >= 8) {
+        valSize = std::min(valSize, X.size() - 8);
+    }
     size_t trainSize = X.size() - valSize;
     
     // Safety guard for extremely small datasets
