@@ -168,11 +168,21 @@ impute.region: mode
 ### Plot and output
 
 - `plots`: `none` | `bivariate` | `univariate` | `overall` | `all`
+- when no plot aliases/flags are provided, Seldon auto-enables a dynamic plot set for the current dataset (avoids under-plotting and suppresses low-value plot families on tiny datasets)
+- plot generation auto-selects suitable visuals by data shape (histogram, scatter with conditional fitted line, stacked bivariate profiles, heatmap, ogive, box plot, pie chart, and limited-scope Gantt for project-like timelines)
 - `plot_univariate`
 - `plot_overall`
 - `plot_bivariate_significant`
 - `plot_format`: `png` | `svg` | `pdf`
+- `plot_theme`: `auto` | `light` | `dark`
+- `plot_grid`: `true` | `false`
+- `plot_point_size`, `plot_line_width`
 - `plot_width`, `plot_height`
+- `ogive_min_points`, `ogive_min_unique`
+- `box_plot_min_points`, `box_plot_min_iqr`
+- `pie_min_categories`, `pie_max_categories`, `pie_max_dominance_ratio`
+- `scatter_fit_min_abs_corr`, `scatter_fit_min_sample_size`
+- `gantt_auto_enabled`, `gantt_min_tasks`, `gantt_max_tasks`, `gantt_duration_hours_threshold`
 - `report`, `assets_dir`
 - `generate_html`
 

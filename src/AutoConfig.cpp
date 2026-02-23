@@ -163,6 +163,7 @@ bool isValidImputationStrategy(const std::string& value) {
 }
 
 void applyPlotModes(AutoConfig& config, const std::string& value) {
+    config.plotModesExplicit = true;
     config.plotUnivariate = false;
     config.plotOverall = false;
     config.plotBivariateSignificant = false;
@@ -204,6 +205,9 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         applyPlotModes(config, value);
         return;
     }
+    if (key == "plot_univariate" || key == "plot_overall" || key == "plot_bivariate_significant") {
+        config.plotModesExplicit = true;
+    }
     if (key == "exclude") {
         config.excludedColumns = splitCSV(value);
         return;
@@ -224,6 +228,10 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
     struct PlotIntRule {
         int PlotConfig::*member;
         int minValue;
+    };
+    struct PlotDoubleRule {
+        double PlotConfig::*member;
+        double minValue;
     };
     struct TuningDoubleRule {
         double HeuristicTuningConfig::*member;
@@ -292,6 +300,10 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"plot_width", {&PlotConfig::width, 320}},
         {"plot_height", {&PlotConfig::height, 240}}
     };
+    static const std::unordered_map<std::string, PlotDoubleRule> plotDoubleFields = {
+        {"plot_point_size", {&PlotConfig::pointSize, 0.1}},
+        {"plot_line_width", {&PlotConfig::lineWidth, 0.1}}
+    };
     static const std::unordered_map<std::string, TuningDoubleRule> tuningDoubleFields = {
         {"feature_min_variance", {&HeuristicTuningConfig::featureMinVariance, 0.0}},
         {"significance_alpha", {&HeuristicTuningConfig::significanceAlpha, 0.0}},
@@ -316,16 +328,40 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"importance_heavy_concentration_threshold", {&HeuristicTuningConfig::importanceHeavyConcentrationThreshold, 0.0}},
         {"numeric_epsilon", {&HeuristicTuningConfig::numericEpsilon, 0.0}},
         {"beta_fallback_tolerance", {&HeuristicTuningConfig::betaFallbackTolerance, 0.0}},
-        {"bivariate_selection_quantile", {&HeuristicTuningConfig::bivariateSelectionQuantileOverride, -1.0}}
+        {"bivariate_selection_quantile", {&HeuristicTuningConfig::bivariateSelectionQuantileOverride, -1.0}},
+        {"box_plot_min_iqr", {&HeuristicTuningConfig::boxPlotMinIqr, 0.0}},
+        {"pie_max_dominance_ratio", {&HeuristicTuningConfig::pieMaxDominanceRatio, 0.0}},
+        {"scatter_fit_min_abs_corr", {&HeuristicTuningConfig::scatterFitMinAbsCorr, 0.0}},
+        {"gantt_duration_hours_threshold", {&HeuristicTuningConfig::ganttDurationHoursThreshold, 0.0}}
     };
     static const std::unordered_map<std::string, TuningSizeRule> tuningSizeFields = {
         {"beta_fallback_intervals_start", {&HeuristicTuningConfig::betaFallbackIntervalsStart, 256}},
         {"beta_fallback_intervals_max", {&HeuristicTuningConfig::betaFallbackIntervalsMax, 512}},
-        {"overall_corr_heatmap_max_columns", {&HeuristicTuningConfig::overallCorrHeatmapMaxColumns, 2}}
+        {"overall_corr_heatmap_max_columns", {&HeuristicTuningConfig::overallCorrHeatmapMaxColumns, 2}},
+        {"ogive_min_points", {&HeuristicTuningConfig::ogiveMinPoints, 2}},
+        {"ogive_min_unique", {&HeuristicTuningConfig::ogiveMinUnique, 2}},
+        {"box_plot_min_points", {&HeuristicTuningConfig::boxPlotMinPoints, 3}},
+        {"pie_min_categories", {&HeuristicTuningConfig::pieMinCategories, 2}},
+        {"pie_max_categories", {&HeuristicTuningConfig::pieMaxCategories, 2}},
+        {"scatter_fit_min_sample_size", {&HeuristicTuningConfig::scatterFitMinSampleSize, 3}},
+        {"gantt_min_tasks", {&HeuristicTuningConfig::ganttMinTasks, 1}},
+        {"gantt_max_tasks", {&HeuristicTuningConfig::ganttMaxTasks, 1}}
     };
 
     if (key == "plot_format") {
         config.plot.format = CommonUtils::toLower(value);
+        return;
+    }
+    if (key == "plot_theme") {
+        config.plot.theme = CommonUtils::toLower(value);
+        return;
+    }
+    if (key == "plot_grid") {
+        config.plot.showGrid = parseBoolStrict(value, key);
+        return;
+    }
+    if (key == "gantt_auto_enabled") {
+        config.tuning.ganttAutoEnabled = parseBoolStrict(value, key);
         return;
     }
 
@@ -361,6 +397,10 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         config.plot.*(it->second.member) = parseIntStrict(value, key, it->second.minValue);
         return;
     }
+    if (const auto it = plotDoubleFields.find(key); it != plotDoubleFields.end()) {
+        config.plot.*(it->second.member) = parseDoubleStrict(value, key, it->second.minValue);
+        return;
+    }
     if (const auto it = tuningDoubleFields.find(key); it != tuningDoubleFields.end()) {
         config.tuning.*(it->second.member) = parseDoubleStrict(value, key, it->second.minValue);
         return;
@@ -374,7 +414,7 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
 
 AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     if (argc < 2) {
-        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--neural-optimizer sgd|adam|lookahead] [--neural-lookahead-fast-optimizer sgd|adam] [--neural-lookahead-sync-period N] [--neural-lookahead-alpha 0..1] [--neural-use-batch-norm true|false] [--neural-batch-norm-momentum 0..1) [--neural-batch-norm-epsilon >0] [--neural-use-layer-norm true|false] [--neural-layer-norm-epsilon >0] [--neural-lr-decay 0..1] [--neural-lr-plateau-patience N] [--neural-lr-cooldown-epochs N] [--neural-max-lr-reductions N] [--neural-min-learning-rate >=0] [--neural-use-validation-loss-ema true|false] [--neural-validation-loss-ema-beta 0..1] [--neural-categorical-input-l2-boost >=0] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1]");
+        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--plot-theme auto|light|dark] [--plot-grid true|false] [--plot-point-size >0] [--plot-line-width >0] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--neural-optimizer sgd|adam|lookahead] [--neural-lookahead-fast-optimizer sgd|adam] [--neural-lookahead-sync-period N] [--neural-lookahead-alpha 0..1] [--neural-use-batch-norm true|false] [--neural-batch-norm-momentum 0..1) [--neural-batch-norm-epsilon >0] [--neural-use-layer-norm true|false] [--neural-layer-norm-epsilon >0] [--neural-lr-decay 0..1] [--neural-lr-plateau-patience N] [--neural-lr-cooldown-epochs N] [--neural-max-lr-reductions N] [--neural-min-learning-rate >=0] [--neural-use-validation-loss-ema true|false] [--neural-validation-loss-ema-beta 0..1] [--neural-categorical-input-l2-boost >=0] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1] [--ogive-min-points N] [--ogive-min-unique N] [--box-min-points N] [--box-min-iqr >=0] [--pie-min-categories N] [--pie-max-categories N] [--pie-max-dominance 0..1] [--fit-min-corr 0..1] [--fit-min-samples N] [--gantt-auto true|false] [--gantt-min-tasks N] [--gantt-max-tasks N] [--gantt-duration-hours-threshold >0]");
     }
 
     AutoConfig config;
@@ -394,11 +434,22 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
         } else if (arg == "--plots" && i + 1 < argc) {
             applyPlotModes(config, argv[++i]);
         } else if (arg == "--plot-univariate" && i + 1 < argc) {
+            config.plotModesExplicit = true;
             config.plotUnivariate = parseBoolStrict(argv[++i], "--plot-univariate");
         } else if (arg == "--plot-overall" && i + 1 < argc) {
+            config.plotModesExplicit = true;
             config.plotOverall = parseBoolStrict(argv[++i], "--plot-overall");
         } else if (arg == "--plot-bivariate" && i + 1 < argc) {
+            config.plotModesExplicit = true;
             config.plotBivariateSignificant = parseBoolStrict(argv[++i], "--plot-bivariate");
+        } else if (arg == "--plot-theme" && i + 1 < argc) {
+            config.plot.theme = CommonUtils::toLower(argv[++i]);
+        } else if (arg == "--plot-grid" && i + 1 < argc) {
+            config.plot.showGrid = parseBoolStrict(argv[++i], "--plot-grid");
+        } else if (arg == "--plot-point-size" && i + 1 < argc) {
+            config.plot.pointSize = parseDoubleStrict(argv[++i], "--plot-point-size", 0.1);
+        } else if (arg == "--plot-line-width" && i + 1 < argc) {
+            config.plot.lineWidth = parseDoubleStrict(argv[++i], "--plot-line-width", 0.1);
         } else if (arg == "--generate-html" && i + 1 < argc) {
             config.generateHtml = parseBoolStrict(argv[++i], "--generate-html");
         } else if (arg == "--verbose-analysis" && i + 1 < argc) {
@@ -476,6 +527,32 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.tuning.bivariateSelectionQuantileOverride = parseDoubleStrict(argv[++i], "--bivariate-selection-quantile", -1.0);
         } else if (arg == "--overall-corr-heatmap-max-columns" && i + 1 < argc) {
             config.tuning.overallCorrHeatmapMaxColumns = static_cast<size_t>(parseIntStrict(argv[++i], "--overall-corr-heatmap-max-columns", 2));
+        } else if (arg == "--ogive-min-points" && i + 1 < argc) {
+            config.tuning.ogiveMinPoints = static_cast<size_t>(parseIntStrict(argv[++i], "--ogive-min-points", 2));
+        } else if (arg == "--ogive-min-unique" && i + 1 < argc) {
+            config.tuning.ogiveMinUnique = static_cast<size_t>(parseIntStrict(argv[++i], "--ogive-min-unique", 2));
+        } else if (arg == "--box-min-points" && i + 1 < argc) {
+            config.tuning.boxPlotMinPoints = static_cast<size_t>(parseIntStrict(argv[++i], "--box-min-points", 3));
+        } else if (arg == "--box-min-iqr" && i + 1 < argc) {
+            config.tuning.boxPlotMinIqr = parseDoubleStrict(argv[++i], "--box-min-iqr", 0.0);
+        } else if (arg == "--pie-min-categories" && i + 1 < argc) {
+            config.tuning.pieMinCategories = static_cast<size_t>(parseIntStrict(argv[++i], "--pie-min-categories", 2));
+        } else if (arg == "--pie-max-categories" && i + 1 < argc) {
+            config.tuning.pieMaxCategories = static_cast<size_t>(parseIntStrict(argv[++i], "--pie-max-categories", 2));
+        } else if (arg == "--pie-max-dominance" && i + 1 < argc) {
+            config.tuning.pieMaxDominanceRatio = parseDoubleStrict(argv[++i], "--pie-max-dominance", 0.0);
+        } else if (arg == "--fit-min-corr" && i + 1 < argc) {
+            config.tuning.scatterFitMinAbsCorr = parseDoubleStrict(argv[++i], "--fit-min-corr", 0.0);
+        } else if (arg == "--fit-min-samples" && i + 1 < argc) {
+            config.tuning.scatterFitMinSampleSize = static_cast<size_t>(parseIntStrict(argv[++i], "--fit-min-samples", 3));
+        } else if (arg == "--gantt-auto" && i + 1 < argc) {
+            config.tuning.ganttAutoEnabled = parseBoolStrict(argv[++i], "--gantt-auto");
+        } else if (arg == "--gantt-min-tasks" && i + 1 < argc) {
+            config.tuning.ganttMinTasks = static_cast<size_t>(parseIntStrict(argv[++i], "--gantt-min-tasks", 1));
+        } else if (arg == "--gantt-max-tasks" && i + 1 < argc) {
+            config.tuning.ganttMaxTasks = static_cast<size_t>(parseIntStrict(argv[++i], "--gantt-max-tasks", 1));
+        } else if (arg == "--gantt-duration-hours-threshold" && i + 1 < argc) {
+            config.tuning.ganttDurationHoursThreshold = parseDoubleStrict(argv[++i], "--gantt-duration-hours-threshold", 0.1);
         }
     }
 
@@ -547,6 +624,12 @@ void AutoConfig::validate() const {
 
     if (!isIn(plot.format, {"png", "svg", "pdf"})) {
         throw Seldon::ConfigurationException("plot_format must be one of: png, svg, pdf");
+    }
+    if (!isIn(plot.theme, {"auto", "light", "dark"})) {
+        throw Seldon::ConfigurationException("plot_theme must be one of: auto, light, dark");
+    }
+    if (plot.pointSize <= 0.0 || plot.lineWidth <= 0.0) {
+        throw Seldon::ConfigurationException("plot_point_size and plot_line_width must be > 0");
     }
     if (!isIn(outlierMethod, {"iqr", "zscore"})) {
         throw Seldon::ConfigurationException("outlier_method must be iqr or zscore");
@@ -620,6 +703,33 @@ void AutoConfig::validate() const {
     }
     if (tuning.overallCorrHeatmapMaxColumns < 2) {
         throw Seldon::ConfigurationException("overall_corr_heatmap_max_columns must be >= 2");
+    }
+    if (tuning.ogiveMinPoints < 2 || tuning.ogiveMinUnique < 2) {
+        throw Seldon::ConfigurationException("ogive_min_points and ogive_min_unique must be >= 2");
+    }
+    if (tuning.boxPlotMinPoints < 3) {
+        throw Seldon::ConfigurationException("box_plot_min_points must be >= 3");
+    }
+    if (tuning.boxPlotMinIqr < 0.0) {
+        throw Seldon::ConfigurationException("box_plot_min_iqr must be >= 0");
+    }
+    if (tuning.pieMinCategories < 2 || tuning.pieMaxCategories < tuning.pieMinCategories) {
+        throw Seldon::ConfigurationException("pie_min_categories must be >= 2 and <= pie_max_categories");
+    }
+    if (tuning.pieMaxDominanceRatio <= 0.0 || tuning.pieMaxDominanceRatio > 1.0) {
+        throw Seldon::ConfigurationException("pie_max_dominance_ratio must be within (0,1]");
+    }
+    if (tuning.scatterFitMinAbsCorr < 0.0 || tuning.scatterFitMinAbsCorr > 1.0) {
+        throw Seldon::ConfigurationException("scatter_fit_min_abs_corr must be within [0,1]");
+    }
+    if (tuning.scatterFitMinSampleSize < 3) {
+        throw Seldon::ConfigurationException("scatter_fit_min_sample_size must be >= 3");
+    }
+    if (tuning.ganttMinTasks < 1 || tuning.ganttMaxTasks < tuning.ganttMinTasks) {
+        throw Seldon::ConfigurationException("gantt_min_tasks must be >= 1 and <= gantt_max_tasks");
+    }
+    if (tuning.ganttDurationHoursThreshold <= 0.0) {
+        throw Seldon::ConfigurationException("gantt_duration_hours_threshold must be > 0");
     }
 
     if (fastMaxBivariatePairs == 0 || fastNeuralSampleRows == 0) {

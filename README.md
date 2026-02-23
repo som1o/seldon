@@ -162,6 +162,12 @@ impute.region: mode
 - `neural_strategy`: `auto` | `none` | `fast` | `balanced` | `expressive`
 - `bivariate_strategy`: `auto` | `balanced` | `corr_heavy` | `importance_heavy`
 - `plots`: `none` | `bivariate` | `univariate` | `overall` | `all`
+- `plots` now auto-selects suitable chart families: histogram, scatter, heatmap, ogive, box plot, pie chart, and project-timeline Gantt (when timeline-like columns exist)
+- `plot_theme`: `auto` | `light` | `dark`
+- `plot_grid`: `true|false`, `plot_point_size`, `plot_line_width`
+- Suitability knobs: `ogive_min_points`, `ogive_min_unique`, `box_plot_min_points`, `box_plot_min_iqr`, `pie_min_categories`, `pie_max_categories`, `pie_max_dominance_ratio`
+- Fit-line knobs: `scatter_fit_min_abs_corr`, `scatter_fit_min_sample_size`
+- Gantt knobs: `gantt_auto_enabled`, `gantt_min_tasks`, `gantt_max_tasks`, `gantt_duration_hours_threshold`
 - `overall_corr_heatmap_max_columns`: limits correlation heatmap size
 
 ## Notes on Current Behavior

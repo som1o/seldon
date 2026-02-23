@@ -8,6 +8,10 @@ struct PlotConfig {
     std::string format = "png";
     int width = 1280;
     int height = 720;
+    std::string theme = "auto"; // auto|light|dark
+    bool showGrid = true;
+    double pointSize = 0.8;
+    double lineWidth = 2.0;
 };
 
 struct HeuristicTuningConfig {
@@ -63,6 +67,27 @@ struct HeuristicTuningConfig {
 
     // Maximum numeric columns used to build overall correlation heatmap (caps O(n^2) work).
     size_t overallCorrHeatmapMaxColumns = 50;
+
+    // Univariate suitability tuning
+    size_t ogiveMinPoints = 8;
+    size_t ogiveMinUnique = 6;
+    size_t boxPlotMinPoints = 5;
+    double boxPlotMinIqr = 1e-9;
+
+    // Categorical pie-chart suitability tuning
+    size_t pieMinCategories = 2;
+    size_t pieMaxCategories = 8;
+    double pieMaxDominanceRatio = 0.96;
+
+    // Scatter fitted-line suitability tuning
+    double scatterFitMinAbsCorr = 0.35;
+    size_t scatterFitMinSampleSize = 12;
+
+    // Project-timeline (Gantt) auto-detection tuning
+    bool ganttAutoEnabled = true;
+    size_t ganttMinTasks = 3;
+    size_t ganttMaxTasks = 25;
+    double ganttDurationHoursThreshold = 72.0;
 };
 
 struct AutoConfig {
@@ -93,6 +118,7 @@ struct AutoConfig {
     bool plotUnivariate = false;
     bool plotOverall = false;
     bool plotBivariateSignificant = true;
+    bool plotModesExplicit = false;
     bool generateHtml = false;
     bool verboseAnalysis = true;
     uint32_t neuralSeed = 1337;

@@ -20,6 +20,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <set>
@@ -36,6 +37,277 @@ std::string toFixed(double v, int prec = 4) {
     std::ostringstream os;
     os << std::fixed << std::setprecision(prec) << v;
     return os.str();
+}
+
+bool containsToken(const std::string& text, const std::vector<std::string>& tokens) {
+    const std::string lower = CommonUtils::toLower(text);
+    for (const auto& token : tokens) {
+        if (lower.find(token) != std::string::npos) return true;
+    }
+    return false;
+}
+
+size_t approximateUniqueCount(const std::vector<double>& values) {
+    std::unordered_set<long long> uniq;
+    uniq.reserve(values.size());
+    for (double v : values) {
+        if (!std::isfinite(v)) continue;
+        long long q = static_cast<long long>(std::llround(v * 1000000.0));
+        uniq.insert(q);
+    }
+    return uniq.size();
+}
+
+bool shouldAddOgive(const std::vector<double>& values, const HeuristicTuningConfig& tuning) {
+    if (values.size() < tuning.ogiveMinPoints) return false;
+    return approximateUniqueCount(values) >= tuning.ogiveMinUnique;
+}
+
+bool shouldAddBoxPlot(const std::vector<double>& values, const HeuristicTuningConfig& tuning, double eps) {
+    if (values.size() < tuning.boxPlotMinPoints) return false;
+    MathUtils::NumericSummary summary = MathUtils::summarizeNumeric(values);
+    const double threshold = std::max(tuning.boxPlotMinIqr, eps);
+    return std::isfinite(summary.iqr) && summary.iqr > threshold;
+}
+
+bool shouldAddPieChart(const std::vector<double>& counts, const HeuristicTuningConfig& tuning) {
+    if (counts.size() < tuning.pieMinCategories || counts.size() > tuning.pieMaxCategories) return false;
+    double total = 0.0;
+    double top = 0.0;
+    for (double c : counts) {
+        if (c > 0.0) {
+            total += c;
+            top = std::max(top, c);
+        }
+    }
+    if (total <= 0.0) return false;
+    return (top / total) <= tuning.pieMaxDominanceRatio;
+}
+
+bool shouldOverlayFittedLine(double r,
+                             bool statSignificant,
+                             const std::vector<double>& x,
+                             const std::vector<double>& y,
+                             double slope,
+                             double intercept,
+                             const HeuristicTuningConfig& tuning) {
+    if (!statSignificant) return false;
+    if (!std::isfinite(r) || !std::isfinite(slope) || !std::isfinite(intercept)) return false;
+
+    const size_t size = std::min(x.size(), y.size());
+    std::vector<double> xValid;
+    std::vector<double> yValid;
+    xValid.reserve(size);
+    yValid.reserve(size);
+    for (size_t i = 0; i < size; ++i) {
+        const double xv = x[i];
+        const double yv = y[i];
+        if (!std::isfinite(xv) || !std::isfinite(yv)) continue;
+        xValid.push_back(xv);
+        yValid.push_back(yv);
+    }
+
+    const size_t sampleSize = xValid.size();
+    if (sampleSize < tuning.scatterFitMinSampleSize) return false;
+    if (std::abs(r) < tuning.scatterFitMinAbsCorr) return false;
+
+    const size_t minUniqueX = std::max<size_t>(6, sampleSize / 10);
+    if (approximateUniqueCount(xValid) < minUniqueX) return false;
+
+    const MathUtils::NumericSummary ySummary = MathUtils::summarizeNumeric(yValid);
+    if (!std::isfinite(ySummary.stddev) || ySummary.stddev <= tuning.numericEpsilon) return false;
+
+    const double explained = r * r;
+    const double minExplained = (sampleSize < 40) ? 0.18 : 0.12;
+    if (explained < minExplained) return false;
+
+    return true;
+}
+
+struct BivariateStackedBarData {
+    std::vector<std::string> categories;
+    std::vector<double> lowCounts;
+    std::vector<double> highCounts;
+    bool valid = false;
+};
+
+BivariateStackedBarData buildBivariateStackedBar(const std::vector<double>& x,
+                                                 const std::vector<double>& y) {
+    BivariateStackedBarData out;
+
+    const size_t n = std::min(x.size(), y.size());
+    if (n < 24) return out;
+
+    std::vector<std::pair<double, double>> rows;
+    rows.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(x[i]) || !std::isfinite(y[i])) continue;
+        rows.push_back({x[i], y[i]});
+    }
+    if (rows.size() < 24) return out;
+
+    std::vector<double> xSorted;
+    std::vector<double> ySorted;
+    xSorted.reserve(rows.size());
+    ySorted.reserve(rows.size());
+    for (const auto& row : rows) {
+        xSorted.push_back(row.first);
+        ySorted.push_back(row.second);
+    }
+    std::sort(xSorted.begin(), xSorted.end());
+    std::sort(ySorted.begin(), ySorted.end());
+
+    const size_t binCount = std::clamp<size_t>((rows.size() >= 200) ? 5 : (rows.size() >= 80 ? 4 : 3), 3, 5);
+    std::vector<double> edges;
+    edges.reserve(binCount - 1);
+    for (size_t q = 1; q < binCount; ++q) {
+        size_t pos = static_cast<size_t>(std::floor((static_cast<double>(q) * static_cast<double>(xSorted.size() - 1)) / static_cast<double>(binCount)));
+        edges.push_back(xSorted[pos]);
+    }
+
+    const double yMedian = ySorted[ySorted.size() / 2];
+    out.categories.reserve(binCount);
+    for (size_t i = 0; i < binCount; ++i) {
+        out.categories.push_back("Q" + std::to_string(i + 1));
+    }
+    out.lowCounts.assign(binCount, 0.0);
+    out.highCounts.assign(binCount, 0.0);
+
+    for (const auto& row : rows) {
+        const double xv = row.first;
+        const double yv = row.second;
+        size_t bin = static_cast<size_t>(std::distance(edges.begin(), std::upper_bound(edges.begin(), edges.end(), xv)));
+        if (bin >= binCount) bin = binCount - 1;
+        if (yv <= yMedian) {
+            out.lowCounts[bin] += 1.0;
+        } else {
+            out.highCounts[bin] += 1.0;
+        }
+    }
+
+    size_t nonEmptyBins = 0;
+    double lowTotal = 0.0;
+    double highTotal = 0.0;
+    for (size_t i = 0; i < binCount; ++i) {
+        const double total = out.lowCounts[i] + out.highCounts[i];
+        if (total > 0.0) ++nonEmptyBins;
+        lowTotal += out.lowCounts[i];
+        highTotal += out.highCounts[i];
+    }
+
+    if (nonEmptyBins < 2 || lowTotal <= 0.0 || highTotal <= 0.0) return out;
+
+    const double dominance = std::max(lowTotal, highTotal) / std::max(1.0, lowTotal + highTotal);
+    if (dominance > 0.97) return out;
+
+    out.valid = true;
+    return out;
+}
+
+struct ProjectTimeline {
+    std::vector<std::string> taskNames;
+    std::vector<int64_t> start;
+    std::vector<int64_t> end;
+};
+
+std::optional<size_t> findDatetimeBySemanticName(const TypedDataset& data, const std::vector<std::string>& hints) {
+    for (size_t idx : data.datetimeColumnIndices()) {
+        if (containsToken(data.columns()[idx].name, hints)) return idx;
+    }
+    return std::nullopt;
+}
+
+std::optional<size_t> findNumericBySemanticName(const TypedDataset& data, const std::vector<std::string>& hints) {
+    for (size_t idx : data.numericColumnIndices()) {
+        if (containsToken(data.columns()[idx].name, hints)) return idx;
+    }
+    return std::nullopt;
+}
+
+std::optional<size_t> findTaskLabelColumn(const TypedDataset& data) {
+    const auto categorical = data.categoricalColumnIndices();
+    for (size_t idx : categorical) {
+        if (containsToken(data.columns()[idx].name, {"task", "activity", "milestone", "story", "work", "phase", "item"})) {
+            return idx;
+        }
+    }
+    if (!categorical.empty()) return categorical.front();
+    return std::nullopt;
+}
+
+std::optional<ProjectTimeline> detectProjectTimeline(const TypedDataset& data, const HeuristicTuningConfig& tuning) {
+    if (!tuning.ganttAutoEnabled) return std::nullopt;
+
+    const auto taskIdx = findTaskLabelColumn(data);
+    const auto startIdx = findDatetimeBySemanticName(data, {"start", "begin", "kickoff", "open"});
+    const auto endIdx = findDatetimeBySemanticName(data, {"end", "finish", "due", "complete", "deadline", "close"});
+    const auto durationIdx = findNumericBySemanticName(data, {"duration", "days", "day", "hours", "hour", "effort"});
+
+    if (!taskIdx || !startIdx) return std::nullopt;
+
+    ProjectTimeline out;
+    const auto& taskNames = std::get<std::vector<std::string>>(data.columns()[*taskIdx].values);
+    const auto& starts = std::get<std::vector<int64_t>>(data.columns()[*startIdx].values);
+
+    const std::vector<int64_t>* ends = nullptr;
+    if (endIdx) {
+        ends = &std::get<std::vector<int64_t>>(data.columns()[*endIdx].values);
+    }
+
+    const std::vector<double>* durations = nullptr;
+    if (!ends && durationIdx) {
+        durations = &std::get<std::vector<double>>(data.columns()[*durationIdx].values);
+    }
+
+    const size_t n = std::min(taskNames.size(), starts.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (data.columns()[*taskIdx].missing[i] || data.columns()[*startIdx].missing[i]) continue;
+        int64_t start = starts[i];
+        int64_t end = start;
+        bool valid = false;
+
+        if (ends && i < ends->size() && !data.columns()[*endIdx].missing[i]) {
+            end = (*ends)[i];
+            valid = end > start;
+        } else if (durations && i < durations->size() && !data.columns()[*durationIdx].missing[i]) {
+            double dur = (*durations)[i];
+            if (std::isfinite(dur) && dur > 0.0) {
+                const bool looksLikeHours = dur <= tuning.ganttDurationHoursThreshold;
+                const int64_t delta = static_cast<int64_t>(std::llround(dur * (looksLikeHours ? 3600.0 : 86400.0)));
+                end = start + std::max<int64_t>(delta, 3600);
+                valid = end > start;
+            }
+        }
+
+        if (!valid) continue;
+        const std::string label = CommonUtils::trim(taskNames[i]);
+        out.taskNames.push_back(label.empty() ? ("Task " + std::to_string(i + 1)) : label);
+        out.start.push_back(start);
+        out.end.push_back(end);
+    }
+
+    if (out.taskNames.size() < tuning.ganttMinTasks) return std::nullopt;
+
+    std::vector<size_t> order(out.taskNames.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+        if (out.start[lhs] == out.start[rhs]) return out.taskNames[lhs] < out.taskNames[rhs];
+        return out.start[lhs] < out.start[rhs];
+    });
+
+    ProjectTimeline sorted;
+    const size_t keep = std::min<size_t>(tuning.ganttMaxTasks, order.size());
+    sorted.taskNames.reserve(keep);
+    sorted.start.reserve(keep);
+    sorted.end.reserve(keep);
+    for (size_t i = 0; i < keep; ++i) {
+        const size_t idx = order[i];
+        sorted.taskNames.push_back(out.taskNames[idx]);
+        sorted.start.push_back(out.start[idx]);
+        sorted.end.push_back(out.end[idx]);
+    }
+
+    return sorted;
 }
 
 std::string activationToString(NeuralNet::Activation activation) {
@@ -427,7 +699,9 @@ struct PairInsight {
     bool statSignificant = false;
     double neuralScore = 0.0;
     bool selected = false;
+    bool fitLineAdded = false;
     std::string plotPath;
+    std::string stackedPlotPath;
 };
 
 struct NeuralAnalysis {
@@ -794,6 +1068,29 @@ TargetContext resolveTargetContext(const TypedDataset& data, const AutoConfig& c
     return context;
 }
 
+void applyDynamicPlotDefaultsIfUnset(AutoConfig& runCfg, const TypedDataset& data) {
+    if (runCfg.plotModesExplicit) return;
+
+    const size_t rows = data.rowCount();
+    const size_t numericCols = data.numericColumnIndices().size();
+    const size_t categoricalCols = data.categoricalColumnIndices().size();
+
+    runCfg.plotUnivariate = rows > 0 && (numericCols + categoricalCols) > 0;
+    runCfg.plotBivariateSignificant = (rows >= std::max<size_t>(8, runCfg.tuning.scatterFitMinSampleSize)) && numericCols >= 2;
+    runCfg.plotOverall = rows > 0 && (numericCols >= 2 || categoricalCols >= 2 || runCfg.plotBivariateSignificant);
+
+    if (!runCfg.plotUnivariate && !runCfg.plotBivariateSignificant && !runCfg.plotOverall) {
+        runCfg.plotUnivariate = true;
+    }
+
+    if (runCfg.verboseAnalysis) {
+        std::cout << "[Seldon][Plots] Auto mode (no plot aliases): univariate="
+                  << (runCfg.plotUnivariate ? "on" : "off")
+                  << ", bivariate=" << (runCfg.plotBivariateSignificant ? "on" : "off")
+                  << ", overall=" << (runCfg.plotOverall ? "on" : "off") << "\n";
+    }
+}
+
 bool configurePlotAvailability(AutoConfig& runCfg, ReportEngine& univariate, const GnuplotEngine& plotterBivariate) {
     const bool canPlot = plotterBivariate.isAvailable();
     univariate.addParagraph(canPlot ? "Gnuplot detected." : "Gnuplot not available: plot generation skipped.");
@@ -832,6 +1129,22 @@ void addUnivariatePlots(ReportEngine& univariate,
             univariate.addImage("Histogram: " + data.columns()[idx].name, img);
             logGeneratedPlot(img);
         }
+
+        if (shouldAddOgive(vals, runCfg.tuning)) {
+            std::string ogive = plotterUnivariate.ogive("uni_ogive_" + std::to_string(idx), vals, "Ogive: " + data.columns()[idx].name);
+            if (!ogive.empty()) {
+                univariate.addImage("Ogive: " + data.columns()[idx].name, ogive);
+                logGeneratedPlot(ogive);
+            }
+        }
+
+        if (shouldAddBoxPlot(vals, runCfg.tuning, runCfg.tuning.numericEpsilon)) {
+            std::string box = plotterUnivariate.box("uni_box_" + std::to_string(idx), vals, "Box Plot: " + data.columns()[idx].name);
+            if (!box.empty()) {
+                univariate.addImage("Box Plot: " + data.columns()[idx].name, box);
+                logGeneratedPlot(box);
+            }
+        }
     }
 
     for (size_t idx : data.categoricalColumnIndices()) {
@@ -851,6 +1164,14 @@ void addUnivariatePlots(ReportEngine& univariate,
         if (!img.empty()) {
             univariate.addImage("Category Plot: " + data.columns()[idx].name, img);
             logGeneratedPlot(img);
+        }
+
+        if (shouldAddPieChart(counts, runCfg.tuning)) {
+            std::string pie = plotterUnivariate.pie("uni_pie_" + std::to_string(idx), labels, counts, "Category Share: " + data.columns()[idx].name);
+            if (!pie.empty()) {
+                univariate.addImage("Pie Chart: " + data.columns()[idx].name, pie);
+                logGeneratedPlot(pie);
+            }
         }
     }
 }
@@ -1376,6 +1697,7 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                                                bool verbose,
                                                const NumericStatsCache& statsCache,
                                                double numericEpsilon,
+                                               const HeuristicTuningConfig& tuning,
                                                size_t maxPairs) {
     std::vector<PairInsight> pairs;
     const auto numericIdx = data.numericColumnIndices();
@@ -1525,7 +1847,32 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             const auto& va = std::get<std::vector<double>>(data.columns()[p.idxA].values);
             const auto& vb = std::get<std::vector<double>>(data.columns()[p.idxB].values);
             std::string id = "sig_" + p.featureA + "_" + p.featureB;
-            p.plotPath = plotter->scatter(id, va, vb, p.featureA + " vs " + p.featureB);
+            const bool addFit = shouldOverlayFittedLine(p.r,
+                                                        p.statSignificant,
+                                                        va,
+                                                        vb,
+                                                        p.slope,
+                                                        p.intercept,
+                                                        tuning);
+            p.fitLineAdded = addFit;
+            p.plotPath = plotter->scatter(id,
+                                          va,
+                                          vb,
+                                          p.featureA + " vs " + p.featureB,
+                                          addFit,
+                                          p.slope,
+                                          p.intercept,
+                                          "Fitted line");
+
+            const BivariateStackedBarData stacked = buildBivariateStackedBar(va, vb);
+            if (stacked.valid) {
+                p.stackedPlotPath = plotter->stackedBar("sigstack_" + p.featureA + "_" + p.featureB,
+                                                        stacked.categories,
+                                                        {p.featureB + " <= median", p.featureB + " > median"},
+                                                        {stacked.lowCounts, stacked.highCounts},
+                                                        "Stacked Profile: " + p.featureA + " x " + p.featureB,
+                                                        "Count");
+            }
         }
         if (verbose) {
             std::cout << "[Seldon][Bivariate] Decision " << p.featureA << " vs " << p.featureB
@@ -1570,6 +1917,18 @@ void addOverallSections(ReportEngine& report,
         }
         std::string missingImg = overallPlotter->bar("overall_missingness", labels, missingCounts, "Overall Missingness by Column");
         if (!missingImg.empty()) report.addImage("Overall Missingness", missingImg);
+
+        if (auto timeline = detectProjectTimeline(data, config.tuning); timeline.has_value()) {
+            std::string gantt = overallPlotter->gantt("overall_project_timeline",
+                                                      timeline->taskNames,
+                                                      timeline->start,
+                                                      timeline->end,
+                                                      "Project Timeline (Auto-Detected)");
+            if (!gantt.empty()) {
+                report.addImage("Project Timeline (Gantt)", gantt);
+                report.addParagraph("Gantt chart generated automatically from project-like columns (task + start/end or start/duration). Timeline preview limit uses gantt_max_tasks tuning.");
+            }
+        }
 
         auto numericIdx = data.numericColumnIndices();
         if (numericIdx.size() >= 2) {
@@ -1648,6 +2007,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     validateExcludedColumns(data, config);
     const TargetContext targetContext = resolveTargetContext(data, config, runCfg);
     const int targetIdx = targetContext.targetIdx;
+    applyDynamicPlotDefaultsIfUnset(runCfg, data);
 
     const bool autoFastMode = (data.rowCount() > 100000) || (data.numericColumnIndices().size() > 50);
     const bool fastModeEnabled = runCfg.fastMode || autoFastMode;
@@ -1735,6 +2095,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                                 runCfg.verboseAnalysis,
                                                 statsCache,
                                                 runCfg.tuning.numericEpsilon,
+                                                runCfg.tuning,
                                                 fastModeEnabled ? runCfg.fastMaxBivariatePairs : 0);
 
     ReportEngine bivariate;
@@ -1763,6 +2124,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
             p.statSignificant ? "yes" : "no",
             toFixed(p.neuralScore, 6),
             p.selected ? "yes" : "no",
+            p.fitLineAdded ? "yes" : "no",
+            p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
             p.plotPath.empty() ? "-" : p.plotPath
         });
 
@@ -1777,10 +2140,15 @@ int AutomationPipeline::run(const AutoConfig& config) {
                 toFixed(p.tStat, 6),
                 toFixed(p.pValue, 6),
                 toFixed(p.neuralScore, 6),
+                p.fitLineAdded ? "yes" : "no",
+                p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
                 p.plotPath.empty() ? "-" : p.plotPath
             });
             if (!p.plotPath.empty()) {
                 bivariate.addImage("Significant Pair: " + p.featureA + " vs " + p.featureB, p.plotPath);
+            }
+            if (!p.stackedPlotPath.empty()) {
+                bivariate.addImage("Stacked Profile: " + p.featureA + " vs " + p.featureB, p.stackedPlotPath);
             }
         }
     }
@@ -1788,8 +2156,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
     bivariate.addParagraph("Total pairs evaluated: " + std::to_string(allRows.size()));
     bivariate.addParagraph("Statistically significant pairs (p<" + toFixed(MathUtils::getSignificanceAlpha(), 4) + "): " + std::to_string(statSigCount));
     bivariate.addParagraph("Final neural-selected significant pairs: " + std::to_string(sigRows.size()));
-    bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "plot"}, allRows);
-    bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "plot"}, sigRows);
+    bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "fit_line", "stacked_plot", "scatter_plot"}, allRows);
+    bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "fit_line", "stacked_plot", "scatter_plot"}, sigRows);
 
     const DataHealthSummary dataHealth = computeDataHealthSummary(data,
                                                                   prep,
@@ -1875,7 +2243,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     finalAnalysis.addTitle("Final Analysis - Significant Findings Only");
     finalAnalysis.addParagraph("This report contains only neural-net-approved significant findings (dynamic decision engine). Non-selected findings are excluded by design.");
     finalAnalysis.addParagraph("Data Health Score: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + "). This score estimates discovered signal strength using completeness, retained feature coverage, significant-pair yield, selected-pair yield, and neural training stability.");
-    finalAnalysis.addTable("Neural-Selected Significant Bivariate Findings", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "plot"}, sigRows);
+    finalAnalysis.addTable("Neural-Selected Significant Bivariate Findings", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "fit_line", "stacked_plot", "scatter_plot"}, sigRows);
 
     finalAnalysis.addTable("Data Health Signal Card", {"Component", "Value"}, {
         {"Score (0-100)", toFixed(dataHealth.score, 1)},
