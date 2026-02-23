@@ -142,6 +142,27 @@ std::vector<bool> detectOutliersIQR(const NumVec& values, double iqrMultiplier) 
     return flags;
 }
 
+std::vector<bool> detectOutliersIQRObserved(const NumVec& values, const MissingMask& missing, double iqrMultiplier) {
+    std::vector<bool> flags(values.size(), false);
+    NumVec observed;
+    observed.reserve(values.size());
+    std::vector<size_t> observedIdx;
+    observedIdx.reserve(values.size());
+    for (size_t i = 0; i < values.size() && i < missing.size(); ++i) {
+        if (missing[i]) continue;
+        if (!std::isfinite(values[i])) continue;
+        observed.push_back(values[i]);
+        observedIdx.push_back(i);
+    }
+    if (observed.size() < 4) return flags;
+
+    std::vector<bool> obsFlags = detectOutliersIQR(observed, iqrMultiplier);
+    for (size_t i = 0; i < obsFlags.size() && i < observedIdx.size(); ++i) {
+        flags[observedIdx[i]] = obsFlags[i];
+    }
+    return flags;
+}
+
 std::vector<bool> detectOutliersZ(const NumVec& values, double zThreshold) {
     std::vector<bool> flags(values.size(), false);
     if (values.size() < 3) return flags;
@@ -163,6 +184,27 @@ std::vector<bool> detectOutliersZ(const NumVec& values, double zThreshold) {
     return flags;
 }
 
+std::vector<bool> detectOutliersZObserved(const NumVec& values, const MissingMask& missing, double zThreshold) {
+    std::vector<bool> flags(values.size(), false);
+    NumVec observed;
+    observed.reserve(values.size());
+    std::vector<size_t> observedIdx;
+    observedIdx.reserve(values.size());
+    for (size_t i = 0; i < values.size() && i < missing.size(); ++i) {
+        if (missing[i]) continue;
+        if (!std::isfinite(values[i])) continue;
+        observed.push_back(values[i]);
+        observedIdx.push_back(i);
+    }
+    if (observed.size() < 3) return flags;
+
+    std::vector<bool> obsFlags = detectOutliersZ(observed, zThreshold);
+    for (size_t i = 0; i < obsFlags.size() && i < observedIdx.size(); ++i) {
+        flags[observedIdx[i]] = obsFlags[i];
+    }
+    return flags;
+}
+
 void capOutliers(NumVec& values, const std::vector<bool>& flags) {
     NumVec inliers;
     for (size_t i = 0; i < values.size(); ++i) if (!flags[i]) inliers.push_back(values[i]);
@@ -180,6 +222,21 @@ void capOutliers(NumVec& values, const std::vector<bool>& flags) {
 PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config) {
     PreprocessReport report;
     report.originalRowCount = data.rowCount();
+
+    // Outlier flags are computed from observed raw numeric values before imputation.
+    std::unordered_map<std::string, std::vector<bool>> detectedFlags;
+    for (const auto& col : data.columns()) {
+        if (col.type != ColumnType::NUMERIC) continue;
+        const auto& values = std::get<NumVec>(col.values);
+
+        std::vector<bool> flags = (CommonUtils::toLower(config.outlierMethod) == "zscore")
+            ? detectOutliersZObserved(values, col.missing, config.tuning.outlierZThreshold)
+            : detectOutliersIQRObserved(values, col.missing, config.tuning.outlierIqrMultiplier);
+
+        detectedFlags[col.name] = flags;
+        report.outlierFlags[col.name] = flags;
+        report.outlierCounts[col.name] = std::count(flags.begin(), flags.end(), true);
+    }
 
     // missing counts + imputation
     for (auto& col : data.columns()) {
@@ -204,25 +261,8 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
         }
     }
 
-    // Outlier flow is intentionally two-phase: detect first for all numeric columns,
-    // then apply exactly one action chosen by outlierAction (remove OR cap OR flag-only).
-    // This keeps behavior deterministic and avoids action-order ambiguity.
+    // Outlier flow remains two-phase: detect first, then apply one action.
     MissingMask keep(data.rowCount(), static_cast<uint8_t>(1));
-    std::unordered_map<std::string, std::vector<bool>> detectedFlags;
-    for (const auto& col : data.columns()) {
-        if (col.type != ColumnType::NUMERIC) continue;
-        const auto& values = std::get<NumVec>(col.values);
-
-        std::vector<bool> flags = (CommonUtils::toLower(config.outlierMethod) == "zscore")
-            ? detectOutliersZ(values, config.tuning.outlierZThreshold)
-            : detectOutliersIQR(values, config.tuning.outlierIqrMultiplier);
-
-        detectedFlags[col.name] = flags;
-        report.outlierFlags[col.name] = flags;
-        size_t c = std::count(flags.begin(), flags.end(), true);
-        report.outlierCounts[col.name] = c;
-    }
-
     std::string action = CommonUtils::toLower(config.outlierAction);
     if (action == "remove") {
         for (const auto& col : data.columns()) {

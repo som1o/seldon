@@ -1,5 +1,6 @@
 #pragma once
 #include "Statistics.h"
+#include <cassert>
 #include <vector>
 #include <string>
 #include <optional>
@@ -104,6 +105,24 @@ public:
 
         Matrix(size_t r, size_t c) : rows(r), cols(c), data(r, std::vector<double>(c, 0.0)) {}
 
+        double& at(size_t r, size_t c) {
+            assert(r < rows && c < cols);
+            return data[r][c];
+        }
+
+        const double& at(size_t r, size_t c) const {
+            assert(r < rows && c < cols);
+            return data[r][c];
+        }
+
+        void setInversionTolerance(double tolerance) {
+            inversionTolerance = tolerance;
+        }
+
+        double getInversionTolerance() const {
+            return inversionTolerance;
+        }
+
         /**
          * @brief Builds identity matrix I(n).
          * @pre n >= 0.
@@ -135,6 +154,9 @@ public:
          * @pre Q and R are output matrices and will be overwritten.
          */
         void qrDecomposition(Matrix& Q, Matrix& R) const;
+
+    private:
+        double inversionTolerance = -1.0;
     };
 
     /**

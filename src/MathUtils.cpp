@@ -6,16 +6,24 @@
 #include <iostream>
 #include <numeric>
 #include <algorithm>
+#include <limits>
 #ifdef USE_OPENMP
 #include <omp.h>
 #endif
 
 namespace {
-double gSignificanceAlpha = 0.05;
-double gNumericEpsilon = 1e-12;
-size_t gBetaFallbackIntervalsStart = 4096;
-size_t gBetaFallbackIntervalsMax = 65536;
-double gBetaFallbackTolerance = 1e-8;
+struct RuntimeConfig {
+    double significanceAlpha = 0.05;
+    double numericEpsilon = 1e-12;
+    size_t betaFallbackIntervalsStart = 4096;
+    size_t betaFallbackIntervalsMax = 65536;
+    double betaFallbackTolerance = 1e-8;
+};
+
+RuntimeConfig& runtimeConfig() {
+    thread_local RuntimeConfig cfg;
+    return cfg;
+}
 
 double clamp01(double v) {
     if (v < 0.0) return 0.0;
@@ -42,15 +50,16 @@ double midpointIntegrateBetaRegularized(double a, double b, double x, size_t int
 }
 
 double midpointIntegrateBetaAdaptive(double a, double b, double x) {
-    size_t startIntervals = std::max<size_t>(256, gBetaFallbackIntervalsStart);
-    size_t maxIntervals = std::max(startIntervals, gBetaFallbackIntervalsMax);
+    const RuntimeConfig& cfg = runtimeConfig();
+    size_t startIntervals = std::max<size_t>(256, cfg.betaFallbackIntervalsStart);
+    size_t maxIntervals = std::max(startIntervals, cfg.betaFallbackIntervalsMax);
 
     double prev = midpointIntegrateBetaRegularized(a, b, x, startIntervals);
     for (size_t intervals = startIntervals * 2; intervals <= maxIntervals; intervals *= 2) {
         double cur = midpointIntegrateBetaRegularized(a, b, x, intervals);
         // Midpoint has O(h^2) error; this scaled delta approximates residual truncation error.
         const double richardsonErr = std::abs(cur - prev) / 3.0;
-        if (richardsonErr < gBetaFallbackTolerance) return cur;
+        if (richardsonErr < cfg.betaFallbackTolerance) return cur;
         prev = cur;
     }
     return prev;
@@ -110,7 +119,7 @@ bool solveUpperTriangular(const MathUtils::Matrix& R,
             rhs -= R.data[i][j] * x[j];
         }
         const double diag = R.data[i][i];
-        if (std::abs(diag) <= gNumericEpsilon) return false;
+        if (std::abs(diag) <= runtimeConfig().numericEpsilon) return false;
         x[i] = rhs / diag;
     }
     return true;
@@ -128,7 +137,7 @@ bool solveLowerFromUpperTranspose(const MathUtils::Matrix& R,
             rhs -= R.data[j][i] * x[j];
         }
         const double diag = R.data[i][i];
-        if (std::abs(diag) <= gNumericEpsilon) return false;
+        if (std::abs(diag) <= runtimeConfig().numericEpsilon) return false;
         x[i] = rhs / diag;
     }
     return true;
@@ -208,22 +217,23 @@ double MathUtils::getCriticalT(double alpha, size_t df) {
 
 void MathUtils::setSignificanceAlpha(double alpha) {
     if (alpha > 0.0 && alpha < 1.0) {
-        gSignificanceAlpha = alpha;
+        runtimeConfig().significanceAlpha = alpha;
     }
 }
 
 double MathUtils::getSignificanceAlpha() {
-    return gSignificanceAlpha;
+    return runtimeConfig().significanceAlpha;
 }
 
 void MathUtils::setNumericTuning(double numericEpsilon,
                                  size_t betaIntervalsStart,
                                  size_t betaIntervalsMax,
                                  double betaTolerance) {
-    if (numericEpsilon > 0.0) gNumericEpsilon = numericEpsilon;
-    if (betaIntervalsStart >= 256) gBetaFallbackIntervalsStart = betaIntervalsStart;
-    if (betaIntervalsMax >= gBetaFallbackIntervalsStart) gBetaFallbackIntervalsMax = betaIntervalsMax;
-    if (betaTolerance > 0.0) gBetaFallbackTolerance = betaTolerance;
+    RuntimeConfig& cfg = runtimeConfig();
+    if (numericEpsilon > 0.0) cfg.numericEpsilon = numericEpsilon;
+    if (betaIntervalsStart >= 256) cfg.betaFallbackIntervalsStart = betaIntervalsStart;
+    if (betaIntervalsMax >= cfg.betaFallbackIntervalsStart) cfg.betaFallbackIntervalsMax = betaIntervalsMax;
+    if (betaTolerance > 0.0) cfg.betaFallbackTolerance = betaTolerance;
 }
 
 Significance MathUtils::calculateSignificance(double r, size_t n) {
@@ -232,7 +242,7 @@ Significance MathUtils::calculateSignificance(double r, size_t n) {
     
     // Avoid division by zero if r is perfectly 1 or -1
     if (std::abs(r) >= 0.9999999) {
-        sig.p_value = gNumericEpsilon;
+        sig.p_value = runtimeConfig().numericEpsilon;
         sig.t_stat = (r > 0 ? 1e6 : -1e6);
         sig.is_significant = true;
         return sig;
@@ -241,7 +251,7 @@ Significance MathUtils::calculateSignificance(double r, size_t n) {
     size_t df = n - 2;
     sig.t_stat = r * std::sqrt(static_cast<double>(df) / (1.0 - r * r));
     sig.p_value = getPValueFromT(sig.t_stat, df);
-    sig.is_significant = (sig.p_value < gSignificanceAlpha);
+    sig.is_significant = (sig.p_value < runtimeConfig().significanceAlpha);
 
     return sig;
 }
@@ -277,7 +287,7 @@ std::pair<double, double> MathUtils::simpleLinearRegression(const std::vector<do
 
 MathUtils::Matrix MathUtils::Matrix::identity(size_t n) {
     Matrix res(n, n);
-    for (size_t i = 0; i < n; ++i) res.data[i][i] = 1.0;
+    for (size_t i = 0; i < n; ++i) res.at(i, i) = 1.0;
     return res;
 }
 
@@ -285,7 +295,7 @@ MathUtils::Matrix MathUtils::Matrix::transpose() const {
     Matrix result(cols, rows);
     for (size_t r = 0; r < rows; ++r) {
         for (size_t c = 0; c < cols; ++c) {
-            result.data[c][r] = data[r][c];
+            result.at(c, r) = at(r, c);
         }
     }
     return result;
@@ -300,10 +310,10 @@ MathUtils::Matrix MathUtils::Matrix::multiply(const Matrix& other) const {
     #pragma omp parallel for schedule(static)
     #endif
     for (size_t r = 0; r < rows; ++r) {
-        const auto& leftRow = data[r];
+        const auto& leftRow = data.at(r);
         auto& outRow = result.data[r];
         for (size_t c = 0; c < other.cols; ++c) {
-            const auto& rightRow = otherT.data[c];
+            const auto& rightRow = otherT.data.at(c);
             double sum = 0.0;
             #ifdef USE_OPENMP
             #pragma omp simd reduction(+:sum)
@@ -328,11 +338,15 @@ std::optional<MathUtils::Matrix> MathUtils::Matrix::inverse() const {
     double scale = 0.0;
     for (size_t i = 0; i < n; ++i) {
         for (size_t j = 0; j < n; ++j) {
-            scale = std::max(scale, std::abs(work.data[i][j]));
+            scale = std::max(scale, std::abs(work.at(i, j)));
         }
     }
-    if (scale <= gNumericEpsilon) return std::nullopt;
-    const double pivotTolerance = std::max(gNumericEpsilon, gNumericEpsilon * scale * static_cast<double>(n));
+    const double eps = runtimeConfig().numericEpsilon;
+    if (scale <= eps) return std::nullopt;
+    const double heuristicTol = std::max(eps, std::numeric_limits<double>::epsilon() * scale * static_cast<double>(n));
+    const double pivotTolerance = (getInversionTolerance() > 0.0)
+        ? std::max(getInversionTolerance(), heuristicTol)
+        : heuristicTol;
 
     for (size_t i = 0; i < n; ++i) {
         size_t pivotRow = i;
@@ -362,24 +376,24 @@ std::optional<MathUtils::Matrix> MathUtils::Matrix::inverse() const {
             std::swap(colPerm[i], colPerm[pivotCol]);
         }
 
-        const double pivot = work.data[i][i];
+        const double pivot = work.at(i, i);
         for (size_t j = 0; j < n; ++j) {
-            work.data[i][j] /= pivot;
-            inv.data[i][j] /= pivot;
+            work.at(i, j) /= pivot;
+            inv.at(i, j) /= pivot;
         }
 
         for (size_t r = 0; r < n; ++r) {
             if (r == i) continue;
-            const double factor = work.data[r][i];
+            const double factor = work.at(r, i);
             if (std::abs(factor) <= pivotTolerance) {
-                work.data[r][i] = 0.0;
+                work.at(r, i) = 0.0;
                 continue;
             }
             for (size_t c = 0; c < n; ++c) {
-                work.data[r][c] -= factor * work.data[i][c];
-                inv.data[r][c] -= factor * inv.data[i][c];
+                work.at(r, c) -= factor * work.at(i, c);
+                inv.at(r, c) -= factor * inv.at(i, c);
             }
-            work.data[r][i] = 0.0;
+            work.at(r, i) = 0.0;
         }
     }
 
@@ -497,7 +511,9 @@ std::vector<double> MathUtils::multipleLinearRegression(const Matrix& X, const M
         if (val < min_diag) min_diag = val;
     }
 
-    if (min_diag < 1e-12 || (max_diag / min_diag) > 1e10) {
+    const double rankTol = std::max(runtimeConfig().numericEpsilon,
+                                    std::numeric_limits<double>::epsilon() * std::max(1.0, max_diag) * static_cast<double>(X.cols));
+    if (min_diag <= rankTol) {
         return std::vector<double>(); // Singular or ill-conditioned matrix
     }
 
@@ -581,7 +597,9 @@ MLRDiagnostics MathUtils::performMLRWithDiagnostics(const Matrix& X, const Matri
         if (v > max_diag) max_diag = v;
         if (v < min_diag) min_diag = v;
     }
-    if (min_diag <= gNumericEpsilon || (max_diag / min_diag) > 1e10) return diag;
+    const double rankTol = std::max(runtimeConfig().numericEpsilon,
+                                    std::numeric_limits<double>::epsilon() * std::max(1.0, max_diag) * static_cast<double>(p));
+    if (min_diag <= rankTol) return diag;
 
     const double s2 = rss / static_cast<double>(dfResidual);
     diag.stdErrors.resize(p);

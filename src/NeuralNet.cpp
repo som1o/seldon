@@ -207,12 +207,6 @@ void NeuralNet::backpropagate(const std::vector<double>& targetValues, const Hyp
     computeGradients(targetValues, hp.loss);
 
     if (hp.gradientClipNorm > 0.0) {
-        for (size_t l = 1; l < m_layers.size(); ++l) {
-            for (double& g : m_layers[l].gradients()) {
-                g = std::clamp(g, -hp.gradientClipNorm, hp.gradientClipNorm);
-            }
-        }
-
         double sqNorm = 0.0;
         for (size_t l = 1; l < m_layers.size(); ++l) {
             for (double g : m_layers[l].gradients()) sqNorm += g * g;
@@ -471,10 +465,32 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
     if (X.empty() || Y.empty() || X.size() != Y.size()) return {};
     size_t numFeatures = X[0].size();
     size_t outDim = Y[0].size();
-    std::vector<double> importances(numFeatures, 0.0);
-    std::vector<double> fallbackSensitivity(numFeatures, 0.0);
+    if (numFeatures == 0 || outDim == 0) return {};
+
+    constexpr size_t kMaxImportanceRows = 5000;
+    std::vector<size_t> sampledIndices(X.size());
+    std::iota(sampledIndices.begin(), sampledIndices.end(), 0);
+    if (sampledIndices.size() > kMaxImportanceRows) {
+        std::shuffle(sampledIndices.begin(), sampledIndices.end(), rng);
+        sampledIndices.resize(kMaxImportanceRows);
+    }
+
+    std::vector<std::vector<double>> Xeval;
+    std::vector<std::vector<double>> Yeval;
+    Xeval.reserve(sampledIndices.size());
+    Yeval.reserve(sampledIndices.size());
+    for (size_t idx : sampledIndices) {
+        Xeval.push_back(X[idx]);
+        Yeval.push_back(Y[idx]);
+    }
+
+    if (Xeval.empty()) return {};
 
     if (trials == 0) trials = 1;
+    if (Xeval.size() > 3000 && trials > 3) trials = 3;
+
+    std::vector<double> importances(numFeatures, 0.0);
+    std::vector<double> fallbackSensitivity(numFeatures, 0.0);
 
     // Calculate baseline error (MSE)
     auto getError = [&](const std::vector<std::vector<double>>& dataX,
@@ -484,7 +500,7 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
         for (size_t i = 0; i < dataX.size(); ++i) {
             auto p = predict(dataX[i]);
             for (size_t j = 0; j < outDim && j < p.size(); ++j) {
-                double diff = p[j] - Y[i][j];
+                double diff = p[j] - Yeval[i][j];
                 totalError += diff * diff;
                 if (predsOut) {
                     (*predsOut)[i][j] = p[j];
@@ -495,17 +511,25 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
     };
 
     std::vector<std::vector<double>> baselinePred;
-    double baselineError = getError(X, &baselinePred);
+    double baselineError = getError(Xeval, &baselinePred);
+
+    const size_t progressStep = std::max<size_t>(1, numFeatures / 10);
+    if (numFeatures >= 20) {
+        std::cout << "[Seldon][Neural] Feature importance on "
+                  << Xeval.size() << " sampled rows, "
+                  << trials << " trial(s)\n";
+    }
 
     for (size_t f = 0; f < numFeatures; ++f) {
         double featureErrorSum = 0.0;
         double sensitivitySum = 0.0;
         for (size_t t = 0; t < trials; ++t) {
-            std::vector<std::vector<double>> shuffledX = X;
+            std::vector<std::vector<double>> shuffledX = Xeval;
             std::vector<double> featureVals;
-            for (const auto& row : X) featureVals.push_back(row[f]);
+            featureVals.reserve(Xeval.size());
+            for (const auto& row : Xeval) featureVals.push_back(row[f]);
             std::shuffle(featureVals.begin(), featureVals.end(), rng);
-            for (size_t i = 0; i < X.size(); ++i) shuffledX[i][f] = featureVals[i];
+            for (size_t i = 0; i < Xeval.size(); ++i) shuffledX[i][f] = featureVals[i];
 
             std::vector<std::vector<double>> shuffledPred;
             featureErrorSum += getError(shuffledX, &shuffledPred);
@@ -519,7 +543,12 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
         // Importance = how much error increased when feature was destroyed
         importances[f] = (featureErrorSum / (double)trials) - baselineError;
         if (importances[f] < 0) importances[f] = 0; // Clip noise
-        fallbackSensitivity[f] = sensitivitySum / static_cast<double>(trials * X.size() * outDim);
+        fallbackSensitivity[f] = sensitivitySum / static_cast<double>(trials * Xeval.size() * outDim);
+
+        if (numFeatures >= 20 && (((f + 1) % progressStep) == 0 || (f + 1) == numFeatures)) {
+            const size_t pct = static_cast<size_t>((100.0 * static_cast<double>(f + 1)) / static_cast<double>(numFeatures));
+            std::cout << "[Seldon][Neural] Feature importance progress: " << pct << "%\n";
+        }
     }
 
     // Normalize and blend loss delta with prediction sensitivity.

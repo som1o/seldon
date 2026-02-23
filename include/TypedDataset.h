@@ -18,7 +18,15 @@ struct TypedColumn {
 
 class TypedDataset {
 public:
+    enum class NumericSeparatorPolicy {
+        AUTO,
+        US_THOUSANDS,
+        EUROPEAN
+    };
+
     explicit TypedDataset(std::string filename, char delimiter = ',');
+
+    void setNumericSeparatorPolicy(NumericSeparatorPolicy policy) { numericSeparatorPolicy_ = policy; }
 
     /**
      * @brief Loads CSV content and infers per-column types.
@@ -53,10 +61,11 @@ public:
 private:
     std::string filename_;
     char delimiter_;
+    NumericSeparatorPolicy numericSeparatorPolicy_ = NumericSeparatorPolicy::AUTO;
     size_t rowCount_ = 0;
     std::vector<TypedColumn> columns_;
 
     std::vector<std::string> parseCSVLine(std::istream& is, bool& malformed) const;
-    static bool parseDouble(const std::string& v, double& out);
+    bool parseDouble(const std::string& v, double& out) const;
     static bool parseDateTime(const std::string& v, int64_t& outUnixSeconds);
 };

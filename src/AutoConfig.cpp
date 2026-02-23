@@ -40,9 +40,76 @@ T parseNumericStrict(const std::string& value,
         return parsed;
     } catch (const Seldon::SeldonException&) {
         throw;
-    } catch (const std::exception&) {
-        throw Seldon::ConfigurationException(errorPrefix + key + ": " + value);
+    } catch (const std::exception& ex) {
+        throw Seldon::ConfigurationException(errorPrefix + key + ": " + value + " (" + ex.what() + ")");
     }
+}
+
+std::string stripStructuralTokensOutsideQuotes(const std::string& line) {
+    std::string out;
+    out.reserve(line.size());
+
+    bool inQuotes = false;
+    bool escaped = false;
+    for (char c : line) {
+        if (escaped) {
+            out.push_back(c);
+            escaped = false;
+            continue;
+        }
+        if (c == '\\') {
+            out.push_back(c);
+            escaped = true;
+            continue;
+        }
+        if (c == '"') {
+            inQuotes = !inQuotes;
+            out.push_back(c);
+            continue;
+        }
+        if (!inQuotes && (c == '{' || c == '}')) {
+            continue;
+        }
+        out.push_back(c);
+    }
+
+    size_t lastNonSpace = out.find_last_not_of(" \t\r\n");
+    if (lastNonSpace != std::string::npos && out[lastNonSpace] == ',') {
+        out.erase(lastNonSpace, 1);
+    }
+    return out;
+}
+
+size_t findSeparatorOutsideQuotes(const std::string& line, char sep) {
+    bool inQuotes = false;
+    bool escaped = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        char c = line[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '"') {
+            inQuotes = !inQuotes;
+            continue;
+        }
+        if (!inQuotes && c == sep) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+std::string maybeUnquote(std::string value) {
+    value = CommonUtils::trim(value);
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+        return value.substr(1, value.size() - 2);
+    }
+    return value;
 }
 
 int parseIntStrict(const std::string& value, const std::string& key, int minValue) {
@@ -253,7 +320,8 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
     };
     static const std::unordered_map<std::string, TuningSizeRule> tuningSizeFields = {
         {"beta_fallback_intervals_start", {&HeuristicTuningConfig::betaFallbackIntervalsStart, 256}},
-        {"beta_fallback_intervals_max", {&HeuristicTuningConfig::betaFallbackIntervalsMax, 512}}
+        {"beta_fallback_intervals_max", {&HeuristicTuningConfig::betaFallbackIntervalsMax, 512}},
+        {"overall_corr_heatmap_max_columns", {&HeuristicTuningConfig::overallCorrHeatmapMaxColumns, 2}}
     };
 
     if (key == "plot_format") {
@@ -406,6 +474,8 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.tuning.featureLeakageCorrThreshold = parseDoubleStrict(argv[++i], "--feature-leakage-corr-threshold", 0.0);
         } else if (arg == "--bivariate-selection-quantile" && i + 1 < argc) {
             config.tuning.bivariateSelectionQuantileOverride = parseDoubleStrict(argv[++i], "--bivariate-selection-quantile", -1.0);
+        } else if (arg == "--overall-corr-heatmap-max-columns" && i + 1 < argc) {
+            config.tuning.overallCorrHeatmapMaxColumns = static_cast<size_t>(parseIntStrict(argv[++i], "--overall-corr-heatmap-max-columns", 2));
         }
     }
 
@@ -414,81 +484,7 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
         if (config.datasetPath.empty()) config.datasetPath = argv[1];
     }
 
-    if (config.datasetPath.empty()) {
-        throw Seldon::ConfigurationException("Dataset path is required");
-    }
-
-    const auto isIn = [](const std::string& value, const std::vector<std::string>& allowed) {
-        return std::find(allowed.begin(), allowed.end(), value) != allowed.end();
-    };
-    if (!isIn(config.targetStrategy, {"auto", "quality", "max_variance", "last_numeric"})) {
-        throw Seldon::ConfigurationException("--target-strategy must be one of: auto, quality, max_variance, last_numeric");
-    }
-    if (!isIn(config.featureStrategy, {"auto", "adaptive", "aggressive", "lenient"})) {
-        throw Seldon::ConfigurationException("--feature-strategy must be one of: auto, adaptive, aggressive, lenient");
-    }
-    if (!isIn(config.neuralStrategy, {"auto", "none", "fast", "balanced", "expressive"})) {
-        throw Seldon::ConfigurationException("--neural-strategy must be one of: auto, none, fast, balanced, expressive");
-    }
-    if (!isIn(config.bivariateStrategy, {"auto", "balanced", "corr_heavy", "importance_heavy"})) {
-        throw Seldon::ConfigurationException("--bivariate-strategy must be one of: auto, balanced, corr_heavy, importance_heavy");
-    }
-    if (!isIn(config.neuralOptimizer, {"sgd", "adam", "lookahead"})) {
-        throw Seldon::ConfigurationException("--neural-optimizer must be one of: sgd, adam, lookahead");
-    }
-    if (!isIn(config.neuralLookaheadFastOptimizer, {"sgd", "adam"})) {
-        throw Seldon::ConfigurationException("--neural-lookahead-fast-optimizer must be one of: sgd, adam");
-    }
-    if (config.neuralLookaheadAlpha < 0.0 || config.neuralLookaheadAlpha > 1.0) {
-        throw Seldon::ConfigurationException("--neural-lookahead-alpha must be within [0,1]");
-    }
-    if (config.neuralBatchNormMomentum < 0.0 || config.neuralBatchNormMomentum >= 1.0) {
-        throw Seldon::ConfigurationException("--neural-batch-norm-momentum must be within [0,1)");
-    }
-    if (config.neuralLrDecay <= 0.0 || config.neuralLrDecay >= 1.0) {
-        throw Seldon::ConfigurationException("--neural-lr-decay must be within (0,1)");
-    }
-    if (config.neuralValidationLossEmaBeta < 0.0 || config.neuralValidationLossEmaBeta >= 1.0) {
-        throw Seldon::ConfigurationException("--neural-validation-loss-ema-beta must be within [0,1)");
-    }
-    if (config.tuning.featureLeakageCorrThreshold < 0.0 || config.tuning.featureLeakageCorrThreshold > 1.0) {
-        throw Seldon::ConfigurationException("--feature-leakage-corr-threshold must be within [0,1]");
-    }
-    if (config.tuning.significanceAlpha <= 0.0 || config.tuning.significanceAlpha >= 1.0) {
-        throw Seldon::ConfigurationException("--significance-alpha must be within (0,1)");
-    }
-    if (config.tuning.outlierIqrMultiplier <= 0.0) {
-        throw Seldon::ConfigurationException("--outlier-iqr-multiplier must be > 0");
-    }
-    if (config.tuning.outlierZThreshold <= 0.0) {
-        throw Seldon::ConfigurationException("--outlier-z-threshold must be > 0");
-    }
-    if (config.tuning.featureMissingAdaptiveMin > config.tuning.featureMissingAdaptiveMax) {
-        throw Seldon::ConfigurationException("feature_missing_floor must be <= feature_missing_ceiling");
-    }
-    if (config.tuning.bivariateSelectionQuantileOverride != -1.0 &&
-        (config.tuning.bivariateSelectionQuantileOverride < 0.0 || config.tuning.bivariateSelectionQuantileOverride > 1.0)) {
-        throw Seldon::ConfigurationException("bivariate_selection_quantile must be -1 or within [0,1]");
-    }
-    if (config.tuning.coherenceWeightMin > config.tuning.coherenceWeightMax) {
-        throw Seldon::ConfigurationException("coherence_weight_min must be <= coherence_weight_max");
-    }
-    if (config.tuning.betaFallbackIntervalsStart > config.tuning.betaFallbackIntervalsMax) {
-        throw Seldon::ConfigurationException("beta_fallback_intervals_start must be <= beta_fallback_intervals_max");
-    }
-    if (config.tuning.numericEpsilon <= 0.0 || config.tuning.betaFallbackTolerance <= 0.0) {
-        throw Seldon::ConfigurationException("numeric_epsilon and beta_fallback_tolerance must be > 0");
-    }
-    if (config.fastMaxBivariatePairs == 0 || config.fastNeuralSampleRows == 0) {
-        throw Seldon::ConfigurationException("fast_max_bivariate_pairs and fast_neural_sample_rows must be > 0");
-    }
-    for (const auto& kv : config.columnImputation) {
-        if (!isValidImputationStrategy(kv.second)) {
-            throw Seldon::ConfigurationException(
-                "Invalid imputation strategy for column '" + kv.first +
-                "': '" + kv.second + "' (allowed: auto, mean, median, zero, mode, interpolate)");
-        }
-    }
+    config.validate();
 
     return config;
 }
@@ -506,18 +502,14 @@ AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig&
         if (line.empty() || line[0] == '#') continue;
 
         // Support loose YAML (key: value) and loose JSON-ish ("key": "value",)
-        line.erase(std::remove(line.begin(), line.end(), '{'), line.end());
-        line.erase(std::remove(line.begin(), line.end(), '}'), line.end());
-        if (!line.empty() && line.back() == ',') line.pop_back();
+        line = CommonUtils::trim(stripStructuralTokensOutsideQuotes(line));
+        if (line.empty()) continue;
 
-        size_t sep = line.find(':');
+        size_t sep = findSeparatorOutsideQuotes(line, ':');
         if (sep == std::string::npos) continue;
 
-        std::string key = CommonUtils::trim(line.substr(0, sep));
-        std::string value = CommonUtils::trim(line.substr(sep + 1));
-
-        if (!key.empty() && key.front() == '"' && key.back() == '"') key = key.substr(1, key.size() - 2);
-        if (!value.empty() && value.front() == '"' && value.back() == '"') value = value.substr(1, value.size() - 2);
+        std::string key = maybeUnquote(line.substr(0, sep));
+        std::string value = maybeUnquote(line.substr(sep + 1));
 
         try {
             assignKeyValue(config, key, value);
@@ -539,95 +531,106 @@ AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig&
             config.columnImputation[key.substr(7)] = normalized;
         }
     }
+    config.validate();
 
-    if (config.plot.format != "png" && config.plot.format != "svg" && config.plot.format != "pdf") {
-        throw Seldon::ConfigurationException("plot_format must be one of: png, svg, pdf");
-    }
+    return config;
+}
 
-    if (config.outlierMethod != "iqr" && config.outlierMethod != "zscore") {
-        throw Seldon::ConfigurationException("outlier_method must be iqr or zscore");
-    }
-
-    if (config.outlierAction != "flag" && config.outlierAction != "remove" && config.outlierAction != "cap") {
-        throw Seldon::ConfigurationException("outlier_action must be flag, remove, or cap");
-    }
-
-    if (config.scalingMethod != "auto" && config.scalingMethod != "zscore" && config.scalingMethod != "minmax" && config.scalingMethod != "none") {
-        throw Seldon::ConfigurationException("scaling must be auto, zscore, minmax, or none");
-    }
-
-    if (config.tuning.significanceAlpha <= 0.0 || config.tuning.significanceAlpha >= 1.0) {
-        throw Seldon::ConfigurationException("significance_alpha must be within (0,1)");
-    }
-    if (config.tuning.outlierIqrMultiplier <= 0.0) {
-        throw Seldon::ConfigurationException("outlier_iqr_multiplier must be > 0");
-    }
-    if (config.tuning.outlierZThreshold <= 0.0) {
-        throw Seldon::ConfigurationException("outlier_z_threshold must be > 0");
+void AutoConfig::validate() const {
+    if (datasetPath.empty()) {
+        throw Seldon::ConfigurationException("dataset path is required");
     }
 
     const auto isIn = [](const std::string& value, const std::vector<std::string>& allowed) {
         return std::find(allowed.begin(), allowed.end(), value) != allowed.end();
     };
-    if (!isIn(config.targetStrategy, {"auto", "quality", "max_variance", "last_numeric"})) {
+
+    if (!isIn(plot.format, {"png", "svg", "pdf"})) {
+        throw Seldon::ConfigurationException("plot_format must be one of: png, svg, pdf");
+    }
+    if (!isIn(outlierMethod, {"iqr", "zscore"})) {
+        throw Seldon::ConfigurationException("outlier_method must be iqr or zscore");
+    }
+    if (!isIn(outlierAction, {"flag", "remove", "cap"})) {
+        throw Seldon::ConfigurationException("outlier_action must be flag, remove, or cap");
+    }
+    if (!isIn(scalingMethod, {"auto", "zscore", "minmax", "none"})) {
+        throw Seldon::ConfigurationException("scaling must be auto, zscore, minmax, or none");
+    }
+
+    if (!isIn(targetStrategy, {"auto", "quality", "max_variance", "last_numeric"})) {
         throw Seldon::ConfigurationException("target_strategy must be one of: auto, quality, max_variance, last_numeric");
     }
-    if (!isIn(config.featureStrategy, {"auto", "adaptive", "aggressive", "lenient"})) {
+    if (!isIn(featureStrategy, {"auto", "adaptive", "aggressive", "lenient"})) {
         throw Seldon::ConfigurationException("feature_strategy must be one of: auto, adaptive, aggressive, lenient");
     }
-    if (!isIn(config.neuralStrategy, {"auto", "none", "fast", "balanced", "expressive"})) {
+    if (!isIn(neuralStrategy, {"auto", "none", "fast", "balanced", "expressive"})) {
         throw Seldon::ConfigurationException("neural_strategy must be one of: auto, none, fast, balanced, expressive");
     }
-    if (!isIn(config.bivariateStrategy, {"auto", "balanced", "corr_heavy", "importance_heavy"})) {
+    if (!isIn(bivariateStrategy, {"auto", "balanced", "corr_heavy", "importance_heavy"})) {
         throw Seldon::ConfigurationException("bivariate_strategy must be one of: auto, balanced, corr_heavy, importance_heavy");
     }
-    if (!isIn(config.neuralOptimizer, {"sgd", "adam", "lookahead"})) {
+    if (!isIn(neuralOptimizer, {"sgd", "adam", "lookahead"})) {
         throw Seldon::ConfigurationException("neural_optimizer must be one of: sgd, adam, lookahead");
     }
-    if (!isIn(config.neuralLookaheadFastOptimizer, {"sgd", "adam"})) {
+    if (!isIn(neuralLookaheadFastOptimizer, {"sgd", "adam"})) {
         throw Seldon::ConfigurationException("neural_lookahead_fast_optimizer must be one of: sgd, adam");
     }
-    if (config.neuralLookaheadAlpha < 0.0 || config.neuralLookaheadAlpha > 1.0) {
+
+    if (neuralLookaheadAlpha < 0.0 || neuralLookaheadAlpha > 1.0) {
         throw Seldon::ConfigurationException("neural_lookahead_alpha must be within [0,1]");
     }
-    if (config.neuralBatchNormMomentum < 0.0 || config.neuralBatchNormMomentum >= 1.0) {
+    if (neuralBatchNormMomentum < 0.0 || neuralBatchNormMomentum >= 1.0) {
         throw Seldon::ConfigurationException("neural_batch_norm_momentum must be within [0,1)");
     }
-    if (config.neuralLrDecay <= 0.0 || config.neuralLrDecay >= 1.0) {
+    if (neuralLrDecay <= 0.0 || neuralLrDecay >= 1.0) {
         throw Seldon::ConfigurationException("neural_lr_decay must be within (0,1)");
     }
-    if (config.neuralValidationLossEmaBeta < 0.0 || config.neuralValidationLossEmaBeta >= 1.0) {
+    if (neuralValidationLossEmaBeta < 0.0 || neuralValidationLossEmaBeta >= 1.0) {
         throw Seldon::ConfigurationException("neural_validation_loss_ema_beta must be within [0,1)");
     }
-    if (config.tuning.featureLeakageCorrThreshold < 0.0 || config.tuning.featureLeakageCorrThreshold > 1.0) {
+
+    if (tuning.featureLeakageCorrThreshold < 0.0 || tuning.featureLeakageCorrThreshold > 1.0) {
         throw Seldon::ConfigurationException("feature_leakage_corr_threshold must be within [0,1]");
     }
-    if (config.tuning.featureMissingAdaptiveMin > config.tuning.featureMissingAdaptiveMax) {
+    if (tuning.significanceAlpha <= 0.0 || tuning.significanceAlpha >= 1.0) {
+        throw Seldon::ConfigurationException("significance_alpha must be within (0,1)");
+    }
+    if (tuning.outlierIqrMultiplier <= 0.0) {
+        throw Seldon::ConfigurationException("outlier_iqr_multiplier must be > 0");
+    }
+    if (tuning.outlierZThreshold <= 0.0) {
+        throw Seldon::ConfigurationException("outlier_z_threshold must be > 0");
+    }
+    if (tuning.featureMissingAdaptiveMin > tuning.featureMissingAdaptiveMax) {
         throw Seldon::ConfigurationException("feature_missing_floor must be <= feature_missing_ceiling");
     }
-    if (config.tuning.bivariateSelectionQuantileOverride != -1.0 &&
-        (config.tuning.bivariateSelectionQuantileOverride < 0.0 || config.tuning.bivariateSelectionQuantileOverride > 1.0)) {
+    if (tuning.bivariateSelectionQuantileOverride != -1.0 &&
+        (tuning.bivariateSelectionQuantileOverride < 0.0 || tuning.bivariateSelectionQuantileOverride > 1.0)) {
         throw Seldon::ConfigurationException("bivariate_selection_quantile must be -1 or within [0,1]");
     }
-    if (config.tuning.coherenceWeightMin > config.tuning.coherenceWeightMax) {
+    if (tuning.coherenceWeightMin > tuning.coherenceWeightMax) {
         throw Seldon::ConfigurationException("coherence_weight_min must be <= coherence_weight_max");
     }
-    if (config.tuning.betaFallbackIntervalsStart > config.tuning.betaFallbackIntervalsMax) {
+    if (tuning.betaFallbackIntervalsStart > tuning.betaFallbackIntervalsMax) {
         throw Seldon::ConfigurationException("beta_fallback_intervals_start must be <= beta_fallback_intervals_max");
     }
-    if (config.tuning.numericEpsilon <= 0.0 || config.tuning.betaFallbackTolerance <= 0.0) {
+    if (tuning.numericEpsilon <= 0.0 || tuning.betaFallbackTolerance <= 0.0) {
         throw Seldon::ConfigurationException("numeric_epsilon and beta_fallback_tolerance must be > 0");
     }
-    if (config.fastMaxBivariatePairs == 0 || config.fastNeuralSampleRows == 0) {
+    if (tuning.overallCorrHeatmapMaxColumns < 2) {
+        throw Seldon::ConfigurationException("overall_corr_heatmap_max_columns must be >= 2");
+    }
+
+    if (fastMaxBivariatePairs == 0 || fastNeuralSampleRows == 0) {
         throw Seldon::ConfigurationException("fast_max_bivariate_pairs and fast_neural_sample_rows must be > 0");
     }
-    for (const auto& kv : config.columnImputation) {
+
+    for (const auto& kv : columnImputation) {
         if (!isValidImputationStrategy(kv.second)) {
             throw Seldon::ConfigurationException(
                 "Invalid imputation strategy for column '" + kv.first +
                 "': '" + kv.second + "' (allowed: auto, mean, median, zero, mode, interpolate)");
         }
     }
-
-    return config;
 }

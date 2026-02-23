@@ -128,8 +128,9 @@ void DenseLayer::forward(const DenseLayer& prev,
             const double clippedMomentum = std::clamp(batchNormMomentum, 0.0, 0.9999);
             const double eps = std::max(batchNormEpsilon, 1e-12);
             if (isTraining) {
-                m_bnRunningMean[n] = clippedMomentum * m_bnRunningMean[n] + (1.0 - clippedMomentum) * activationInput;
-                const double centered = activationInput - m_bnRunningMean[n];
+                const double oldRunningMean = m_bnRunningMean[n];
+                m_bnRunningMean[n] = clippedMomentum * oldRunningMean + (1.0 - clippedMomentum) * activationInput;
+                const double centered = activationInput - oldRunningMean;
                 m_bnRunningVar[n] = clippedMomentum * m_bnRunningVar[n] + (1.0 - clippedMomentum) * (centered * centered);
             }
 

@@ -60,6 +60,9 @@ struct HeuristicTuningConfig {
     size_t betaFallbackIntervalsStart = 4096;
     size_t betaFallbackIntervalsMax = 65536;
     double betaFallbackTolerance = 1e-8;
+
+    // Maximum numeric columns used to build overall correlation heatmap (caps O(n^2) work).
+    size_t overallCorrHeatmapMaxColumns = 50;
 };
 
 struct AutoConfig {
@@ -133,4 +136,10 @@ struct AutoConfig {
      * @throws Seldon::ConfigurationException on parse/validation failures.
      */
     static AutoConfig fromFile(const std::string& configPath, const AutoConfig& base);
+
+    /**
+     * @brief Validates merged configuration invariants and enum-like fields.
+     * @throws Seldon::ConfigurationException on invalid values.
+     */
+    void validate() const;
 };

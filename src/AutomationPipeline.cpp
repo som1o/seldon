@@ -27,6 +27,9 @@
 #include <unordered_set>
 #include <utility>
 #include <cstdlib>
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
 
 namespace {
 std::string toFixed(double v, int prec = 4) {
@@ -88,23 +91,20 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
         const auto& values = std::get<std::vector<double>>(col.values);
         size_t finiteCount = 0;
         size_t nonZero = 0;
-        double sum = 0.0;
+        double mean = 0.0;
+        double m2 = 0.0;
         for (double v : values) {
             if (!std::isfinite(v)) continue;
-            finiteCount++;
-            sum += v;
+            ++finiteCount;
+            const double delta = v - mean;
+            mean += delta / static_cast<double>(finiteCount);
+            const double delta2 = v - mean;
+            m2 += delta * delta2;
             if (std::abs(v) > 1e-12) nonZero++;
         }
         if (finiteCount < 3) return -1e9;
 
-        double mean = sum / static_cast<double>(finiteCount);
-        double var = 0.0;
-        for (double v : values) {
-            if (!std::isfinite(v)) continue;
-            double d = v - mean;
-            var += d * d;
-        }
-        var /= static_cast<double>(std::max<size_t>(1, finiteCount - 1));
+        const double var = m2 / static_cast<double>(std::max<size_t>(1, finiteCount - 1));
 
         double missingRatio = 1.0 - (static_cast<double>(finiteCount) / static_cast<double>(std::max<size_t>(1, data.rowCount())));
         double nonZeroRatio = static_cast<double>(nonZero) / static_cast<double>(finiteCount);
@@ -1303,16 +1303,22 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     double totalImportance = 0.0;
     double categoricalImportance = 0.0;
     for (size_t i = 0; i < rawImportance.size(); ++i) {
-        const double imp = std::max(0.0, rawImportance[i]);
+        const double imp = std::max(0.0, std::isfinite(rawImportance[i]) ? rawImportance[i] : 0.0);
         totalImportance += imp;
 
-        if (i < encoded.sourceNumericFeaturePos.size()) {
-            int numericPos = encoded.sourceNumericFeaturePos[i];
-            if (numericPos >= 0 && static_cast<size_t>(numericPos) < analysis.featureImportance.size()) {
-                analysis.featureImportance[static_cast<size_t>(numericPos)] += imp;
-            } else {
-                categoricalImportance += imp;
+        if (i >= encoded.sourceNumericFeaturePos.size()) {
+            categoricalImportance += imp;
+            continue;
+        }
+
+        const int numericPos = encoded.sourceNumericFeaturePos[i];
+        if (numericPos >= 0) {
+            const size_t numericPosU = static_cast<size_t>(numericPos);
+            if (numericPosU < analysis.featureImportance.size()) {
+                analysis.featureImportance[numericPosU] += imp;
             }
+        } else {
+            categoricalImportance += imp;
         }
     }
     analysis.categoricalImportanceShare = (totalImportance > config.tuning.numericEpsilon)
@@ -1478,23 +1484,26 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         appendPairsForRange(0, evalNumericIdx.size(), pairs, true);
     } else {
         #ifdef USE_OPENMP
-        #pragma omp parallel
-        #endif
-        {
-            std::vector<PairInsight> localPairs;
+        const int threadCount = std::max(1, omp_get_max_threads());
+        std::vector<std::vector<PairInsight>> threadPairs(static_cast<size_t>(threadCount));
 
-            #ifdef USE_OPENMP
+        #pragma omp parallel
+        {
+            const int tid = omp_get_thread_num();
+            std::vector<PairInsight>& localPairs = threadPairs[static_cast<size_t>(tid)];
+
             #pragma omp for schedule(dynamic)
-            #endif
             for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
                 appendPairsForRange(aPos, aPos + 1, localPairs, false);
             }
-
-            #ifdef USE_OPENMP
-            #pragma omp critical
-            #endif
-            pairs.insert(pairs.end(), localPairs.begin(), localPairs.end());
         }
+
+        for (auto& local : threadPairs) {
+            pairs.insert(pairs.end(), local.begin(), local.end());
+        }
+        #else
+        appendPairsForRange(0, evalNumericIdx.size(), pairs, false);
+        #endif
     }
 
     std::vector<double> significantScores;
@@ -1539,6 +1548,7 @@ void addOverallSections(ReportEngine& report,
                         const std::vector<BenchmarkResult>& benchmarks,
                         const NeuralAnalysis& neural,
                         const DataHealthSummary& health,
+                        const AutoConfig& config,
                         GnuplotEngine* overallPlotter,
                         bool canPlotOverall,
                         bool verbose,
@@ -1563,13 +1573,27 @@ void addOverallSections(ReportEngine& report,
 
         auto numericIdx = data.numericColumnIndices();
         if (numericIdx.size() >= 2) {
+            const size_t maxCols = std::max<size_t>(2, config.tuning.overallCorrHeatmapMaxColumns);
+            if (numericIdx.size() > maxCols) {
+                std::stable_sort(numericIdx.begin(), numericIdx.end(), [&](size_t lhs, size_t rhs) {
+                    auto lIt = statsCache.find(lhs);
+                    auto rIt = statsCache.find(rhs);
+                    const double lv = (lIt != statsCache.end() && std::isfinite(lIt->second.variance)) ? lIt->second.variance : 0.0;
+                    const double rv = (rIt != statsCache.end() && std::isfinite(rIt->second.variance)) ? rIt->second.variance : 0.0;
+                    return lv > rv;
+                });
+                numericIdx.resize(maxCols);
+            }
+
             std::vector<std::vector<double>> corr(numericIdx.size(), std::vector<double>(numericIdx.size(), 1.0));
             for (size_t i = 0; i < numericIdx.size(); ++i) {
                 for (size_t j = i + 1; j < numericIdx.size(); ++j) {
-                    const auto& a = std::get<std::vector<double>>(data.columns()[numericIdx[i]].values);
-                    const auto& b = std::get<std::vector<double>>(data.columns()[numericIdx[j]].values);
-                    auto ai = statsCache.find(numericIdx[i]);
-                    auto bi = statsCache.find(numericIdx[j]);
+                    const auto idxI = numericIdx[i];
+                    const auto idxJ = numericIdx[j];
+                    const auto& a = std::get<std::vector<double>>(data.columns()[idxI].values);
+                    const auto& b = std::get<std::vector<double>>(data.columns()[idxJ].values);
+                    auto ai = statsCache.find(idxI);
+                    auto bi = statsCache.find(idxJ);
                     ColumnStats aFallback = Statistics::calculateStats(a);
                     ColumnStats bFallback = Statistics::calculateStats(b);
                     const ColumnStats& sa = (ai != statsCache.end()) ? ai->second : aFallback;
@@ -1841,6 +1865,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
                        benchmarks,
                        neural,
                        dataHealth,
+                       runCfg,
                        &plotterOverall,
                        canPlot && runCfg.plotOverall,
                        runCfg.verboseAnalysis,

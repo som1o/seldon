@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <unordered_map>
 
 TypedDataset::TypedDataset(std::string filename, char delimiter)
     : filename_(std::move(filename)), delimiter_(delimiter) {}
@@ -95,17 +96,80 @@ bool parseDatePart(const std::string& datePart, int& year, int& month, int& day)
 
     return false;
 }
+
+std::string normalizeNumericToken(const std::string& input, TypedDataset::NumericSeparatorPolicy policy) {
+    std::string cleaned;
+    cleaned.reserve(input.size());
+    for (char ch : input) {
+        if (!std::isspace(static_cast<unsigned char>(ch)) && ch != '_') {
+            cleaned.push_back(ch);
+        }
+    }
+
+    const auto toUS = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char ch : s) {
+            if (ch != ',') out.push_back(ch);
+        }
+        return out;
+    };
+
+    const auto toEuropean = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char ch : s) {
+            if (ch == '.') {
+                continue;
+            }
+            if (ch == ',') {
+                out.push_back('.');
+            } else {
+                out.push_back(ch);
+            }
+        }
+        return out;
+    };
+
+    if (policy == TypedDataset::NumericSeparatorPolicy::US_THOUSANDS) {
+        return toUS(cleaned);
+    }
+    if (policy == TypedDataset::NumericSeparatorPolicy::EUROPEAN) {
+        return toEuropean(cleaned);
+    }
+
+    const size_t dotPos = cleaned.find('.');
+    const size_t commaPos = cleaned.find(',');
+    if (dotPos != std::string::npos && commaPos != std::string::npos) {
+        const size_t lastDot = cleaned.find_last_of('.');
+        const size_t lastComma = cleaned.find_last_of(',');
+        if (lastComma > lastDot) {
+            return toEuropean(cleaned);
+        }
+        return toUS(cleaned);
+    }
+
+    if (commaPos != std::string::npos) {
+        if (cleaned.find(',', commaPos + 1) == std::string::npos) {
+            const size_t digitsAfter = cleaned.size() - commaPos - 1;
+            if (digitsAfter >= 1 && digitsAfter <= 6) {
+                std::string out = cleaned;
+                out[commaPos] = '.';
+                return out;
+            }
+        }
+        return toUS(cleaned);
+    }
+
+    return cleaned;
+}
 }
 
-bool TypedDataset::parseDouble(const std::string& v, double& out) {
+bool TypedDataset::parseDouble(const std::string& v, double& out) const {
     auto sv = CommonUtils::trim(v);
     if (isMissingToken(sv)) return false;
 
-    std::string cleaned;
-    cleaned.reserve(sv.size());
-    for (char ch : sv) {
-        if (ch != ',') cleaned.push_back(ch);
-    }
+    std::string cleaned = normalizeNumericToken(sv, numericSeparatorPolicy_);
 
     if (!cleaned.empty() && cleaned.front() == '+') {
         cleaned.erase(cleaned.begin());
@@ -171,37 +235,32 @@ void TypedDataset::load() {
     bool malformed = false;
     auto header = parseCSVLine(in, malformed);
     if (malformed || header.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
-
     header = CSVUtils::normalizeHeader(header);
-
-    std::vector<std::vector<std::string>> bufferedRows;
-    bufferedRows.reserve(1024);
-
-    // Single pass: buffer usable rows for stable inference + loading.
-    while (in.peek() != EOF) {
-        auto row = parseCSVLine(in, malformed);
-        if (row.empty()) continue;
-        if (malformed) continue;
-        bufferedRows.push_back(std::move(row));
-    }
 
     std::vector<size_t> numericHits(header.size(), 0);
     std::vector<size_t> datetimeHits(header.size(), 0);
     std::vector<size_t> nonMissing(header.size(), 0);
+    rowCount_ = 0;
 
-    for (const auto& row : bufferedRows) {
-        size_t cols = std::min(row.size(), header.size());
+    while (in.peek() != EOF) {
+        auto row = parseCSVLine(in, malformed);
+        if (row.empty() || malformed) continue;
+        ++rowCount_;
+
+        const size_t cols = std::min(row.size(), header.size());
         for (size_t c = 0; c < cols; ++c) {
             if (isMissingToken(row[c])) continue;
-            nonMissing[c]++;
+            ++nonMissing[c];
             double dv = 0.0;
             int64_t tv = 0;
-            if (parseDouble(row[c], dv)) numericHits[c]++;
-            else if (parseDateTime(row[c], tv)) datetimeHits[c]++;
+            if (parseDouble(row[c], dv)) {
+                ++numericHits[c];
+            } else if (parseDateTime(row[c], tv)) {
+                ++datetimeHits[c];
+            }
         }
     }
 
-    rowCount_ = bufferedRows.size();
     columns_.clear();
     columns_.reserve(header.size());
 
@@ -226,8 +285,26 @@ void TypedDataset::load() {
     std::vector<size_t> datetimeObserved(columns_.size(), 0);
     std::vector<size_t> datetimeParseFailures(columns_.size(), 0);
 
-    for (size_t r = 0; r < bufferedRows.size(); ++r) {
-        const auto& row = bufferedRows[r];
+    std::unordered_map<size_t, std::vector<std::string>> datetimeRaw;
+    for (size_t c = 0; c < columns_.size(); ++c) {
+        if (columns_[c].type == ColumnType::DATETIME) {
+            datetimeRaw.emplace(c, std::vector<std::string>(rowCount_));
+        }
+    }
+
+    in.clear();
+    in.seekg(0, std::ios::beg);
+    CSVUtils::skipBOM(in);
+    malformed = false;
+    auto headerSecondPass = parseCSVLine(in, malformed);
+    if (malformed || headerSecondPass.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
+
+    size_t r = 0;
+    while (in.peek() != EOF) {
+        auto row = parseCSVLine(in, malformed);
+        if (row.empty() || malformed) continue;
+        if (r >= rowCount_) break;
+
         size_t cols = std::min(row.size(), header.size());
         for (size_t c = 0; c < header.size(); ++c) {
             std::string s = (c < cols) ? row[c] : "";
@@ -248,6 +325,10 @@ void TypedDataset::load() {
                 auto& datetimeValues = std::get<std::vector<int64_t>>(columns_[c].values);
                 int64_t ts = 0;
                 datetimeObserved[c]++;
+                auto rawIt = datetimeRaw.find(c);
+                if (rawIt != datetimeRaw.end()) {
+                    rawIt->second[r] = CommonUtils::trim(s);
+                }
                 if (parseDateTime(s, ts)) {
                     datetimeValues[r] = ts;
                 } else {
@@ -262,6 +343,7 @@ void TypedDataset::load() {
                 }
             }
         }
+        ++r;
     }
 
     constexpr double kDatetimeFallbackFailureRatio = 0.15;
@@ -278,14 +360,16 @@ void TypedDataset::load() {
         auto& categoricalValues = std::get<std::vector<std::string>>(columns_[c].values);
         columns_[c].missing.assign(rowCount_, static_cast<uint8_t>(0));
 
-        for (size_t r = 0; r < bufferedRows.size(); ++r) {
-            const auto& row = bufferedRows[r];
-            std::string s = (c < row.size()) ? CommonUtils::trim(row[c]) : "";
+        auto rawIt = datetimeRaw.find(c);
+        if (rawIt == datetimeRaw.end()) continue;
+        const auto& rawCol = rawIt->second;
+        for (size_t row = 0; row < rawCol.size(); ++row) {
+            const std::string s = rawCol[row];
             if (isMissingToken(s) || s.empty()) {
-                columns_[c].missing[r] = static_cast<uint8_t>(1);
-                categoricalValues[r].clear();
+                columns_[c].missing[row] = static_cast<uint8_t>(1);
+                categoricalValues[row].clear();
             } else {
-                categoricalValues[r] = s;
+                categoricalValues[row] = s;
             }
         }
     }
