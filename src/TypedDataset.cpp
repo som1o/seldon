@@ -1,5 +1,6 @@
 #include "TypedDataset.h"
 #include "CSVUtils.h"
+#include "CommonUtils.h"
 #include "SeldonExceptions.h"
 #include <algorithm>
 #include <cctype>
@@ -13,25 +14,11 @@
 TypedDataset::TypedDataset(std::string filename, char delimiter)
     : filename_(std::move(filename)), delimiter_(delimiter) {}
 
-std::string TypedDataset::trim(const std::string& s) {
-    size_t b = s.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos) return "";
-    size_t e = s.find_last_not_of(" \t\r\n");
-    return s.substr(b, e - b + 1);
-}
-
 namespace {
-std::string trimLocal(const std::string& s) {
-    size_t b = s.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos) return "";
-    size_t e = s.find_last_not_of(" \t\r\n");
-    return s.substr(b, e - b + 1);
-}
-
 bool isMissingToken(const std::string& raw) {
-    std::string s = trimLocal(raw);
+    std::string s = CommonUtils::trim(raw);
     if (s.empty()) return true;
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    s = CommonUtils::toLower(std::move(s));
     return s == "na" || s == "n/a" || s == "null" || s == "none" || s == "nan" || s == "missing";
 }
 
@@ -69,10 +56,49 @@ int64_t daysFromCivil(int y, unsigned m, unsigned d) {
     const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     return static_cast<int64_t>(era) * 146097 + static_cast<int64_t>(doe) - 719468;
 }
+
+bool parseTimePart(const std::string& timePart, int& hour, int& minute, int& second) {
+    if (timePart.empty()) {
+        hour = minute = second = 0;
+        return true;
+    }
+    if (timePart.size() != 8) return false;
+    if (!parseFixedInt(timePart, 0, 2, hour) || timePart[2] != ':' ||
+        !parseFixedInt(timePart, 3, 2, minute) || timePart[5] != ':' ||
+        !parseFixedInt(timePart, 6, 2, second)) {
+        return false;
+    }
+    return true;
+}
+
+bool parseDatePart(const std::string& datePart, int& year, int& month, int& day) {
+    // ISO: YYYY-MM-DD
+    if (datePart.size() == 10 && datePart[4] == '-' && datePart[7] == '-') {
+        return parseFixedInt(datePart, 0, 4, year) &&
+               parseFixedInt(datePart, 5, 2, month) &&
+               parseFixedInt(datePart, 8, 2, day);
+    }
+
+    // US: MM/DD/YYYY
+    if (datePart.size() == 10 && datePart[2] == '/' && datePart[5] == '/') {
+        return parseFixedInt(datePart, 0, 2, month) &&
+               parseFixedInt(datePart, 3, 2, day) &&
+               parseFixedInt(datePart, 6, 4, year);
+    }
+
+    // DMY: DD-MM-YYYY
+    if (datePart.size() == 10 && datePart[2] == '-' && datePart[5] == '-') {
+        return parseFixedInt(datePart, 0, 2, day) &&
+               parseFixedInt(datePart, 3, 2, month) &&
+               parseFixedInt(datePart, 6, 4, year);
+    }
+
+    return false;
+}
 }
 
 bool TypedDataset::parseDouble(const std::string& v, double& out) {
-    auto sv = trim(v);
+    auto sv = CommonUtils::trim(v);
     if (isMissingToken(sv)) return false;
 
     std::string cleaned;
@@ -97,7 +123,7 @@ bool TypedDataset::parseDouble(const std::string& v, double& out) {
 }
 
 bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) {
-    std::string s = trim(v);
+    std::string s = CommonUtils::trim(v);
     if (s.empty() || isMissingToken(s)) return false;
 
     int year = 0;
@@ -107,23 +133,19 @@ bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) 
     int minute = 0;
     int second = 0;
 
-    const bool hasDateOnly = (s.size() == 10);
-    const bool hasDateTime = (s.size() == 19);
-    if (!hasDateOnly && !hasDateTime) return false;
-
-    if (!parseFixedInt(s, 0, 4, year) || s[4] != '-' ||
-        !parseFixedInt(s, 5, 2, month) || s[7] != '-' ||
-        !parseFixedInt(s, 8, 2, day)) {
-        return false;
+    std::string datePart = s;
+    std::string timePart;
+    const size_t sep = s.find(' ');
+    if (sep != std::string::npos) {
+        datePart = s.substr(0, sep);
+        timePart = s.substr(sep + 1);
     }
 
-    if (hasDateTime) {
-        if (s[10] != ' ' ||
-            !parseFixedInt(s, 11, 2, hour) || s[13] != ':' ||
-            !parseFixedInt(s, 14, 2, minute) || s[16] != ':' ||
-            !parseFixedInt(s, 17, 2, second)) {
-            return false;
-        }
+    if (!parseDatePart(datePart, year, month, day)) {
+        return false;
+    }
+    if (!parseTimePart(timePart, hour, minute, second)) {
+        return false;
     }
 
     if (month < 1 || month > 12) return false;
@@ -152,22 +174,22 @@ void TypedDataset::load() {
 
     header = CSVUtils::normalizeHeader(header);
 
-    std::vector<size_t> numericHits(header.size(), 0);
-    std::vector<size_t> datetimeHits(header.size(), 0);
-    std::vector<size_t> nonMissing(header.size(), 0);
-    
-    size_t record = 1;
-    size_t validRows = 0;
-    
-    // Pass 1: Determine column types and count rows
-    auto pos = in.tellg();
+    std::vector<std::vector<std::string>> bufferedRows;
+    bufferedRows.reserve(1024);
+
+    // Single pass: buffer usable rows for stable inference + loading.
     while (in.peek() != EOF) {
         auto row = parseCSVLine(in, malformed);
         if (row.empty()) continue;
-        record++;
         if (malformed) continue;
+        bufferedRows.push_back(std::move(row));
+    }
 
-        validRows++;
+    std::vector<size_t> numericHits(header.size(), 0);
+    std::vector<size_t> datetimeHits(header.size(), 0);
+    std::vector<size_t> nonMissing(header.size(), 0);
+
+    for (const auto& row : bufferedRows) {
         size_t cols = std::min(row.size(), header.size());
         for (size_t c = 0; c < cols; ++c) {
             if (isMissingToken(row[c])) continue;
@@ -179,14 +201,14 @@ void TypedDataset::load() {
         }
     }
 
-    rowCount_ = validRows;
+    rowCount_ = bufferedRows.size();
     columns_.clear();
     columns_.reserve(header.size());
 
     for (size_t c = 0; c < header.size(); ++c) {
         TypedColumn col;
         col.name = header[c];
-        col.missing.assign(rowCount_, false);
+        col.missing.assign(rowCount_, static_cast<uint8_t>(0));
 
         if (nonMissing[c] > 0 && numericHits[c] >= std::max<size_t>(3, (nonMissing[c] * 8) / 10)) {
             col.type = ColumnType::NUMERIC;
@@ -201,21 +223,16 @@ void TypedDataset::load() {
         columns_.push_back(std::move(col));
     }
 
-    // Pass 2: Parse and store data
-    in.clear();
-    in.seekg(pos);
-    
-    size_t r = 0;
-    while (in.peek() != EOF && r < rowCount_) {
-        auto row = parseCSVLine(in, malformed);
-        if (row.empty()) continue;
-        if (malformed) continue;
+    std::vector<size_t> datetimeObserved(columns_.size(), 0);
+    std::vector<size_t> datetimeParseFailures(columns_.size(), 0);
 
+    for (size_t r = 0; r < bufferedRows.size(); ++r) {
+        const auto& row = bufferedRows[r];
         size_t cols = std::min(row.size(), header.size());
         for (size_t c = 0; c < header.size(); ++c) {
             std::string s = (c < cols) ? row[c] : "";
             if (isMissingToken(s)) {
-                columns_[c].missing[r] = true;
+                columns_[c].missing[r] = static_cast<uint8_t>(1);
                 continue;
             }
 
@@ -225,25 +242,52 @@ void TypedDataset::load() {
                 if (parseDouble(s, dv)) {
                     numericValues[r] = dv;
                 } else {
-                    columns_[c].missing[r] = true;
+                    columns_[c].missing[r] = static_cast<uint8_t>(1);
                 }
             } else if (columns_[c].type == ColumnType::DATETIME) {
                 auto& datetimeValues = std::get<std::vector<int64_t>>(columns_[c].values);
                 int64_t ts = 0;
+                datetimeObserved[c]++;
                 if (parseDateTime(s, ts)) {
                     datetimeValues[r] = ts;
                 } else {
-                    columns_[c].missing[r] = true;
+                    datetimeParseFailures[c]++;
+                    columns_[c].missing[r] = static_cast<uint8_t>(1);
                 }
             } else {
                 auto& categoricalValues = std::get<std::vector<std::string>>(columns_[c].values);
-                categoricalValues[r] = trim(s);
+                categoricalValues[r] = CommonUtils::trim(s);
                 if (categoricalValues[r].empty()) {
-                    columns_[c].missing[r] = true;
+                    columns_[c].missing[r] = static_cast<uint8_t>(1);
                 }
             }
         }
-        r++;
+    }
+
+    constexpr double kDatetimeFallbackFailureRatio = 0.15;
+    for (size_t c = 0; c < columns_.size(); ++c) {
+        if (columns_[c].type != ColumnType::DATETIME) continue;
+        if (datetimeObserved[c] == 0 || datetimeParseFailures[c] == 0) continue;
+
+        const double failureRatio = static_cast<double>(datetimeParseFailures[c]) /
+                                    static_cast<double>(datetimeObserved[c]);
+        if (failureRatio <= kDatetimeFallbackFailureRatio) continue;
+
+        columns_[c].type = ColumnType::CATEGORICAL;
+        columns_[c].values = std::vector<std::string>(rowCount_);
+        auto& categoricalValues = std::get<std::vector<std::string>>(columns_[c].values);
+        columns_[c].missing.assign(rowCount_, static_cast<uint8_t>(0));
+
+        for (size_t r = 0; r < bufferedRows.size(); ++r) {
+            const auto& row = bufferedRows[r];
+            std::string s = (c < row.size()) ? CommonUtils::trim(row[c]) : "";
+            if (isMissingToken(s) || s.empty()) {
+                columns_[c].missing[r] = static_cast<uint8_t>(1);
+                categoricalValues[r].clear();
+            } else {
+                categoricalValues[r] = s;
+            }
+        }
     }
 }
 
@@ -270,11 +314,11 @@ int TypedDataset::findColumnIndex(const std::string& name) const {
     return -1;
 }
 
-void TypedDataset::removeRows(const std::vector<bool>& keepMask) {
+void TypedDataset::removeRows(const MissingMask& keepMask) {
     if (keepMask.size() != rowCount_) throw Seldon::DatasetException("Row mask size mismatch");
 
     for (auto& col : columns_) {
-        std::vector<bool> newMissing;
+        MissingMask newMissing;
         newMissing.reserve(rowCount_);
 
         if (col.type == ColumnType::NUMERIC) {
@@ -312,5 +356,5 @@ void TypedDataset::removeRows(const std::vector<bool>& keepMask) {
         col.missing = std::move(newMissing);
     }
 
-    rowCount_ = std::count(keepMask.begin(), keepMask.end(), true);
+    rowCount_ = std::count(keepMask.begin(), keepMask.end(), static_cast<uint8_t>(1));
 }

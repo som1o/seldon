@@ -1,6 +1,7 @@
 #include "CSVUtils.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <unordered_set>
 
 namespace CSVUtils {
@@ -30,7 +31,7 @@ std::vector<std::string> parseCSVLine(std::istream& is, char delimiter, bool* ma
     if (is.peek() == EOF) return {};
 
     std::vector<std::string> row;
-    std::vector<bool> fieldQuoted;
+    std::vector<uint8_t> fieldQuoted;
     std::string val;
     bool inQuotes = false;
     bool currentFieldQuoted = false;
@@ -57,7 +58,7 @@ std::vector<std::string> parseCSVLine(std::istream& is, char delimiter, bool* ma
             }
         } else if (c == delimiter && !inQuotes) {
             row.push_back(currentFieldQuoted ? val : trimUnquotedField(val));
-            fieldQuoted.push_back(currentFieldQuoted);
+            fieldQuoted.push_back(static_cast<uint8_t>(currentFieldQuoted ? 1 : 0));
             val.clear();
             currentFieldQuoted = false;
             hadDelimiter = true;
@@ -89,10 +90,10 @@ std::vector<std::string> parseCSVLine(std::istream& is, char delimiter, bool* ma
 
     if (hasRecordData || hadDelimiter || !val.empty()) {
         row.push_back(currentFieldQuoted ? val : trimUnquotedField(val));
-        fieldQuoted.push_back(currentFieldQuoted);
+        fieldQuoted.push_back(static_cast<uint8_t>(currentFieldQuoted ? 1 : 0));
     }
 
-    if (row.size() == 1 && row[0].empty() && !fieldQuoted[0] && !hadDelimiter) {
+    if (row.size() == 1 && row[0].empty() && fieldQuoted[0] == 0 && !hadDelimiter) {
         return {};
     }
 

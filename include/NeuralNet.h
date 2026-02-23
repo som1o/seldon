@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <random>
@@ -79,7 +80,7 @@ private:
         std::vector<double> m_weights, v_weights;
         std::vector<double> m_biases, v_biases;
         
-        std::vector<bool> dropMask;
+        std::vector<uint8_t> dropMask;
         
         Activation activation; // Per-layer activation
     };

@@ -1,6 +1,7 @@
 #include "AutomationPipeline.h"
 
 #include "BenchmarkEngine.h"
+#include "CommonUtils.h"
 #include "GnuplotEngine.h"
 #include "MathUtils.h"
 #include "NeuralNet.h"
@@ -19,22 +20,19 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <cstdlib>
 
 namespace {
 std::string toFixed(double v, int prec = 4) {
     std::ostringstream os;
     os << std::fixed << std::setprecision(prec) << v;
     return os.str();
-}
-
-std::string toLowerCopy(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return s;
 }
 
 struct BivariateScoringPolicy {
@@ -137,7 +135,7 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
 
     auto pickLastNumeric = [&]() { return numeric.back(); };
 
-    std::string mode = toLowerCopy(config.targetStrategy);
+    std::string mode = CommonUtils::toLower(config.targetStrategy);
     if (mode == "quality") {
         choice.index = static_cast<int>(pickByQuality());
         choice.strategyUsed = "quality";
@@ -317,7 +315,7 @@ FeatureSelectionResult collectFeatureIndices(const TypedDataset& data,
     if (config.maxFeatureMissingRatio >= 0.0) {
         policies.push_back({"fixed", config.maxFeatureMissingRatio});
     } else {
-        std::string mode = toLowerCopy(config.featureStrategy);
+        std::string mode = CommonUtils::toLower(config.featureStrategy);
         if (mode == "adaptive") {
             policies.push_back({"adaptive", adaptiveThreshold});
         } else if (mode == "aggressive") {
@@ -389,8 +387,17 @@ FeatureSelectionResult collectFeatureIndices(const TypedDataset& data,
         }
     }
 
-    if (best.included.empty()) {
-        throw Seldon::ConfigurationException("No numeric input features available after exclusions");
+    if (best.included.empty() && !candidates.empty()) {
+        auto keep = std::max_element(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            if (a.absTargetCorr == b.absTargetCorr) return a.variance < b.variance;
+            return a.absTargetCorr < b.absTargetCorr;
+        });
+        if (keep != candidates.end()) {
+            best.included.push_back(static_cast<int>(keep->idx));
+            if (best.strategyUsed.empty()) best.strategyUsed = "fallback_single_feature";
+            if (best.missingThresholdUsed <= 0.0) best.missingThresholdUsed = 1.0;
+            best.droppedByMissingness.push_back("fallback retained: " + keep->name + " (no other usable numeric features)");
+        }
     }
     return best;
 }
@@ -425,10 +432,25 @@ struct NeuralAnalysis {
     double dropoutRate = 0.0;
     int earlyStoppingPatience = 0;
     std::string policyUsed;
+    size_t trainingRowsUsed = 0;
+    size_t trainingRowsTotal = 0;
     std::vector<double> trainLoss;
     std::vector<double> valLoss;
     std::vector<double> featureImportance;
 };
+
+using NumericStatsCache = std::unordered_map<size_t, ColumnStats>;
+
+NumericStatsCache buildNumericStatsCache(const TypedDataset& data) {
+    NumericStatsCache cache;
+    const auto numericIdx = data.numericColumnIndices();
+    cache.reserve(numericIdx.size());
+    for (size_t idx : numericIdx) {
+        const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
+        cache.emplace(idx, Statistics::calculateStats(vals));
+    }
+    return cache;
+}
 
 std::vector<double> normalizeNonNegative(const std::vector<double>& values) {
     std::vector<double> out(values.size(), 0.0);
@@ -448,18 +470,21 @@ std::vector<double> normalizeNonNegative(const std::vector<double>& values) {
 
 std::vector<double> computeFeatureTargetAbsCorr(const TypedDataset& data,
                                                 int targetIdx,
-                                                const std::vector<int>& featureIdx) {
+                                                const std::vector<int>& featureIdx,
+                                                const NumericStatsCache& statsCache) {
     std::vector<double> out(featureIdx.size(), 0.0);
     if (targetIdx < 0 || static_cast<size_t>(targetIdx) >= data.columns().size()) return out;
 
     const auto& y = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(targetIdx)].values);
-    ColumnStats yStats = Statistics::calculateStats(y);
+    const auto yIt = statsCache.find(static_cast<size_t>(targetIdx));
+    const ColumnStats yStats = (yIt != statsCache.end()) ? yIt->second : Statistics::calculateStats(y);
     for (size_t i = 0; i < featureIdx.size(); ++i) {
         int idx = featureIdx[i];
         if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
         if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
         const auto& x = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
-        ColumnStats xStats = Statistics::calculateStats(x);
+        auto xIt = statsCache.find(static_cast<size_t>(idx));
+        const ColumnStats xStats = (xIt != statsCache.end()) ? xIt->second : Statistics::calculateStats(x);
         out[i] = std::abs(MathUtils::calculatePearson(x, y, xStats, yStats).value_or(0.0));
     }
     return out;
@@ -478,32 +503,36 @@ std::vector<double> buildCoherentImportance(const TypedDataset& data,
                                             int targetIdx,
                                             const std::vector<int>& featureIdx,
                                             const NeuralAnalysis& neural,
-                                            const std::vector<BenchmarkResult>& benchmarks) {
+                                            const std::vector<BenchmarkResult>& benchmarks,
+                                            const AutoConfig& config,
+                                            const NumericStatsCache& statsCache) {
     std::vector<double> neuralNorm = normalizeNonNegative(neural.featureImportance);
-    std::vector<double> corrNorm = normalizeNonNegative(computeFeatureTargetAbsCorr(data, targetIdx, featureIdx));
+    std::vector<double> corrNorm = normalizeNonNegative(computeFeatureTargetAbsCorr(data, targetIdx, featureIdx, statsCache));
 
     if (neuralNorm.size() != corrNorm.size()) {
         return corrNorm.empty() ? neuralNorm : corrNorm;
     }
 
-    double neuralWeight = (data.rowCount() < 80) ? 0.55 : 0.70;
+    double neuralWeight = (data.rowCount() < 80)
+        ? config.tuning.coherenceWeightSmallDataset
+        : config.tuning.coherenceWeightRegularDataset;
     if (!neural.trainLoss.empty() && !neural.valLoss.empty()) {
-        double trainLast = std::max(neural.trainLoss.back(), 1e-12);
+        double trainLast = std::max(neural.trainLoss.back(), config.tuning.numericEpsilon);
         double valLast = std::max(neural.valLoss.back(), 0.0);
-        if (valLast > (1.5 * trainLast)) {
-            neuralWeight -= 0.20;
+        if (valLast > (config.tuning.coherenceOverfitPenaltyTrainRatio * trainLast)) {
+            neuralWeight -= config.tuning.coherencePenaltyStep;
         }
     }
 
     const double bestRmse = bestBenchmarkRmse(benchmarks);
     if (std::isfinite(bestRmse) && bestRmse >= 0.0 && !neural.valLoss.empty()) {
         double neuralValRmseApprox = std::sqrt(std::max(neural.valLoss.back(), 0.0));
-        if (neuralValRmseApprox > (1.5 * bestRmse)) {
-            neuralWeight -= 0.20;
+        if (neuralValRmseApprox > (config.tuning.coherenceBenchmarkPenaltyRatio * bestRmse)) {
+            neuralWeight -= config.tuning.coherencePenaltyStep;
         }
     }
 
-    neuralWeight = std::clamp(neuralWeight, 0.20, 0.85);
+    neuralWeight = std::clamp(neuralWeight, config.tuning.coherenceWeightMin, config.tuning.coherenceWeightMax);
     const double corrWeight = 1.0 - neuralWeight;
 
     std::vector<double> blended(neuralNorm.size(), 0.0);
@@ -534,23 +563,11 @@ struct NumericDetailedStats {
     size_t nonZero = 0;
 };
 
-double quantileSorted(const std::vector<double>& sorted, double q) {
-    if (sorted.empty()) return 0.0;
-    if (q <= 0.0) return sorted.front();
-    if (q >= 1.0) return sorted.back();
-    double pos = q * static_cast<double>(sorted.size() - 1);
-    size_t lo = static_cast<size_t>(std::floor(pos));
-    size_t hi = static_cast<size_t>(std::ceil(pos));
-    if (lo == hi) return sorted[lo];
-    double frac = pos - static_cast<double>(lo);
-    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
-}
-
-NumericDetailedStats detailedNumeric(const std::vector<double>& values) {
+NumericDetailedStats detailedNumeric(const std::vector<double>& values, const ColumnStats* precomputedStats = nullptr) {
     NumericDetailedStats out;
     if (values.empty()) return out;
 
-    ColumnStats st = Statistics::calculateStats(values);
+    ColumnStats st = precomputedStats ? *precomputedStats : Statistics::calculateStats(values);
     out.mean = st.mean;
     out.median = st.median;
     out.variance = st.variance;
@@ -562,13 +579,11 @@ NumericDetailedStats detailedNumeric(const std::vector<double>& values) {
     out.max = *std::max_element(values.begin(), values.end());
     out.range = out.max - out.min;
 
-    std::vector<double> sorted = values;
-    std::sort(sorted.begin(), sorted.end());
-    out.q1 = quantileSorted(sorted, 0.25);
-    out.q3 = quantileSorted(sorted, 0.75);
+    out.q1 = CommonUtils::quantileByNth(values, 0.25);
+    out.q3 = CommonUtils::quantileByNth(values, 0.75);
     out.iqr = out.q3 - out.q1;
-    out.p05 = quantileSorted(sorted, 0.05);
-    out.p95 = quantileSorted(sorted, 0.95);
+    out.p05 = CommonUtils::quantileByNth(values, 0.05);
+    out.p95 = CommonUtils::quantileByNth(values, 0.95);
 
     std::vector<double> absDev(values.size(), 0.0);
     for (size_t i = 0; i < values.size(); ++i) {
@@ -576,8 +591,7 @@ NumericDetailedStats detailedNumeric(const std::vector<double>& values) {
         out.sum += values[i];
         if (std::abs(values[i]) > 1e-12) out.nonZero++;
     }
-    std::sort(absDev.begin(), absDev.end());
-    out.mad = quantileSorted(absDev, 0.5);
+    out.mad = CommonUtils::quantileByNth(absDev, 0.5);
 
     if (std::abs(out.mean) > 1e-12) out.coeffVar = out.stddev / std::abs(out.mean);
     return out;
@@ -595,10 +609,10 @@ void cleanupOutputs(const AutoConfig& config) {
         "univariate.html",
         "bivariate.html",
         "seldon_model.seldon",
-        "univariate.txt",
-        "bivariate.txt",
-        "neural_synthesis.txt",
-        "final_analysis.txt"
+        "univariate.md",
+        "bivariate.md",
+        "neural_synthesis.md",
+        "final_analysis.md"
     };
 
     std::error_code ec;
@@ -611,7 +625,137 @@ void cleanupOutputs(const AutoConfig& config) {
     fs::create_directories(config.assetsDir, ec);
 }
 
-void addUnivariateDetailedSection(ReportEngine& report, const TypedDataset& data, const PreprocessReport& prep, bool verbose) {
+void validateExcludedColumns(const TypedDataset& data, const AutoConfig& config) {
+    for (const auto& ex : config.excludedColumns) {
+        if (data.findColumnIndex(ex) < 0) {
+            throw Seldon::ConfigurationException("Excluded column not found: " + ex);
+        }
+    }
+}
+
+struct TargetContext {
+    bool userProvidedTarget = false;
+    TargetChoice choice;
+    int targetIdx = -1;
+    TargetSemantics semantics;
+};
+
+TargetContext resolveTargetContext(const TypedDataset& data, const AutoConfig& config, AutoConfig& runCfg) {
+    TargetContext context;
+    context.userProvidedTarget = !config.targetColumn.empty();
+    context.choice = resolveTargetChoice(data, config);
+    context.targetIdx = context.choice.index;
+    context.semantics = inferTargetSemanticsRaw(data, context.targetIdx);
+    runCfg.targetColumn = data.columns()[context.targetIdx].name;
+
+    if (runCfg.verboseAnalysis) {
+        std::cout << "[Seldon][Target] "
+                  << (context.userProvidedTarget ? "Using user-selected target: " : "Auto-selected target: ")
+                  << runCfg.targetColumn
+                  << " (strategy=" << context.choice.strategyUsed << ")\n";
+    }
+
+    return context;
+}
+
+bool configurePlotAvailability(AutoConfig& runCfg, ReportEngine& univariate, const GnuplotEngine& plotterBivariate) {
+    const bool canPlot = plotterBivariate.isAvailable();
+    univariate.addParagraph(canPlot ? "Gnuplot detected." : "Gnuplot not available: plot generation skipped.");
+    if (!canPlot && (runCfg.plotUnivariate || runCfg.plotOverall || runCfg.plotBivariateSignificant)) {
+        runCfg.plotUnivariate = false;
+        runCfg.plotOverall = false;
+        runCfg.plotBivariateSignificant = false;
+        univariate.addParagraph("Requested plotting features were disabled because gnuplot is unavailable in PATH.");
+    }
+    return canPlot;
+}
+
+void addUnivariatePlots(ReportEngine& univariate,
+                        const TypedDataset& data,
+                        const AutoConfig& runCfg,
+                        bool canPlot,
+                        GnuplotEngine& plotterUnivariate) {
+    if (!(runCfg.plotUnivariate && canPlot)) {
+        univariate.addParagraph("Supervised setting disabled: univariate plots skipped.");
+        return;
+    }
+
+    univariate.addParagraph("Supervised setting enabled: univariate plots generated in a dedicated folder.");
+    if (runCfg.verboseAnalysis) {
+        std::cout << "[Seldon][Univariate] Generating supervised univariate plots...\n";
+    }
+
+    for (size_t idx : data.numericColumnIndices()) {
+        const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
+        std::string img = plotterUnivariate.histogram("uni_hist_" + std::to_string(idx), vals, "Histogram: " + data.columns()[idx].name);
+        if (!img.empty()) {
+            univariate.addImage("Histogram: " + data.columns()[idx].name, img);
+            if (runCfg.verboseAnalysis) std::cout << "[Seldon][Univariate] Plot generated: " << img << "\n";
+        }
+    }
+
+    for (size_t idx : data.categoricalColumnIndices()) {
+        const auto& vals = std::get<std::vector<std::string>>(data.columns()[idx].values);
+        std::map<std::string, size_t> freq;
+        for (const auto& v : vals) freq[v]++;
+        std::vector<std::pair<std::string, size_t>> top(freq.begin(), freq.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        if (top.size() > 12) top.resize(12);
+        std::vector<std::string> labels;
+        std::vector<double> counts;
+        for (const auto& kv : top) {
+            labels.push_back(kv.first);
+            counts.push_back(static_cast<double>(kv.second));
+        }
+        std::string img = plotterUnivariate.bar("uni_cat_" + std::to_string(idx), labels, counts, "Category Frequencies: " + data.columns()[idx].name);
+        if (!img.empty()) {
+            univariate.addImage("Category Plot: " + data.columns()[idx].name, img);
+            if (runCfg.verboseAnalysis) std::cout << "[Seldon][Univariate] Plot generated: " << img << "\n";
+        }
+    }
+}
+
+void saveGeneratedReports(const AutoConfig& runCfg,
+                          const ReportEngine& univariate,
+                          const ReportEngine& bivariate,
+                          const ReportEngine& neuralReport,
+                          const ReportEngine& finalAnalysis) {
+    univariate.save("univariate.md");
+    bivariate.save("bivariate.md");
+    neuralReport.save(runCfg.reportFile);
+    finalAnalysis.save("final_analysis.md");
+
+    if (runCfg.generateHtml) {
+        const std::vector<std::pair<std::string, std::string>> conversions = {
+            {"univariate.md", "univariate.html"},
+            {"bivariate.md", "bivariate.html"},
+            {runCfg.reportFile, "neural_synthesis.html"},
+            {"final_analysis.md", "final_analysis.html"}
+        };
+        for (const auto& [src, dst] : conversions) {
+            const std::string cmd = "pandoc \"" + src + "\" -o \"" + dst + "\" --standalone --self-contained > /dev/null 2>&1";
+            std::system(cmd.c_str());
+        }
+    }
+}
+
+void printPipelineCompletion(const AutoConfig& runCfg) {
+    std::cout << "[Seldon] Automated pipeline complete.\n";
+    std::cout << "[Seldon] Reports: univariate.md, bivariate.md, " << runCfg.reportFile << ", final_analysis.md\n";
+    if (runCfg.generateHtml) {
+        std::cout << "[Seldon] HTML reports (self-contained): univariate.html, bivariate.html, neural_synthesis.html, final_analysis.html\n";
+    }
+    std::cout << "[Seldon] Plot folders: "
+              << plotSubdir(runCfg, "univariate") << ", "
+              << plotSubdir(runCfg, "bivariate") << ", "
+              << plotSubdir(runCfg, "overall") << "\n";
+}
+
+void addUnivariateDetailedSection(ReportEngine& report,
+                                  const TypedDataset& data,
+                                  const PreprocessReport& prep,
+                                  bool verbose,
+                                  const NumericStatsCache& statsCache) {
     std::vector<std::vector<std::string>> summaryRows;
     std::vector<std::vector<std::string>> categoricalRows;
     summaryRows.reserve(data.colCount());
@@ -626,7 +770,10 @@ void addUnivariateDetailedSection(ReportEngine& report, const TypedDataset& data
 
         if (col.type == ColumnType::NUMERIC) {
             const auto& vals = std::get<std::vector<double>>(col.values);
-            NumericDetailedStats st = detailedNumeric(vals);
+            int idx = data.findColumnIndex(col.name);
+            const auto it = (idx >= 0) ? statsCache.find(static_cast<size_t>(idx)) : statsCache.end();
+            const ColumnStats* precomputed = (it != statsCache.end()) ? &it->second : nullptr;
+            NumericDetailedStats st = detailedNumeric(vals, precomputed);
 
             summaryRows.push_back({
                 col.name,
@@ -776,12 +923,68 @@ void addBenchmarkSection(ReportEngine& report, const std::vector<BenchmarkResult
     report.addTable("Baseline Benchmark (k-fold)", {"Rank", "Model", "RMSE", "R2", "Accuracy"}, benchRows);
 }
 
+void addDatasetHealthTable(ReportEngine& report, const TypedDataset& data, const PreprocessReport& prep) {
+    size_t totalMissing = 0;
+    size_t totalOutliers = 0;
+    for (const auto& kv : prep.missingCounts) totalMissing += kv.second;
+    for (const auto& kv : prep.outlierCounts) totalOutliers += kv.second;
+
+    report.addTable("Dataset Health", {"Metric", "Value"}, {
+        {"Rows", std::to_string(data.rowCount())},
+        {"Columns", std::to_string(data.colCount())},
+        {"Numeric Columns", std::to_string(data.numericColumnIndices().size())},
+        {"Categorical Columns", std::to_string(data.categoricalColumnIndices().size())},
+        {"Datetime Columns", std::to_string(data.datetimeColumnIndices().size())},
+        {"Total Missing Cells", std::to_string(totalMissing)},
+        {"Total Outlier Flags", std::to_string(totalOutliers)}
+    });
+}
+
+void addNeuralLossSummaryTable(ReportEngine& report, const NeuralAnalysis& neural) {
+    std::vector<std::vector<std::string>> lossSummary;
+    if (!neural.trainLoss.empty()) {
+        double minTrain = *std::min_element(neural.trainLoss.begin(), neural.trainLoss.end());
+        double maxTrain = *std::max_element(neural.trainLoss.begin(), neural.trainLoss.end());
+        double endTrain = neural.trainLoss.back();
+        lossSummary.push_back({"train", toFixed(minTrain, 6), toFixed(maxTrain, 6), toFixed(endTrain, 6)});
+    }
+    if (!neural.valLoss.empty()) {
+        double minVal = *std::min_element(neural.valLoss.begin(), neural.valLoss.end());
+        double maxVal = *std::max_element(neural.valLoss.begin(), neural.valLoss.end());
+        double endVal = neural.valLoss.back();
+        lossSummary.push_back({"validation", toFixed(minVal, 6), toFixed(maxVal, 6), toFixed(endVal, 6)});
+    }
+    if (!lossSummary.empty()) {
+        report.addTable("Neural Loss Summary", {"Series", "Min", "Max", "Final"}, lossSummary);
+    }
+}
+
 NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
                                  int targetIdx,
                                  const std::vector<int>& featureIdx,
                                  bool binaryTarget,
                                  bool verbose,
-                                 const AutoConfig& config) {
+                                 const AutoConfig& config,
+                                 bool fastModeEnabled,
+                                 size_t fastSampleRows) {
+    NeuralAnalysis analysis;
+    analysis.inputNodes = featureIdx.size();
+    analysis.outputNodes = 1;
+    analysis.binaryTarget = binaryTarget;
+    analysis.outputActivation = binaryTarget ? "sigmoid" : "linear";
+    analysis.trainingRowsTotal = data.rowCount();
+
+    if (featureIdx.empty()) {
+        analysis.policyUsed = "none_no_features";
+        return analysis;
+    }
+    if (data.rowCount() < 2) {
+        analysis.policyUsed = "none_too_few_rows";
+        analysis.featureImportance.assign(featureIdx.size(), 0.0);
+        analysis.trainingRowsUsed = data.rowCount();
+        return analysis;
+    }
+
     const auto& y = std::get<std::vector<double>>(data.columns()[targetIdx].values);
 
     std::vector<std::vector<double>> Xnn(data.rowCount(), std::vector<double>(featureIdx.size(), 0.0));
@@ -825,7 +1028,14 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         {"expressive", {"expressive", 1.45, 1.45, 0.04, 0.75, 5}},
     };
 
-    std::string requested = toLowerCopy(config.neuralStrategy);
+    std::string requested = CommonUtils::toLower(config.neuralStrategy);
+    if (requested == "none") {
+        analysis.hiddenNodes = 0;
+        analysis.policyUsed = "none";
+        analysis.featureImportance.assign(featureIdx.size(), 0.0);
+        analysis.trainingRowsUsed = data.rowCount();
+        return analysis;
+    }
     std::string policyName = requested;
     if (requested == "auto") {
         double complexity = std::log1p(static_cast<double>(data.rowCount())) * std::sqrt(static_cast<double>(std::max<size_t>(1, inputNodes)));
@@ -834,7 +1044,26 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         else policyName = "balanced";
     }
     if (registry.find(policyName) == registry.end()) policyName = "balanced";
+    if (fastModeEnabled) policyName = "fast";
     const NeuralPolicy& policy = registry.at(policyName);
+
+    if (fastModeEnabled && Xnn.size() > fastSampleRows) {
+        std::vector<size_t> order(Xnn.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::mt19937 rng(config.neuralSeed ^ 0x9e3779b9U);
+        std::shuffle(order.begin(), order.end(), rng);
+
+        std::vector<std::vector<double>> sampledX;
+        std::vector<std::vector<double>> sampledY;
+        sampledX.reserve(fastSampleRows);
+        sampledY.reserve(fastSampleRows);
+        for (size_t i = 0; i < fastSampleRows; ++i) {
+            sampledX.push_back(std::move(Xnn[order[i]]));
+            sampledY.push_back(std::move(Ynn[order[i]]));
+        }
+        Xnn = std::move(sampledX);
+        Ynn = std::move(sampledY);
+    }
 
     size_t hidden = std::clamp<size_t>(static_cast<size_t>(std::llround(static_cast<double>(baseHidden) * policy.hiddenMultiplier)), 4, 96);
     size_t dynamicEpochs = std::clamp<size_t>(static_cast<size_t>(std::llround(static_cast<double>(baseEpochs) * policy.epochMultiplier)), 80, 420);
@@ -842,7 +1071,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     int dynamicPatience = std::clamp(basePatience + policy.patienceDelta, 6, 40);
     double dynamicDropout = std::clamp(baseDropout + policy.dropoutDelta, 0.0, 0.35);
 
-    if (data.rowCount() < 80) {
+    if (Xnn.size() < 80) {
         hidden = std::min<size_t>(hidden, 24);
         dynamicEpochs = std::min<size_t>(dynamicEpochs, 140);
         dynamicPatience = std::min(dynamicPatience, 8);
@@ -857,8 +1086,8 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     hp.lrStepSize = 50;
     hp.lrDecay = 0.5;
     hp.dropoutRate = dynamicDropout;
-    hp.valSplit = (data.rowCount() < 80) ? 0.30 : 0.20;
-    hp.l2Lambda = (data.rowCount() < 80) ? 0.010 : 0.001;
+    hp.valSplit = (Xnn.size() < 80) ? 0.30 : 0.20;
+    hp.l2Lambda = (Xnn.size() < 80) ? 0.010 : 0.001;
     hp.activation = NeuralNet::Activation::RELU;
     hp.outputActivation = binaryTarget ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
     hp.loss = binaryTarget ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
@@ -868,7 +1097,6 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
 
     nn.train(Xnn, Ynn, hp);
 
-    NeuralAnalysis analysis;
     analysis.inputNodes = inputNodes;
     analysis.hiddenNodes = hidden;
     analysis.outputNodes = outputNodes;
@@ -881,6 +1109,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     analysis.dropoutRate = hp.dropoutRate;
     analysis.earlyStoppingPatience = hp.earlyStoppingPatience;
     analysis.policyUsed = policy.name;
+    analysis.trainingRowsUsed = Xnn.size();
     analysis.trainLoss = nn.getTrainLossHistory();
     analysis.valLoss = nn.getValLossHistory();
     analysis.featureImportance = nn.calculateFeatureImportance(Xnn, Ynn, inputNodes > 10 ? 7 : 5);
@@ -894,7 +1123,7 @@ BivariateScoringPolicy chooseBivariatePolicy(const AutoConfig& config, const Neu
         {"importance_heavy", {"importance_heavy", 0.65, 0.20, 0.15, 0.65, 1.0, 0.70, 0.35}},
     };
 
-    std::string mode = toLowerCopy(config.bivariateStrategy);
+    std::string mode = CommonUtils::toLower(config.bivariateStrategy);
     auto applySelectionQuantileOverride = [&](BivariateScoringPolicy policy) {
         if (config.tuning.bivariateSelectionQuantileOverride >= 0.0 &&
             config.tuning.bivariateSelectionQuantileOverride <= 1.0) {
@@ -916,8 +1145,14 @@ BivariateScoringPolicy chooseBivariatePolicy(const AutoConfig& config, const Neu
     }
     double concentration = std::sqrt(sumImpSq);
 
-    if (maxImp > 0.65 || concentration > 0.55) return applySelectionQuantileOverride(registry.at("corr_heavy"));
-    if (maxImp < 0.30 && concentration < 0.40) return applySelectionQuantileOverride(registry.at("importance_heavy"));
+    if (maxImp > config.tuning.corrHeavyMaxImportanceThreshold ||
+        concentration > config.tuning.corrHeavyConcentrationThreshold) {
+        return applySelectionQuantileOverride(registry.at("corr_heavy"));
+    }
+    if (maxImp < config.tuning.importanceHeavyMaxImportanceThreshold &&
+        concentration < config.tuning.importanceHeavyConcentrationThreshold) {
+        return applySelectionQuantileOverride(registry.at("importance_heavy"));
+    }
     return applySelectionQuantileOverride(registry.at("balanced"));
 }
 
@@ -926,25 +1161,54 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                                                const std::unordered_set<size_t>& modeledIndices,
                                                const BivariateScoringPolicy& policy,
                                                GnuplotEngine* plotter,
-                                               bool verbose) {
+                                               bool verbose,
+                                               const NumericStatsCache& statsCache,
+                                               double numericEpsilon,
+                                               size_t maxPairs) {
     std::vector<PairInsight> pairs;
     const auto numericIdx = data.numericColumnIndices();
     const size_t n = data.rowCount();
-    std::vector<ColumnStats> cachedStats(numericIdx.size());
-    for (size_t i = 0; i < numericIdx.size(); ++i) {
-        const auto& vals = std::get<std::vector<double>>(data.columns()[numericIdx[i]].values);
-        cachedStats[i] = Statistics::calculateStats(vals);
+    std::vector<size_t> evalNumericIdx = numericIdx;
+
+    const size_t totalPairs = numericIdx.size() < 2 ? 0 : (numericIdx.size() * (numericIdx.size() - 1)) / 2;
+    if (maxPairs > 0 && totalPairs > maxPairs) {
+        std::vector<std::pair<size_t, double>> ranked;
+        ranked.reserve(numericIdx.size());
+        for (size_t idx : numericIdx) {
+            double imp = 0.0;
+            auto it = importanceByIndex.find(idx);
+            if (it != importanceByIndex.end()) imp = it->second;
+            double modeledBoost = (modeledIndices.find(idx) != modeledIndices.end()) ? 0.25 : 0.0;
+            ranked.push_back({idx, imp + modeledBoost});
+        }
+        std::sort(ranked.begin(), ranked.end(), [&](const auto& a, const auto& b) {
+            if (a.second == b.second) return data.columns()[a.first].name < data.columns()[b.first].name;
+            return a.second > b.second;
+        });
+
+        const size_t keepColumns = std::clamp<size_t>(
+            static_cast<size_t>(std::floor((1.0 + std::sqrt(1.0 + 8.0 * static_cast<double>(maxPairs))) / 2.0)),
+            2,
+            ranked.size());
+        evalNumericIdx.clear();
+        evalNumericIdx.reserve(keepColumns);
+        for (size_t i = 0; i < keepColumns; ++i) {
+            evalNumericIdx.push_back(ranked[i].first);
+        }
     }
 
     if (verbose) {
-        size_t totalPairs = numericIdx.size() < 2 ? 0 : (numericIdx.size() * (numericIdx.size() - 1)) / 2;
-        std::cout << "[Seldon][Bivariate] Evaluating " << totalPairs << " pair combinations with policy '" << policy.name << "'...\n";
+        size_t activePairs = evalNumericIdx.size() < 2 ? 0 : (evalNumericIdx.size() * (evalNumericIdx.size() - 1)) / 2;
+        std::cout << "[Seldon][Bivariate] Evaluating " << activePairs << " pair combinations with policy '" << policy.name << "'";
+        if (activePairs < totalPairs) {
+            std::cout << " (fast cap from " << totalPairs << ")";
+        }
+        std::cout << "...\n";
     }
 
-    for (size_t aPos = 0; aPos < numericIdx.size(); ++aPos) {
-        for (size_t bPos = aPos + 1; bPos < numericIdx.size(); ++bPos) {
-            size_t ia = numericIdx[aPos];
-            size_t ib = numericIdx[bPos];
+    auto buildPair = [&](size_t aPos, size_t bPos) {
+            size_t ia = evalNumericIdx[aPos];
+            size_t ib = evalNumericIdx[bPos];
             const auto& va = std::get<std::vector<double>>(data.columns()[ia].values);
             const auto& vb = std::get<std::vector<double>>(data.columns()[ib].values);
 
@@ -953,8 +1217,12 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             p.idxB = ib;
             p.featureA = data.columns()[ia].name;
             p.featureB = data.columns()[ib].name;
-            const ColumnStats& statsA = cachedStats[aPos];
-            const ColumnStats& statsB = cachedStats[bPos];
+            auto aIt = statsCache.find(ia);
+            auto bIt = statsCache.find(ib);
+            ColumnStats statsAFallback = Statistics::calculateStats(va);
+            ColumnStats statsBFallback = Statistics::calculateStats(vb);
+            const ColumnStats& statsA = (aIt != statsCache.end()) ? aIt->second : statsAFallback;
+            const ColumnStats& statsB = (bIt != statsCache.end()) ? bIt->second : statsBFallback;
             p.r = MathUtils::calculatePearson(va, vb, statsA, statsB).value_or(0.0);
             p.r2 = p.r * p.r;
             // Keep regression parameter derivation centralized in MathUtils.
@@ -975,22 +1243,47 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             if (itb != importanceByIndex.end()) impB = itb->second;
             double impScore = std::clamp((impA + impB) / 2.0, 0.0, 1.0);
             double corrScore = std::clamp(std::abs(p.r), 0.0, 1.0);
-            double sigScore = std::clamp(-std::log10(std::max(p.pValue, 1e-12)) / 12.0, 0.0, 1.0);
+            double sigScore = std::clamp(-std::log10(std::max(p.pValue, numericEpsilon)) / 12.0, 0.0, 1.0);
             bool aModeled = modeledIndices.find(ia) != modeledIndices.end();
             bool bModeled = modeledIndices.find(ib) != modeledIndices.end();
             double coverageFactor = (aModeled && bModeled) ? policy.coverageBoth : ((aModeled || bModeled) ? policy.coverageOne : policy.coverageNone);
             p.neuralScore = (policy.wImportance * impScore + policy.wCorrelation * corrScore + policy.wSignificance * sigScore) * coverageFactor;
 
-            pairs.push_back(std::move(p));
+            return p;
+    };
 
-            if (verbose) {
-                const auto& ref = pairs.back();
-                std::cout << "[Seldon][Bivariate] " << ref.featureA << " vs " << ref.featureB
-                          << " | r=" << toFixed(ref.r, 6)
-                          << " p=" << toFixed(ref.pValue, 8)
-                          << " t=" << toFixed(ref.tStat, 6)
-                          << " neural=" << toFixed(ref.neuralScore, 8) << "\n";
+    if (verbose) {
+        for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
+            for (size_t bPos = aPos + 1; bPos < evalNumericIdx.size(); ++bPos) {
+                PairInsight p = buildPair(aPos, bPos);
+                std::cout << "[Seldon][Bivariate] " << p.featureA << " vs " << p.featureB
+                          << " | r=" << toFixed(p.r, 6)
+                          << " p=" << toFixed(p.pValue, 8)
+                          << " t=" << toFixed(p.tStat, 6)
+                          << " neural=" << toFixed(p.neuralScore, 8) << "\n";
+                pairs.push_back(std::move(p));
             }
+        }
+    } else {
+        #ifdef USE_OPENMP
+        #pragma omp parallel
+        #endif
+        {
+            std::vector<PairInsight> localPairs;
+
+            #ifdef USE_OPENMP
+            #pragma omp for schedule(dynamic)
+            #endif
+            for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
+                for (size_t bPos = aPos + 1; bPos < evalNumericIdx.size(); ++bPos) {
+                    localPairs.push_back(buildPair(aPos, bPos));
+                }
+            }
+
+            #ifdef USE_OPENMP
+            #pragma omp critical
+            #endif
+            pairs.insert(pairs.end(), localPairs.begin(), localPairs.end());
         }
     }
 
@@ -1037,42 +1330,13 @@ void addOverallSections(ReportEngine& report,
                         const NeuralAnalysis& neural,
                         GnuplotEngine* overallPlotter,
                         bool canPlotOverall,
-                        bool verbose) {
+                        bool verbose,
+                        const NumericStatsCache& statsCache) {
     report.addParagraph("Overall analysis aggregates dataset health, model baselines, neural training behavior, and optional global visual diagnostics.");
-
-    size_t totalMissing = 0;
-    size_t totalOutliers = 0;
-    for (const auto& kv : prep.missingCounts) totalMissing += kv.second;
-    for (const auto& kv : prep.outlierCounts) totalOutliers += kv.second;
-
-    report.addTable("Dataset Health", {"Metric", "Value"}, {
-        {"Rows", std::to_string(data.rowCount())},
-        {"Columns", std::to_string(data.colCount())},
-        {"Numeric Columns", std::to_string(data.numericColumnIndices().size())},
-        {"Categorical Columns", std::to_string(data.categoricalColumnIndices().size())},
-        {"Datetime Columns", std::to_string(data.datetimeColumnIndices().size())},
-        {"Total Missing Cells", std::to_string(totalMissing)},
-        {"Total Outlier Flags", std::to_string(totalOutliers)}
-    });
+    addDatasetHealthTable(report, data, prep);
 
     addBenchmarkSection(report, benchmarks);
-
-    std::vector<std::vector<std::string>> lossSummary;
-    if (!neural.trainLoss.empty()) {
-        double minTrain = *std::min_element(neural.trainLoss.begin(), neural.trainLoss.end());
-        double maxTrain = *std::max_element(neural.trainLoss.begin(), neural.trainLoss.end());
-        double endTrain = neural.trainLoss.back();
-        lossSummary.push_back({"train", toFixed(minTrain, 6), toFixed(maxTrain, 6), toFixed(endTrain, 6)});
-    }
-    if (!neural.valLoss.empty()) {
-        double minVal = *std::min_element(neural.valLoss.begin(), neural.valLoss.end());
-        double maxVal = *std::max_element(neural.valLoss.begin(), neural.valLoss.end());
-        double endVal = neural.valLoss.back();
-        lossSummary.push_back({"validation", toFixed(minVal, 6), toFixed(maxVal, 6), toFixed(endVal, 6)});
-    }
-    if (!lossSummary.empty()) {
-        report.addTable("Neural Loss Summary", {"Series", "Min", "Max", "Final"}, lossSummary);
-    }
+    addNeuralLossSummaryTable(report, neural);
 
     if (overallPlotter && canPlotOverall) {
         std::vector<std::string> labels;
@@ -1088,16 +1352,17 @@ void addOverallSections(ReportEngine& report,
         auto numericIdx = data.numericColumnIndices();
         if (numericIdx.size() >= 2) {
             std::vector<std::vector<double>> corr(numericIdx.size(), std::vector<double>(numericIdx.size(), 1.0));
-            std::vector<ColumnStats> cachedStats(numericIdx.size());
-            for (size_t i = 0; i < numericIdx.size(); ++i) {
-                const auto& col = std::get<std::vector<double>>(data.columns()[numericIdx[i]].values);
-                cachedStats[i] = Statistics::calculateStats(col);
-            }
             for (size_t i = 0; i < numericIdx.size(); ++i) {
                 for (size_t j = i + 1; j < numericIdx.size(); ++j) {
                     const auto& a = std::get<std::vector<double>>(data.columns()[numericIdx[i]].values);
                     const auto& b = std::get<std::vector<double>>(data.columns()[numericIdx[j]].values);
-                    double r = MathUtils::calculatePearson(a, b, cachedStats[i], cachedStats[j]).value_or(0.0);
+                    auto ai = statsCache.find(numericIdx[i]);
+                    auto bi = statsCache.find(numericIdx[j]);
+                    ColumnStats aFallback = Statistics::calculateStats(a);
+                    ColumnStats bFallback = Statistics::calculateStats(b);
+                    const ColumnStats& sa = (ai != statsCache.end()) ? ai->second : aFallback;
+                    const ColumnStats& sb = (bi != statsCache.end()) ? bi->second : bFallback;
+                    double r = MathUtils::calculatePearson(a, b, sa, sb).value_or(0.0);
                     corr[i][j] = r;
                     corr[j][i] = r;
                 }
@@ -1132,6 +1397,11 @@ int AutomationPipeline::run(const AutoConfig& config) {
     runCfg.plot.format = "png";
 
     cleanupOutputs(runCfg);
+    MathUtils::setSignificanceAlpha(runCfg.tuning.significanceAlpha);
+    MathUtils::setNumericTuning(runCfg.tuning.numericEpsilon,
+                                runCfg.tuning.betaFallbackIntervalsStart,
+                                runCfg.tuning.betaFallbackIntervalsMax,
+                                runCfg.tuning.betaFallbackTolerance);
 
     TypedDataset data(config.datasetPath, config.delimiter);
     data.load();
@@ -1139,27 +1409,19 @@ int AutomationPipeline::run(const AutoConfig& config) {
         throw Seldon::DatasetException("Dataset has no usable rows/columns");
     }
 
-    for (const auto& ex : config.excludedColumns) {
-        if (data.findColumnIndex(ex) < 0) {
-            throw Seldon::ConfigurationException("Excluded column not found: " + ex);
-        }
-    }
+    validateExcludedColumns(data, config);
+    const TargetContext targetContext = resolveTargetContext(data, config, runCfg);
+    const int targetIdx = targetContext.targetIdx;
 
-    bool userProvidedTarget = !config.targetColumn.empty();
-    TargetChoice targetChoice = resolveTargetChoice(data, config);
-    int targetIdx = targetChoice.index;
-    TargetSemantics targetSemantics = inferTargetSemanticsRaw(data, targetIdx);
-    runCfg.targetColumn = data.columns()[targetIdx].name;
-
-    if (runCfg.verboseAnalysis) {
-        std::cout << "[Seldon][Target] "
-                  << (userProvidedTarget ? "Using user-selected target: " : "Auto-selected target: ")
-                  << runCfg.targetColumn
-                  << " (strategy=" << targetChoice.strategyUsed << ")\n";
+    const bool autoFastMode = (data.rowCount() > 100000) || (data.numericColumnIndices().size() > 50);
+    const bool fastModeEnabled = runCfg.fastMode || autoFastMode;
+    if (fastModeEnabled && CommonUtils::toLower(runCfg.neuralStrategy) == "auto") {
+        runCfg.neuralStrategy = "fast";
     }
 
     PreprocessReport prep = Preprocessor::run(data, runCfg);
-    normalizeBinaryTarget(data, targetIdx, targetSemantics);
+    normalizeBinaryTarget(data, targetIdx, targetContext.semantics);
+    const NumericStatsCache statsCache = buildNumericStatsCache(data);
 
     if (runCfg.verboseAnalysis) {
         std::cout << "[Seldon][Univariate] Preparing deeply detailed univariate analysis...\n";
@@ -1169,51 +1431,13 @@ int AutomationPipeline::run(const AutoConfig& config) {
     univariate.addTitle("Univariate Analysis");
     univariate.addParagraph("Dataset: " + runCfg.datasetPath);
     univariate.addParagraph("Rows: " + std::to_string(data.rowCount()) + " | Columns: " + std::to_string(data.colCount()));
-    addUnivariateDetailedSection(univariate, data, prep, runCfg.verboseAnalysis);
+    addUnivariateDetailedSection(univariate, data, prep, runCfg.verboseAnalysis, statsCache);
 
     GnuplotEngine plotterBivariate(plotSubdir(runCfg, "bivariate"), runCfg.plot);
     GnuplotEngine plotterUnivariate(plotSubdir(runCfg, "univariate"), runCfg.plot);
     GnuplotEngine plotterOverall(plotSubdir(runCfg, "overall"), runCfg.plot);
-    bool canPlot = plotterBivariate.isAvailable();
-    univariate.addParagraph(canPlot ? "Gnuplot detected." : "Gnuplot not available: plot generation skipped.");
-
-    if (runCfg.plotUnivariate && canPlot) {
-        univariate.addParagraph("Supervised setting enabled: univariate plots generated in a dedicated folder.");
-        if (runCfg.verboseAnalysis) {
-            std::cout << "[Seldon][Univariate] Generating supervised univariate plots...\n";
-        }
-
-        for (size_t idx : data.numericColumnIndices()) {
-            const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
-            std::string img = plotterUnivariate.histogram("uni_hist_" + std::to_string(idx), vals, "Histogram: " + data.columns()[idx].name);
-            if (!img.empty()) {
-                univariate.addImage("Histogram: " + data.columns()[idx].name, img);
-                if (runCfg.verboseAnalysis) std::cout << "[Seldon][Univariate] Plot generated: " << img << "\n";
-            }
-        }
-
-        for (size_t idx : data.categoricalColumnIndices()) {
-            const auto& vals = std::get<std::vector<std::string>>(data.columns()[idx].values);
-            std::map<std::string, size_t> freq;
-            for (const auto& v : vals) freq[v]++;
-            std::vector<std::pair<std::string, size_t>> top(freq.begin(), freq.end());
-            std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-            if (top.size() > 12) top.resize(12);
-            std::vector<std::string> labels;
-            std::vector<double> counts;
-            for (const auto& kv : top) {
-                labels.push_back(kv.first);
-                counts.push_back(static_cast<double>(kv.second));
-            }
-            std::string img = plotterUnivariate.bar("uni_cat_" + std::to_string(idx), labels, counts, "Category Frequencies: " + data.columns()[idx].name);
-            if (!img.empty()) {
-                univariate.addImage("Category Plot: " + data.columns()[idx].name, img);
-                if (runCfg.verboseAnalysis) std::cout << "[Seldon][Univariate] Plot generated: " << img << "\n";
-            }
-        }
-    } else {
-        univariate.addParagraph("Supervised setting disabled: univariate plots skipped.");
-    }
+    const bool canPlot = configurePlotAvailability(runCfg, univariate, plotterBivariate);
+    addUnivariatePlots(univariate, data, runCfg, canPlot, plotterUnivariate);
 
     FeatureSelectionResult selectedFeatures = collectFeatureIndices(data, targetIdx, runCfg, prep);
     std::vector<int> featureIdx = selectedFeatures.included;
@@ -1227,13 +1451,20 @@ int AutomationPipeline::run(const AutoConfig& config) {
         }
     }
 
-    auto benchmarks = BenchmarkEngine::run(data, targetIdx, featureIdx, runCfg.kfold);
+    auto benchmarks = BenchmarkEngine::run(data, targetIdx, featureIdx, runCfg.kfold, runCfg.benchmarkSeed);
 
     if (runCfg.verboseAnalysis) {
         std::cout << "[Seldon][Neural] Starting neural lattice training with verbose trace...\n";
     }
-    NeuralAnalysis neural = runNeuralAnalysis(data, targetIdx, featureIdx, targetSemantics.isBinary, runCfg.verboseAnalysis, runCfg);
-    neural.featureImportance = buildCoherentImportance(data, targetIdx, featureIdx, neural, benchmarks);
+    NeuralAnalysis neural = runNeuralAnalysis(data,
+                                              targetIdx,
+                                              featureIdx,
+                                              targetContext.semantics.isBinary,
+                                              runCfg.verboseAnalysis,
+                                              runCfg,
+                                              fastModeEnabled,
+                                              runCfg.fastNeuralSampleRows);
+    neural.featureImportance = buildCoherentImportance(data, targetIdx, featureIdx, neural, benchmarks, runCfg, statsCache);
     BivariateScoringPolicy bivariatePolicy = chooseBivariatePolicy(runCfg, neural);
 
     std::unordered_map<size_t, double> importanceByIndex;
@@ -1257,11 +1488,26 @@ int AutomationPipeline::run(const AutoConfig& config) {
     for (int idx : featureIdx) modeledIndices.insert(static_cast<size_t>(idx));
 
     GnuplotEngine* bivariatePlotter = (canPlot && runCfg.plotBivariateSignificant) ? &plotterBivariate : nullptr;
-    auto bivariatePairs = analyzeBivariatePairs(data, importanceByIndex, modeledIndices, bivariatePolicy, bivariatePlotter, runCfg.verboseAnalysis);
+    const size_t totalPossiblePairs = numeric.size() < 2
+        ? 0
+        : (numeric.size() * (numeric.size() - 1)) / 2;
+    auto bivariatePairs = analyzeBivariatePairs(data,
+                                                importanceByIndex,
+                                                modeledIndices,
+                                                bivariatePolicy,
+                                                bivariatePlotter,
+                                                runCfg.verboseAnalysis,
+                                                statsCache,
+                                                runCfg.tuning.numericEpsilon,
+                                                fastModeEnabled ? runCfg.fastMaxBivariatePairs : 0);
 
     ReportEngine bivariate;
     bivariate.addTitle("Bivariate Analysis");
-    bivariate.addParagraph("All numeric pair combinations are included below (nC2). Significant table is dynamically filtered using statistical significance + neural relevance score.");
+    if (totalPossiblePairs > bivariatePairs.size()) {
+        bivariate.addParagraph("Fast mode active: pair evaluation was capped for runtime safety. Results below cover the highest-priority numeric columns only.");
+    } else {
+        bivariate.addParagraph("All numeric pair combinations are included below (nC2). Significant table is dynamically filtered using statistical significance + neural relevance score.");
+    }
     bivariate.addParagraph("Neural-lattice significance score drives final pair selection; only selected pairs are considered significant findings.");
 
     std::vector<std::vector<std::string>> allRows;
@@ -1304,7 +1550,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     bivariate.addParagraph("Total pairs evaluated: " + std::to_string(allRows.size()));
-    bivariate.addParagraph("Statistically significant pairs (p<0.05): " + std::to_string(statSigCount));
+    bivariate.addParagraph("Statistically significant pairs (p<" + toFixed(MathUtils::getSignificanceAlpha(), 4) + "): " + std::to_string(statSigCount));
     bivariate.addParagraph("Final neural-selected significant pairs: " + std::to_string(sigRows.size()));
     bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "plot"}, allRows);
     bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "plot"}, sigRows);
@@ -1312,16 +1558,18 @@ int AutomationPipeline::run(const AutoConfig& config) {
     ReportEngine neuralReport;
     neuralReport.addTitle("Neural Synthesis");
     neuralReport.addParagraph("This synthesis captures detailed lattice training traces and how neural relevance influenced bivariate selection.");
-    neuralReport.addParagraph(std::string("Task type inferred from target: ") + (targetSemantics.isBinary ? "binary_classification" : "regression"));
+    neuralReport.addParagraph(std::string("Task type inferred from target: ") + (targetContext.semantics.isBinary ? "binary_classification" : "regression"));
     neuralReport.addTable("Auto Decision Log", {"Decision", "Value"}, {
-        {"Target Selection", userProvidedTarget ? "user-specified" : "auto"},
-        {"Target Strategy", targetChoice.strategyUsed},
+        {"Target Selection", targetContext.userProvidedTarget ? "user-specified" : "auto"},
+        {"Target Strategy", targetContext.choice.strategyUsed},
         {"Target Column", runCfg.targetColumn},
         {"Feature Strategy", selectedFeatures.strategyUsed},
         {"Feature Missingness Threshold", toFixed(selectedFeatures.missingThresholdUsed, 4)},
         {"Features Retained", std::to_string(featureIdx.size())},
         {"Sparse Features Dropped", std::to_string(selectedFeatures.droppedByMissingness.size())},
         {"Neural Strategy", neural.policyUsed},
+        {"Fast Mode", fastModeEnabled ? "enabled" : "disabled"},
+        {"Neural Training Rows Used", std::to_string(neural.trainingRowsUsed) + " / " + std::to_string(neural.trainingRowsTotal)},
         {"Bivariate Strategy", bivariatePolicy.name}
     });
     if (!selectedFeatures.droppedByMissingness.empty()) {
@@ -1362,7 +1610,15 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
     neuralReport.addTable("Neural Lattice Training Trace", {"Epoch", "Train Loss", "Validation Loss"}, lossRows);
 
-    addOverallSections(neuralReport, data, prep, benchmarks, neural, &plotterOverall, canPlot && runCfg.plotOverall, runCfg.verboseAnalysis);
+    addOverallSections(neuralReport,
+                       data,
+                       prep,
+                       benchmarks,
+                       neural,
+                       &plotterOverall,
+                       canPlot && runCfg.plotOverall,
+                       runCfg.verboseAnalysis,
+                       statsCache);
 
     ReportEngine finalAnalysis;
     finalAnalysis.addTitle("Final Analysis - Significant Findings Only");
@@ -1391,17 +1647,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Training Epochs Executed", std::to_string(neural.trainLoss.size())}
     });
 
-    univariate.save("univariate.txt");
-    bivariate.save("bivariate.txt");
-    neuralReport.save(runCfg.reportFile);
-    finalAnalysis.save("final_analysis.txt");
-
-    std::cout << "[Seldon] Automated pipeline complete.\n";
-    std::cout << "[Seldon] Reports: univariate.txt, bivariate.txt, " << runCfg.reportFile << ", final_analysis.txt\n";
-    std::cout << "[Seldon] Plot folders: "
-              << plotSubdir(runCfg, "univariate") << ", "
-              << plotSubdir(runCfg, "bivariate") << ", "
-              << plotSubdir(runCfg, "overall") << "\n";
+    saveGeneratedReports(runCfg, univariate, bivariate, neuralReport, finalAnalysis);
+    printPipelineCompletion(runCfg);
 
     return 0;
 }

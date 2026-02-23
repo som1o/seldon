@@ -7,12 +7,13 @@
 
 enum class ColumnType { NUMERIC, CATEGORICAL, DATETIME };
 using ColumnStorage = std::variant<std::vector<double>, std::vector<std::string>, std::vector<int64_t>>;
+using MissingMask = std::vector<uint8_t>;
 
 struct TypedColumn {
     std::string name;
     ColumnType type = ColumnType::CATEGORICAL;
     ColumnStorage values = std::vector<std::string>{};
-    std::vector<bool> missing;
+    MissingMask missing;
 };
 
 class TypedDataset {
@@ -47,7 +48,7 @@ public:
      * @post All typed columns keep row alignment after filtering.
      * @throws Seldon::DatasetException when mask size mismatches row count.
      */
-    void removeRows(const std::vector<bool>& keepMask);
+    void removeRows(const MissingMask& keepMask);
 
 private:
     std::string filename_;
@@ -58,5 +59,4 @@ private:
     std::vector<std::string> parseCSVLine(std::istream& is, bool& malformed) const;
     static bool parseDouble(const std::string& v, double& out);
     static bool parseDateTime(const std::string& v, int64_t& outUnixSeconds);
-    static std::string trim(const std::string& s);
 };

@@ -1,4 +1,5 @@
 #include "ReportEngine.h"
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -18,37 +19,35 @@ void ReportEngine::addTable(const std::string& title, const std::vector<std::str
         return;
     }
 
-    std::vector<size_t> widths(headers.size(), 0);
-    for (size_t i = 0; i < headers.size(); ++i) {
-        widths[i] = headers[i].size();
+    body_ += "|";
+    for (const auto& h : headers) {
+        body_ += " " + h + " |";
     }
+    body_ += "\n|";
+    for (size_t i = 0; i < headers.size(); ++i) {
+        body_ += " --- |";
+    }
+    body_ += "\n";
 
     for (const auto& row : rows) {
-        for (size_t i = 0; i < headers.size() && i < row.size(); ++i) {
-            widths[i] = std::max(widths[i], row[i].size());
-        }
-    }
-
-    auto appendRow = [&](const std::vector<std::string>& row) {
+        body_ += "|";
         for (size_t i = 0; i < headers.size(); ++i) {
-            std::string cell = (i < row.size() ? row[i] : "");
-            body_ += cell;
-            if (widths[i] > cell.size()) body_ += std::string(widths[i] - cell.size(), ' ');
-            body_ += (i + 1 == headers.size() ? "\n" : " | ");
+            body_ += " " + (i < row.size() ? row[i] : "") + " |";
         }
-    };
-
-    appendRow(headers);
-    for (size_t i = 0; i < headers.size(); ++i) {
-        body_ += std::string(widths[i], '-');
-        body_ += (i + 1 == headers.size() ? "\n" : "-+-");
+        body_ += "\n";
     }
-    for (const auto& row : rows) appendRow(row);
     body_ += "\n";
 }
 
 void ReportEngine::addImage(const std::string& title, const std::string& imagePath) {
-    body_ += "[PLOT] " + title + " => " + imagePath + "\n";
+    std::string portablePath = imagePath;
+    std::error_code ec;
+    const std::filesystem::path rel = std::filesystem::relative(std::filesystem::path(imagePath), std::filesystem::current_path(), ec);
+    if (!ec && !rel.empty()) {
+        portablePath = rel.string();
+    }
+    body_ += "### " + title + "\n";
+    body_ += "![" + title + "](" + portablePath + ")\n\n";
 }
 
 void ReportEngine::save(const std::string& filePath) const {

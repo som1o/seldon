@@ -55,7 +55,6 @@ std::string GnuplotEngine::terminalForFormat(const std::string& format, int widt
 
 GnuplotEngine::GnuplotEngine(std::string assetsDir, PlotConfig cfg)
     : assetsDir_(std::move(assetsDir)), cfg_(std::move(cfg)) {
-    assetsDir_ = std::filesystem::absolute(assetsDir_).string();
     std::filesystem::create_directories(assetsDir_);
 }
 

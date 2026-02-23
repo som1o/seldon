@@ -7,7 +7,7 @@
 struct Significance {
     double t_stat;
     double p_value;
-    bool is_significant; // Default checking against p < 0.05
+    bool is_significant; // Checked against MathUtils::getSignificanceAlpha()
 };
 
 struct MLRDiagnostics {
@@ -24,6 +24,13 @@ struct MLRDiagnostics {
 
 class MathUtils {
 public:
+    static void setSignificanceAlpha(double alpha);
+    static double getSignificanceAlpha();
+    static void setNumericTuning(double numericEpsilon,
+                                 size_t betaIntervalsStart,
+                                 size_t betaIntervalsMax,
+                                 double betaTolerance);
+
     /**
      * @brief Computes Pearson's correlation coefficient between two numeric vectors.
      * @pre x.size() == y.size() and size >= 2.

@@ -10,7 +10,11 @@
 #endif
 
 namespace {
-constexpr double kDefaultSignificanceAlpha = 0.05;
+double gSignificanceAlpha = 0.05;
+double gNumericEpsilon = 1e-12;
+size_t gBetaFallbackIntervalsStart = 4096;
+size_t gBetaFallbackIntervalsMax = 65536;
+double gBetaFallbackTolerance = 1e-8;
 
 double clamp01(double v) {
     if (v < 0.0) return 0.0;
@@ -18,7 +22,7 @@ double clamp01(double v) {
     return v;
 }
 
-double midpointIntegrateBetaRegularized(double a, double b, double x, size_t intervals = 4096) {
+double midpointIntegrateBetaRegularized(double a, double b, double x, size_t intervals) {
     if (x <= 0.0) return 0.0;
     if (x >= 1.0) return 1.0;
 
@@ -35,6 +39,63 @@ double midpointIntegrateBetaRegularized(double a, double b, double x, size_t int
 
     return clamp01(sum * h);
 }
+
+double midpointIntegrateBetaAdaptive(double a, double b, double x) {
+    size_t startIntervals = std::max<size_t>(256, gBetaFallbackIntervalsStart);
+    size_t maxIntervals = std::max(startIntervals, gBetaFallbackIntervalsMax);
+
+    double prev = midpointIntegrateBetaRegularized(a, b, x, startIntervals);
+    for (size_t intervals = startIntervals * 2; intervals <= maxIntervals; intervals *= 2) {
+        double cur = midpointIntegrateBetaRegularized(a, b, x, intervals);
+        // Midpoint has O(h^2) error; this scaled delta approximates residual truncation error.
+        const double richardsonErr = std::abs(cur - prev) / 3.0;
+        if (richardsonErr < gBetaFallbackTolerance) return cur;
+        prev = cur;
+    }
+    return prev;
+}
+
+std::pair<double, bool> betaContinuedFraction(double a, double b, double x) {
+    constexpr int maxIter = 400;
+    constexpr double eps = 3e-14;
+    constexpr double fpmin = 1e-300;
+
+    const double qab = a + b;
+    const double qap = a + 1.0;
+    const double qam = a - 1.0;
+
+    double c = 1.0;
+    double d = 1.0 - qab * x / qap;
+    if (std::abs(d) < fpmin) d = fpmin;
+    d = 1.0 / d;
+    double h = d;
+
+    for (int m = 1; m <= maxIter; ++m) {
+        const int m2 = 2 * m;
+
+        double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if (std::abs(d) < fpmin) d = fpmin;
+        c = 1.0 + aa / c;
+        if (std::abs(c) < fpmin) c = fpmin;
+        d = 1.0 / d;
+        h *= d * c;
+
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if (std::abs(d) < fpmin) d = fpmin;
+        c = 1.0 + aa / c;
+        if (std::abs(c) < fpmin) c = fpmin;
+        d = 1.0 / d;
+        const double del = d * c;
+        h *= del;
+
+        if (std::abs(del - 1.0) <= eps) {
+            return {h, true};
+        }
+    }
+    return {h, false};
+}
 }
 
 // Regularized incomplete beta function I_x(a, b) using continued fractions (Lentz's method)
@@ -43,43 +104,25 @@ static double betainc(double a, double b, double x) {
     if (x == 0.0) return 0.0;
     if (x == 1.0) return 1.0;
 
-    // Symmetry: I_x(a,b) = 1 - I_{1-x}(b,a)
-    if (x > (a + 1.0) / (a + b + 2.0)) {
-        return 1.0 - betainc(b, a, 1.0 - x);
-    }
+    if (a <= 0.0 || b <= 0.0 || !std::isfinite(a) || !std::isfinite(b)) return NAN;
 
-    double logBeta = std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b);
-    double front = std::exp(a * std::log(x) + b * std::log(1.0 - x) - logBeta) / a;
+    const double lnBeta = std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b);
+    const double bt = std::exp(a * std::log(x) + b * std::log(1.0 - x) - lnBeta);
+    const bool useDirect = (x < (a + 1.0) / (a + b + 2.0));
 
-    // Continued fraction using Lentz's method
-    double f = 1.0, c = 1.0, d = 0.0;
-    const double tiny = 1e-30;
-    const double eps = 1e-15;
-
-    for (int i = 1; i <= 300; ++i) {
-        double m = i / 2.0;
-        double numerator;
-        if (i % 2 == 0) {
-            numerator = (m * (b - m) * x) / ((a + 2.0 * m - 1.0) * (a + 2.0 * m));
-        } else {
-            double m_prev = (i - 1) / 2.0;
-            numerator = -((a + m_prev) * (a + b + m_prev) * x) / ((a + 2.0 * m_prev) * (a + 2.0 * m_prev + 1.0));
+    if (useDirect) {
+        auto [cf, ok] = betaContinuedFraction(a, b, x);
+        if (ok && std::isfinite(cf)) {
+            return clamp01(bt * cf / a);
         }
-
-        d = 1.0 + numerator * d;
-        if (std::abs(d) < tiny) d = tiny;
-        d = 1.0 / d;
-
-        c = 1.0 + numerator / c;
-        if (std::abs(c) < tiny) c = tiny;
-
-        double delta = c * d;
-        f *= delta;
-        if (std::abs(delta - 1.0) < eps) return front * f;
+    } else {
+        auto [cf, ok] = betaContinuedFraction(b, a, 1.0 - x);
+        if (ok && std::isfinite(cf)) {
+            return clamp01(1.0 - bt * cf / b);
+        }
     }
 
-    // Fallback path for non-convergence/extreme parameters.
-    return midpointIntegrateBetaRegularized(a, b, x);
+    return midpointIntegrateBetaAdaptive(a, b, x);
 }
 
 // Two-tailed p-value from t-statistic using analytical beta distribution
@@ -126,13 +169,33 @@ double MathUtils::getCriticalT(double alpha, size_t df) {
     return z * (1.0 + (z * z + 1.0) / (4.0 * df) + (5.0 * z * z * z * z + 16.0 * z * z + 3.0) / (96.0 * df * df));
 }
 
+void MathUtils::setSignificanceAlpha(double alpha) {
+    if (alpha > 0.0 && alpha < 1.0) {
+        gSignificanceAlpha = alpha;
+    }
+}
+
+double MathUtils::getSignificanceAlpha() {
+    return gSignificanceAlpha;
+}
+
+void MathUtils::setNumericTuning(double numericEpsilon,
+                                 size_t betaIntervalsStart,
+                                 size_t betaIntervalsMax,
+                                 double betaTolerance) {
+    if (numericEpsilon > 0.0) gNumericEpsilon = numericEpsilon;
+    if (betaIntervalsStart >= 256) gBetaFallbackIntervalsStart = betaIntervalsStart;
+    if (betaIntervalsMax >= gBetaFallbackIntervalsStart) gBetaFallbackIntervalsMax = betaIntervalsMax;
+    if (betaTolerance > 0.0) gBetaFallbackTolerance = betaTolerance;
+}
+
 Significance MathUtils::calculateSignificance(double r, size_t n) {
     Significance sig{0.0, 0.0, false};
     if (n <= 2) return sig;
     
     // Avoid division by zero if r is perfectly 1 or -1
     if (std::abs(r) >= 0.9999999) {
-        sig.p_value = 1e-12;
+        sig.p_value = gNumericEpsilon;
         sig.t_stat = (r > 0 ? 1e6 : -1e6);
         sig.is_significant = true;
         return sig;
@@ -141,7 +204,7 @@ Significance MathUtils::calculateSignificance(double r, size_t n) {
     size_t df = n - 2;
     sig.t_stat = r * std::sqrt(static_cast<double>(df) / (1.0 - r * r));
     sig.p_value = getPValueFromT(sig.t_stat, df);
-    sig.is_significant = (sig.p_value < kDefaultSignificanceAlpha);
+    sig.is_significant = (sig.p_value < gSignificanceAlpha);
 
     return sig;
 }

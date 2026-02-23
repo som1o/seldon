@@ -1,5 +1,6 @@
 #pragma once
 #include "TypedDataset.h"
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -16,5 +17,5 @@ struct BenchmarkResult {
 
 class BenchmarkEngine {
 public:
-    static std::vector<BenchmarkResult> run(const TypedDataset& data, int targetIndex, const std::vector<int>& featureIndices, int kfold);
+    static std::vector<BenchmarkResult> run(const TypedDataset& data, int targetIndex, const std::vector<int>& featureIndices, int kfold, uint32_t seed = 1337);
 };

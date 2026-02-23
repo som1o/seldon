@@ -10,10 +10,11 @@ Seldon is organized as a deterministic analytics pipeline centered on `TypedData
    - Bivariate significance analysis
    - Neural-lattice relevance scoring
 4. **Reporting**:
-   - `univariate.txt`
-   - `bivariate.txt`
-   - `neural_synthesis.txt`
-   - `final_analysis.txt`
+   - `univariate.md`
+   - `bivariate.md`
+   - `neural_synthesis.md`
+   - `final_analysis.md`
+   - Optional self-contained HTML counterparts via `pandoc` when `generate_html=true`
 5. **Plotting (Supervised)**:
    - `seldon_report_assets/univariate`
    - `seldon_report_assets/bivariate`
@@ -27,17 +28,21 @@ Seldon is organized as a deterministic analytics pipeline centered on `TypedData
 - `MathUtils`: statistical significance and matrix math
 - `NeuralNet`: feed-forward network with deterministic seed + gradient clipping
 - `GnuplotEngine`: optional PNG plotting backend
-- `ReportEngine`: plain-text report writer
+- `ReportEngine`: markdown report writer
 
 ## Design Notes
 - `TypedDataset` is the main production dataset representation.
 - Pearson correlation in pipeline delegates to `MathUtils` to avoid duplicated statistical formulas.
+- Numeric `ColumnStats` are cached post-preprocessing and reused across univariate/bivariate/overall analysis stages.
 - Plot generation gracefully degrades when `gnuplot` is unavailable; analysis reports are still fully generated.
+- Bivariate pair scoring uses OpenMP parallel loops in non-verbose mode.
+- Neural stage can be bypassed with `neural_strategy=none`.
 
 ## Determinism & Numerical Safety
 - Neural training supports fixed seed control (`neural_seed`) for reproducibility.
 - Global gradient clipping (`gradient_clip_norm`) mitigates unstable updates.
 - Statistical significance is computed consistently through `MathUtils`.
+- Incomplete beta fallback controls are configurable (`beta_fallback_*`, `numeric_epsilon`).
 
 ## Extension Points
 - Replace `GnuplotEngine` with another plotting backend while preserving report contract.

@@ -11,23 +11,60 @@ struct PlotConfig {
 };
 
 struct HeuristicTuningConfig {
+    // Global significance threshold used in pairwise significance checks.
+    double significanceAlpha = 0.05;
+    // IQR multiplier for Tukey-style outlier fence (lower/higher => more/less sensitive).
+    double outlierIqrMultiplier = 1.5;
+    // Absolute z-score threshold for z-score outlier detection.
+    double outlierZThreshold = 3.0;
+
+    // Numerical floor for retaining low-variance numeric features.
     double featureMinVariance = 1e-10;
+    // Leakage guard: drop feature when abs(feature,target corr) exceeds this value.
     double featureLeakageCorrThreshold = 0.995;
+
+    // Adaptive missingness threshold = Q3(missing ratios) + offset.
     double featureMissingQ3Offset = 0.15;
+    // Clamp for adaptive missingness threshold.
     double featureMissingAdaptiveMin = 0.35;
     double featureMissingAdaptiveMax = 0.95;
+
+    // Strategy-specific deltas applied around adaptive threshold.
     double featureAggressiveDelta = 0.20;
     double featureAggressiveMin = 0.20;
     double featureAggressiveMax = 0.80;
     double featureLenientDelta = 0.20;
     double featureLenientMin = 0.40;
     double featureLenientMax = 0.98;
+
+    // Optional override for pair selection quantile (-1 means strategy default).
     double bivariateSelectionQuantileOverride = -1.0; // -1 => policy default
+
+    // Coherent-importance blending heuristics.
+    double coherenceWeightSmallDataset = 0.55;
+    double coherenceWeightRegularDataset = 0.70;
+    double coherenceOverfitPenaltyTrainRatio = 1.5;
+    double coherenceBenchmarkPenaltyRatio = 1.5;
+    double coherencePenaltyStep = 0.20;
+    double coherenceWeightMin = 0.20;
+    double coherenceWeightMax = 0.85;
+
+    // Auto bivariate policy switching triggers.
+    double corrHeavyMaxImportanceThreshold = 0.65;
+    double corrHeavyConcentrationThreshold = 0.55;
+    double importanceHeavyMaxImportanceThreshold = 0.30;
+    double importanceHeavyConcentrationThreshold = 0.40;
+
+    // Runtime tolerances used across numeric routines.
+    double numericEpsilon = 1e-12;
+    size_t betaFallbackIntervalsStart = 4096;
+    size_t betaFallbackIntervalsMax = 65536;
+    double betaFallbackTolerance = 1e-8;
 };
 
 struct AutoConfig {
     std::string datasetPath;
-    std::string reportFile = "neural_synthesis.txt";
+    std::string reportFile = "neural_synthesis.md";
     std::string assetsDir = "seldon_report_assets";
     std::string targetColumn;
     char delimiter = ',';
@@ -44,14 +81,19 @@ struct AutoConfig {
     double maxFeatureMissingRatio = -1.0; // -1 => auto
     std::string targetStrategy = "auto";    // auto|quality|max_variance|last_numeric
     std::string featureStrategy = "auto";   // auto|adaptive|aggressive|lenient
-    std::string neuralStrategy = "auto";    // auto|fast|balanced|expressive
+    std::string neuralStrategy = "auto";    // auto|none|fast|balanced|expressive
     std::string bivariateStrategy = "auto"; // auto|balanced|corr_heavy|importance_heavy
+    bool fastMode = false;
+    size_t fastMaxBivariatePairs = 2500;
+    size_t fastNeuralSampleRows = 25000;
 
     bool plotUnivariate = false;
     bool plotOverall = false;
     bool plotBivariateSignificant = true;
+    bool generateHtml = false;
     bool verboseAnalysis = true;
     uint32_t neuralSeed = 1337;
+    uint32_t benchmarkSeed = 1337;
     double gradientClipNorm = 5.0;
 
     PlotConfig plot;

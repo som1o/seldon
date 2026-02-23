@@ -3,6 +3,7 @@
 #include <random>
 #include <iostream>
 #include <algorithm>
+#include <numeric>
 #include <fstream>
 #include <sstream>
 #include <cstdint>
@@ -38,11 +39,8 @@ namespace {
 
     template<typename T>
     void swapEndian(T &val) {
-        char *ptr = reinterpret_cast<char*>(&val);
-        int size = sizeof(T);
-        for (int i = 0; i < size / 2; i++) {
-            std::swap(ptr[i], ptr[size - 1 - i]);
-        }
+        auto* first = reinterpret_cast<unsigned char*>(&val);
+        std::reverse(first, first + sizeof(T));
     }
 
     template<typename T>
@@ -95,7 +93,7 @@ NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
         layer.gradients.assign(layer.size, 0.0);
         layer.m_biases.assign(layer.size, 0.0);
         layer.v_biases.assign(layer.size, 0.0);
-        layer.dropMask.assign(layer.size, false);
+        layer.dropMask.assign(layer.size, static_cast<uint8_t>(0));
         layer.activation = (l == topology.size() - 1) ? Activation::SIGMOID : Activation::RELU;
 
         if (l > 0) {
@@ -111,9 +109,9 @@ NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
             }
             
             std::normal_distribution<> weightDis(0.0, stddev);
-            layer.weights.reserve(weightCount);
-            for (size_t i = 0; i < weightCount; ++i) {
-                layer.weights.push_back(weightDis(rng));
+            layer.weights.resize(weightCount, 0.0);
+            for (double& w : layer.weights) {
+                w = weightDis(rng);
             }
 
             layer.m_weights.assign(weightCount, 0.0);
@@ -196,14 +194,14 @@ void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTrain
 
                 if (u < dropoutRate) {
                     current.outputs[n] = 0.0;
-                    current.dropMask[n] = true;
+                    current.dropMask[n] = static_cast<uint8_t>(1);
                 } else {
                     current.outputs[n] = out / (1.0 - dropoutRate);
-                    current.dropMask[n] = false;
+                    current.dropMask[n] = static_cast<uint8_t>(0);
                 }
             } else {
                 current.outputs[n] = out;
-                current.dropMask[n] = false;
+                current.dropMask[n] = static_cast<uint8_t>(0);
             }
         }
     }
@@ -558,20 +556,39 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
         fallbackSensitivity[f] = sensitivitySum / static_cast<double>(trials * X.size() * outDim);
     }
 
-    // If loss-based importances collapse to zero, fall back to prediction sensitivity.
-    double sumLoss = 0.0;
-    for (double v : importances) sumLoss += v;
-    if (sumLoss <= 1e-12) {
-        importances = fallbackSensitivity;
+    // Normalize and blend loss delta with prediction sensitivity.
+    double sumLoss = std::accumulate(importances.begin(), importances.end(), 0.0);
+    double sumSens = std::accumulate(fallbackSensitivity.begin(), fallbackSensitivity.end(), 0.0);
+
+    std::vector<double> lossNorm = importances;
+    std::vector<double> sensNorm = fallbackSensitivity;
+    if (sumLoss > 1e-12) {
+        for (double& v : lossNorm) v /= sumLoss;
+    } else {
+        std::fill(lossNorm.begin(), lossNorm.end(), 0.0);
+    }
+    if (sumSens > 1e-12) {
+        for (double& v : sensNorm) v /= sumSens;
+    } else {
+        std::fill(sensNorm.begin(), sensNorm.end(), 0.0);
     }
 
-    // Normalize to percentages
-    double sum = 0;
-    for (double v : importances) sum += v;
-    if (sum > 0) {
+    if (sumLoss <= 1e-12 && sumSens > 1e-12) {
+        importances = sensNorm;
+    } else if (!importances.empty()) {
+        importances.assign(importances.size(), 0.0);
+        for (size_t i = 0; i < importances.size(); ++i) {
+            const double lossWeight = (sumLoss > 1e-12) ? 0.8 : 0.0;
+            const double sensWeight = (sumSens > 1e-12) ? (1.0 - lossWeight) : 0.0;
+            importances[i] = lossWeight * lossNorm[i] + sensWeight * sensNorm[i];
+        }
+    }
+
+    const double sum = std::accumulate(importances.begin(), importances.end(), 0.0);
+    if (sum > 1e-12) {
         for (double& v : importances) v /= sum;
     } else if (!importances.empty()) {
-        double uniform = 1.0 / static_cast<double>(importances.size());
+        const double uniform = 1.0 / static_cast<double>(importances.size());
         for (double& v : importances) v = uniform;
     }
 

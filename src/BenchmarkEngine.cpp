@@ -1,8 +1,12 @@
 #include "BenchmarkEngine.h"
+#include "MathUtils.h"
 #include <algorithm>
 #include <cmath>
 #include <numeric>
 #include <random>
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
 
 namespace {
 using Matrix = std::vector<std::vector<double>>;
@@ -63,37 +67,33 @@ std::pair<double, double> fitTargetScaler(const std::vector<double>& y) {
 
 std::vector<double> fitLinear(const Matrix& X, const std::vector<double>& y, double lambda = 0.0) {
     if (X.empty()) return {};
-    size_t n = X.size();
-    size_t p = X[0].size();
 
-    Matrix a(p + 1, std::vector<double>(p + 2, 0.0));
-    std::vector<double> row(p + 1, 1.0);
+    const size_t n = X.size();
+    const size_t p = X[0].size();
+    const bool ridge = (lambda > 0.0);
+    const size_t extraRows = ridge ? p : 0;
+
+    MathUtils::Matrix design(n + extraRows, p + 1);
+    MathUtils::Matrix target(n + extraRows, 1);
+
     for (size_t i = 0; i < n; ++i) {
-        for (size_t j = 0; j < p; ++j) row[j + 1] = X[i][j];
-        for (size_t r = 0; r < p + 1; ++r) {
-            for (size_t c = 0; c < p + 1; ++c) a[r][c] += row[r] * row[c];
-            a[r][p + 1] += row[r] * y[i];
+        design.data[i][0] = 1.0;
+        for (size_t j = 0; j < p; ++j) {
+            design.data[i][j + 1] = X[i][j];
         }
+        target.data[i][0] = y[i];
     }
-    for (size_t d = 1; d < p + 1; ++d) a[d][d] += lambda;
 
-    for (size_t i = 0; i < p + 1; ++i) {
-        size_t piv = i;
-        for (size_t r = i + 1; r < p + 1; ++r) if (std::abs(a[r][i]) > std::abs(a[piv][i])) piv = r;
-        std::swap(a[i], a[piv]);
-        if (std::abs(a[i][i]) < 1e-12) continue;
-        double div = a[i][i];
-        for (size_t c = i; c < p + 2; ++c) a[i][c] /= div;
-        for (size_t r = 0; r < p + 1; ++r) {
-            if (r == i) continue;
-            double fac = a[r][i];
-            for (size_t c = i; c < p + 2; ++c) a[r][c] -= fac * a[i][c];
+    if (ridge) {
+        const double penalty = std::sqrt(lambda);
+        for (size_t j = 0; j < p; ++j) {
+            const size_t row = n + j;
+            design.data[row][j + 1] = penalty;
+            target.data[row][0] = 0.0;
         }
     }
 
-    std::vector<double> beta(p + 1, 0.0);
-    for (size_t i = 0; i < p + 1; ++i) beta[i] = a[i][p + 1];
-    return beta;
+    return MathUtils::multipleLinearRegression(design, target);
 }
 
 double predictLinear(const std::vector<double>& beta, const std::vector<double>& x) {
@@ -102,7 +102,7 @@ double predictLinear(const std::vector<double>& beta, const std::vector<double>&
     return y;
 }
 
-BenchmarkResult evalLinear(const std::string& name, const Matrix& X, const std::vector<double>& y, int kfold, double lambda = 0.0) {
+BenchmarkResult evalLinear(const std::string& name, const Matrix& X, const std::vector<double>& y, int kfold, uint32_t seed, double lambda = 0.0) {
     BenchmarkResult res;
     res.model = name;
     if (X.empty()) return res;
@@ -113,7 +113,7 @@ BenchmarkResult evalLinear(const std::string& name, const Matrix& X, const std::
 
     std::vector<size_t> order(n);
     std::iota(order.begin(), order.end(), 0);
-    std::mt19937 rng(1337);
+    std::mt19937 rng(seed);
     std::shuffle(order.begin(), order.end(), rng);
 
     std::vector<double> preds(n, 0.0);
@@ -177,7 +177,7 @@ BenchmarkResult evalLinear(const std::string& name, const Matrix& X, const std::
     return res;
 }
 
-BenchmarkResult evalTreeStump(const Matrix& X, const std::vector<double>& y, int kfold) {
+BenchmarkResult evalTreeStump(const Matrix& X, const std::vector<double>& y, int kfold, uint32_t seed) {
     BenchmarkResult res;
     res.model = "DecisionTreeStump";
     if (X.empty() || X[0].empty()) return res;
@@ -192,7 +192,7 @@ BenchmarkResult evalTreeStump(const Matrix& X, const std::vector<double>& y, int
 
     std::vector<size_t> order(n);
     std::iota(order.begin(), order.end(), 0);
-    std::mt19937 rng(1337);
+    std::mt19937 rng(seed);
     std::shuffle(order.begin(), order.end(), rng);
 
     for (int f = 0; f < folds; ++f) {
@@ -277,12 +277,22 @@ BenchmarkResult evalTreeStump(const Matrix& X, const std::vector<double>& y, int
 }
 }
 
-std::vector<BenchmarkResult> BenchmarkEngine::run(const TypedDataset& data, int targetIndex, const std::vector<int>& featureIndices, int kfold) {
+std::vector<BenchmarkResult> BenchmarkEngine::run(const TypedDataset& data, int targetIndex, const std::vector<int>& featureIndices, int kfold, uint32_t seed) {
     std::vector<BenchmarkResult> out;
     if (targetIndex < 0 || data.columns()[targetIndex].type != ColumnType::NUMERIC) return out;
 
     const auto& target = std::get<std::vector<double>>(data.columns()[targetIndex].values);
     if (target.empty()) return out;
+    if (target.size() < 2) {
+        BenchmarkResult tiny;
+        tiny.model = "InsufficientRows";
+        tiny.rmse = 0.0;
+        tiny.r2 = 0.0;
+        tiny.actual = target;
+        tiny.predicted = target;
+        out.push_back(std::move(tiny));
+        return out;
+    }
 
     Matrix X(data.rowCount(), std::vector<double>(featureIndices.size(), 0.0));
     for (size_t j = 0; j < featureIndices.size(); ++j) {
@@ -292,9 +302,29 @@ std::vector<BenchmarkResult> BenchmarkEngine::run(const TypedDataset& data, int 
         for (size_t i = 0; i < data.rowCount(); ++i) X[i][j] = col[i];
     }
 
-    out.push_back(evalLinear("LinearRegression", X, target, kfold, 1e-6));
-    out.push_back(evalLinear("RidgeRegression", X, target, kfold, 1.0));
-    out.push_back(evalTreeStump(X, target, kfold));
+    BenchmarkResult linear;
+    BenchmarkResult ridge;
+    BenchmarkResult stump;
+
+    #ifdef USE_OPENMP
+    #pragma omp parallel sections
+    {
+        #pragma omp section
+        { linear = evalLinear("LinearRegression", X, target, kfold, seed, 1e-6); }
+        #pragma omp section
+        { ridge = evalLinear("RidgeRegression", X, target, kfold, seed ^ 0x9e3779b9U, 1.0); }
+        #pragma omp section
+        { stump = evalTreeStump(X, target, kfold, seed ^ 0x85ebca6bU); }
+    }
+    #else
+    linear = evalLinear("LinearRegression", X, target, kfold, seed, 1e-6);
+    ridge = evalLinear("RidgeRegression", X, target, kfold, seed ^ 0x9e3779b9U, 1.0);
+    stump = evalTreeStump(X, target, kfold, seed ^ 0x85ebca6bU);
+    #endif
+
+    out.push_back(std::move(linear));
+    out.push_back(std::move(ridge));
+    out.push_back(std::move(stump));
 
     // crude binary accuracy if target looks binary
     bool isBinary = true;
