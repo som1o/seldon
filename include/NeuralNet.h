@@ -3,14 +3,14 @@
 #include <vector>
 #include <string>
 #include <random>
-#include <map>
+#include "NeuralLayer.h"
 
 // Advanced, dependency-free Dense Feed-Forward Neural Network
 class NeuralNet {
 public:
-    enum class Activation { SIGMOID, RELU, TANH, LINEAR };
+    using Activation = NeuralActivation;
     enum class LossFunction { MSE, CROSS_ENTROPY };
-    enum class Optimizer { SGD, ADAM };
+    using Optimizer = NeuralOptimizer;
 
     struct ScaleInfo {
         double min;
@@ -69,31 +69,12 @@ public:
     void loadModelBinary(const std::string& filename);
 
 private:
-    struct Layer {
-        size_t size;
-        std::vector<double> outputs;
-        std::vector<double> biases;
-        std::vector<double> weights; // Contiguous: weights for all neurons in this layer
-        std::vector<double> gradients;
-        
-        // Adam buffers
-        std::vector<double> m_weights, v_weights;
-        std::vector<double> m_biases, v_biases;
-        
-        std::vector<uint8_t> dropMask;
-        
-        Activation activation; // Per-layer activation
-    };
-
     void feedForward(const std::vector<double>& inputValues, bool isTraining, double dropoutRate = 0.0);
     void backpropagate(const std::vector<double>& targetValues, const Hyperparameters& hp, size_t t_step);
     
     void computeGradients(const std::vector<double>& targetValues, LossFunction loss);
     void applyOptimization(const Hyperparameters& hp, size_t t_step);
     
-    double activate(double x, Activation act);
-    double activateDerivative(double out, Activation act);
-
     // Decomposition helpers for train
     double runEpoch(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
                     const std::vector<size_t>& indices, size_t trainSize, 
@@ -104,7 +85,7 @@ private:
     double validate(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
                     const std::vector<size_t>& indices, size_t trainSize, const Hyperparameters& hp);
 
-    std::vector<Layer> m_layers;
+    std::vector<DenseLayer> m_layers;
     std::vector<size_t> topology;
     std::vector<ScaleInfo> inputScales;
     std::vector<ScaleInfo> outputScales;

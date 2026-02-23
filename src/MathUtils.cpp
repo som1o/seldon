@@ -96,6 +96,42 @@ std::pair<double, bool> betaContinuedFraction(double a, double b, double x) {
     }
     return {h, false};
 }
+
+bool solveUpperTriangular(const MathUtils::Matrix& R,
+                          size_t n,
+                          const std::vector<double>& b,
+                          std::vector<double>& x) {
+    if (b.size() != n) return false;
+    x.assign(n, 0.0);
+    for (size_t i = n; i-- > 0;) {
+        double rhs = b[i];
+        for (size_t j = i + 1; j < n; ++j) {
+            rhs -= R.data[i][j] * x[j];
+        }
+        const double diag = R.data[i][i];
+        if (std::abs(diag) <= gNumericEpsilon) return false;
+        x[i] = rhs / diag;
+    }
+    return true;
+}
+
+bool solveLowerFromUpperTranspose(const MathUtils::Matrix& R,
+                                  size_t n,
+                                  const std::vector<double>& b,
+                                  std::vector<double>& x) {
+    if (b.size() != n) return false;
+    x.assign(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        double rhs = b[i];
+        for (size_t j = 0; j < i; ++j) {
+            rhs -= R.data[j][i] * x[j];
+        }
+        const double diag = R.data[i][i];
+        if (std::abs(diag) <= gNumericEpsilon) return false;
+        x[i] = rhs / diag;
+    }
+    return true;
+}
 }
 
 // Regularized incomplete beta function I_x(a, b) using continued fractions (Lentz's method)
@@ -476,37 +512,47 @@ MLRDiagnostics MathUtils::performMLRWithDiagnostics(const Matrix& X, const Matri
     }
 
     // 3. Standard Errors for coefficients
-    // SE = sqrt( s^2 * diag((X^TX)^-1) )
-    Matrix XT = X.transpose();
-    Matrix XTX = XT.multiply(X);
-    auto XTX_inv_opt = XTX.inverse();
-    
-    if (XTX_inv_opt) {
-        Matrix XTX_inv = *XTX_inv_opt;
-        double s2 = rss / dfResidual;
-        diag.stdErrors.resize(X.cols);
-        diag.tStats.resize(X.cols);
-        diag.pValues.resize(X.cols);
-        
-        for (size_t j = 0; j < X.cols; ++j) {
-            double variance = s2 * XTX_inv.data[j][j];
-            if (variance < 0 && std::abs(variance) < 1e-15) {
-                variance = 0;
-            }
-            if (variance < 0) return diag;
+    // SE = sqrt(s^2 * diag((X^TX)^-1)), where (X^TX)^-1 = R^-1 * (R^-1)^T from QR.
+    Matrix Q(0, 0), R(0, 0);
+    X.qrDecomposition(Q, R);
 
-            diag.stdErrors[j] = std::sqrt(variance);
-            if (diag.stdErrors[j] > 0) {
-                diag.tStats[j] = diag.coefficients[j] / diag.stdErrors[j];
-                diag.pValues[j] = getPValueFromT(diag.tStats[j], dfResidual);
-            } else {
-                diag.tStats[j] = 0.0;
-                diag.pValues[j] = 1.0;
-            }
+    const size_t p = X.cols;
+    double max_diag = 0.0;
+    double min_diag = 1e30;
+    for (size_t i = 0; i < p; ++i) {
+        const double v = std::abs(R.data[i][i]);
+        if (v > max_diag) max_diag = v;
+        if (v < min_diag) min_diag = v;
+    }
+    if (min_diag <= gNumericEpsilon || (max_diag / min_diag) > 1e10) return diag;
+
+    const double s2 = rss / static_cast<double>(dfResidual);
+    diag.stdErrors.resize(p);
+    diag.tStats.resize(p);
+    diag.pValues.resize(p);
+
+    std::vector<double> e(p, 0.0);
+    std::vector<double> z;
+    std::vector<double> col;
+    for (size_t j = 0; j < p; ++j) {
+        std::fill(e.begin(), e.end(), 0.0);
+        e[j] = 1.0;
+
+        if (!solveLowerFromUpperTranspose(R, p, e, z)) return diag;
+        if (!solveUpperTriangular(R, p, z, col)) return diag;
+
+        double variance = s2 * col[j];
+        if (variance < 0.0 && std::abs(variance) < 1e-15) variance = 0.0;
+        if (variance < 0.0) return diag;
+
+        diag.stdErrors[j] = std::sqrt(variance);
+        if (diag.stdErrors[j] > 0.0) {
+            diag.tStats[j] = diag.coefficients[j] / diag.stdErrors[j];
+            diag.pValues[j] = getPValueFromT(diag.tStats[j], dfResidual);
+        } else {
+            diag.tStats[j] = 0.0;
+            diag.pValues[j] = 1.0;
         }
-    } else {
-        // Fallback or mark as failed
-        return diag;
     }
 
     diag.success = true;

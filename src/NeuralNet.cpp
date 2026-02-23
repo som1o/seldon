@@ -65,12 +65,6 @@ namespace {
         }
     }
 
-    uint64_t splitmix64(uint64_t x) {
-        x += 0x9e3779b97f4a7c15ULL;
-        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-        return x ^ (x >> 31);
-    }
 }
 
 NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
@@ -86,41 +80,9 @@ NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
     rng.seed(seedState);
 
     for (size_t l = 0; l < topology.size(); ++l) {
-        Layer layer;
-        layer.size = topology[l];
-        layer.outputs.assign(layer.size, 0.0);
-        layer.biases.assign(layer.size, 0.0);
-        layer.gradients.assign(layer.size, 0.0);
-        layer.m_biases.assign(layer.size, 0.0);
-        layer.v_biases.assign(layer.size, 0.0);
-        layer.dropMask.assign(layer.size, static_cast<uint8_t>(0));
-        layer.activation = (l == topology.size() - 1) ? Activation::SIGMOID : Activation::RELU;
-
-        if (l > 0) {
-            size_t prevSize = topology[l - 1];
-            size_t weightCount = layer.size * prevSize;
-            
-            // Xavier/He initialization based on activation
-            double stddev = 0.1;
-            if (layer.activation == Activation::RELU) {
-                stddev = std::sqrt(2.0 / prevSize); // He initialization
-            } else {
-                stddev = std::sqrt(1.0 / prevSize); // Xavier initialization
-            }
-            
-            std::normal_distribution<> weightDis(0.0, stddev);
-            layer.weights.resize(weightCount, 0.0);
-            for (double& w : layer.weights) {
-                w = weightDis(rng);
-            }
-
-            layer.m_weights.assign(weightCount, 0.0);
-            layer.v_weights.assign(weightCount, 0.0);
-            for (size_t i = 0; i < layer.size; ++i) {
-                layer.biases[i] = 0.01; // Small positive bias to prevent dead neurons
-            }
-        }
-        m_layers.push_back(layer);
+        const Activation activation = (l == topology.size() - 1) ? Activation::SIGMOID : Activation::RELU;
+        const size_t prevSize = (l > 0) ? topology[l - 1] : 0;
+        m_layers.emplace_back(topology[l], prevSize, activation, rng);
     }
 }
 
@@ -129,174 +91,48 @@ void NeuralNet::setSeed(uint32_t seed) {
     rng.seed(seedState);
 }
 
-double NeuralNet::activate(double x, Activation act) {
-    switch (act) {
-        case Activation::RELU: return std::max(0.0, x);
-        case Activation::TANH: return std::tanh(x);
-        case Activation::SIGMOID: {
-            double clipped = std::clamp(x, -60.0, 60.0);
-            return 1.0 / (1.0 + std::exp(-clipped));
-        }
-        case Activation::LINEAR: return x;
-        default: return x;
-    }
-}
-
-double NeuralNet::activateDerivative(double out, Activation act) {
-    switch (act) {
-        case Activation::RELU: return out > 0 ? 1.0 : 0.0;
-        case Activation::TANH: return 1.0 - out * out;
-        case Activation::SIGMOID: return out * (1.0 - out);
-        case Activation::LINEAR: return 1.0;
-        default: return 1.0;
-    }
-}
-
 void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTraining, double dropoutRate) {
     if (m_layers.empty()) {
         throw Seldon::NeuralNetException("Network has no layers");
     }
 
-    size_t inputSize = std::min(inputValues.size(), m_layers[0].size);
+    size_t inputSize = std::min(inputValues.size(), m_layers[0].size());
     for (size_t i = 0; i < inputSize; ++i) {
-        m_layers[0].outputs[i] = inputValues[i];
+        m_layers[0].outputs()[i] = inputValues[i];
     }
-    for (size_t i = inputSize; i < m_layers[0].size; ++i) {
-        m_layers[0].outputs[i] = 0.0;
+    for (size_t i = inputSize; i < m_layers[0].size(); ++i) {
+        m_layers[0].outputs()[i] = 0.0;
     }
 
     ++forwardCounter;
     for (size_t l = 1; l < m_layers.size(); ++l) {
-        Layer& current = m_layers[l];
-        Layer& prev = m_layers[l - 1];
-
-        #ifdef USE_OPENMP
-        #pragma omp parallel for
-        #endif
-        for (size_t n = 0; n < current.size; ++n) {
-            double sum = current.biases[n];
-            size_t weightOffset = n * prev.size;
-            #ifdef USE_OPENMP
-            #pragma omp simd reduction(+:sum)
-            #endif
-            for (size_t pn = 0; pn < prev.size; ++pn) {
-                sum += prev.outputs[pn] * current.weights[weightOffset + pn];
-            }
-            
-            double out = activate(sum, current.activation);
-
-            if (isTraining && l < m_layers.size() - 1 && dropoutRate > 0.0) {
-                uint64_t key = static_cast<uint64_t>(seedState);
-                key ^= (static_cast<uint64_t>(l) << 48);
-                key ^= (static_cast<uint64_t>(n) << 24);
-                key ^= forwardCounter;
-                double u = (splitmix64(key) & 0xFFFFFF) / static_cast<double>(0x1000000);
-
-                if (u < dropoutRate) {
-                    current.outputs[n] = 0.0;
-                    current.dropMask[n] = static_cast<uint8_t>(1);
-                } else {
-                    current.outputs[n] = out / (1.0 - dropoutRate);
-                    current.dropMask[n] = static_cast<uint8_t>(0);
-                }
-            } else {
-                current.outputs[n] = out;
-                current.dropMask[n] = static_cast<uint8_t>(0);
-            }
-        }
+        const bool dropoutEnabled = isTraining && l < m_layers.size() - 1;
+        m_layers[l].forward(m_layers[l - 1], dropoutEnabled, dropoutRate, seedState, forwardCounter + l * 1315423911ULL);
     }
 }
 
 void NeuralNet::computeGradients(const std::vector<double>& targetValues, LossFunction loss) {
-    if (m_layers.size() < 2 || targetValues.size() != m_layers.back().size) {
+    if (m_layers.size() < 2 || targetValues.size() != m_layers.back().size()) {
         throw Seldon::NeuralNetException("Target dimensions do not match output layer");
     }
 
-    Layer& outputLayer = m_layers.back();
-    if (loss == LossFunction::CROSS_ENTROPY && outputLayer.activation != Activation::SIGMOID) {
+    DenseLayer& outputLayer = m_layers.back();
+    if (loss == LossFunction::CROSS_ENTROPY && outputLayer.activation() != Activation::SIGMOID) {
         throw Seldon::NeuralNetException("Cross-Entropy loss currently requires SIGMOID output activation");
     }
-    for (size_t n = 0; n < outputLayer.size; ++n) {
-        if (loss == LossFunction::CROSS_ENTROPY && outputLayer.activation == Activation::SIGMOID) {
-            // Simplified gradient for Cross-Entropy + Sigmoid
-            outputLayer.gradients[n] = outputLayer.outputs[n] - targetValues[n];
-        } else {
-            double delta = outputLayer.outputs[n] - targetValues[n]; // MSE Gradient
-            outputLayer.gradients[n] = delta * activateDerivative(outputLayer.outputs[n], outputLayer.activation);
-        }
-    }
+    outputLayer.computeOutputGradients(targetValues, loss == LossFunction::CROSS_ENTROPY);
 
     for (size_t l = m_layers.size() - 1; l-- > 1;) {
-        Layer& hidden = m_layers[l];
-        Layer& next = m_layers[l + 1];
-
-        std::fill(hidden.gradients.begin(), hidden.gradients.end(), 0.0);
-
-        for (size_t nn = 0; nn < next.size; ++nn) {
-            double next_grad = next.gradients[nn];
-            size_t weightOffset = nn * hidden.size;
-            #ifdef USE_OPENMP
-            #pragma omp simd
-            #endif
-            for (size_t n = 0; n < hidden.size; ++n) {
-                hidden.gradients[n] += next.weights[weightOffset + n] * next_grad;
-            }
-        }
-
-        for (size_t n = 0; n < hidden.size; ++n) {
-            if (hidden.dropMask[n]) {
-                hidden.gradients[n] = 0.0;
-            } else {
-                hidden.gradients[n] *= activateDerivative(hidden.outputs[n], hidden.activation);
-            }
-        }
+        DenseLayer& hidden = m_layers[l];
+        DenseLayer& next = m_layers[l + 1];
+        hidden.accumulateHiddenGradients(next);
+        hidden.applyActivationDerivativeAndDropout();
     }
 }
 
 void NeuralNet::applyOptimization(const Hyperparameters& hp, size_t t_step) {
-    const double beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8;
-    const double beta1_t = 1.0 - std::pow(beta1, t_step);
-    const double beta2_t = 1.0 - std::pow(beta2, t_step);
-
     for (size_t l = 1; l < m_layers.size(); ++l) {
-        Layer& current = m_layers[l];
-        Layer& prev = m_layers[l - 1];
-
-        #ifdef USE_OPENMP
-        #pragma omp parallel for
-        #endif
-        for (size_t n = 0; n < current.size; ++n) {
-            // Update Bias
-            double grad_bias = current.gradients[n];
-            if (hp.optimizer == Optimizer::ADAM) {
-                current.m_biases[n] = beta1 * current.m_biases[n] + (1.0 - beta1) * grad_bias;
-                current.v_biases[n] = beta2 * current.v_biases[n] + (1.0 - beta2) * grad_bias * grad_bias;
-                double m_hat = current.m_biases[n] / beta1_t;
-                double v_hat = current.v_biases[n] / beta2_t;
-                current.biases[n] -= hp.learningRate * (m_hat / (std::sqrt(v_hat) + epsilon));
-            } else {
-                current.biases[n] -= hp.learningRate * grad_bias;
-            }
-
-            size_t weightOffset = n * prev.size;
-            #ifdef USE_OPENMP
-            #pragma omp simd
-            #endif
-            for (size_t pn = 0; pn < prev.size; ++pn) {
-                double grad_w = current.gradients[n] * prev.outputs[pn];
-                grad_w += hp.l2Lambda * current.weights[weightOffset + pn]; // Weight decay scaling
-
-                if (hp.optimizer == Optimizer::ADAM) {
-                    current.m_weights[weightOffset + pn] = beta1 * current.m_weights[weightOffset + pn] + (1.0 - beta1) * grad_w;
-                    current.v_weights[weightOffset + pn] = beta2 * current.v_weights[weightOffset + pn] + (1.0 - beta2) * grad_w * grad_w;
-                    double m_hat = current.m_weights[weightOffset + pn] / beta1_t;
-                    double v_hat = current.v_weights[weightOffset + pn] / beta2_t;
-                    current.weights[weightOffset + pn] -= hp.learningRate * (m_hat / (std::sqrt(v_hat) + epsilon));
-                } else {
-                    current.weights[weightOffset + pn] -= hp.learningRate * grad_w;
-                }
-            }
-        }
+        m_layers[l].updateParameters(m_layers[l - 1], hp.learningRate, hp.l2Lambda, hp.optimizer, t_step);
     }
 }
 
@@ -306,13 +142,13 @@ void NeuralNet::backpropagate(const std::vector<double>& targetValues, const Hyp
     if (hp.gradientClipNorm > 0.0) {
         double sqNorm = 0.0;
         for (size_t l = 1; l < m_layers.size(); ++l) {
-            for (double g : m_layers[l].gradients) sqNorm += g * g;
+            for (double g : m_layers[l].gradients()) sqNorm += g * g;
         }
         double norm = std::sqrt(sqNorm);
         if (norm > hp.gradientClipNorm && norm > 1e-12) {
             double scale = hp.gradientClipNorm / norm;
             for (size_t l = 1; l < m_layers.size(); ++l) {
-                for (double& g : m_layers[l].gradients) g *= scale;
+                for (double& g : m_layers[l].gradients()) g *= scale;
             }
         }
     }
@@ -335,8 +171,8 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
         throw Seldon::NeuralNetException("Batch size must be greater than zero");
     }
 
-    const size_t expectedInput = m_layers.front().size;
-    const size_t expectedOutput = m_layers.back().size;
+    const size_t expectedInput = m_layers.front().size();
+    const size_t expectedOutput = m_layers.back().size();
     for (size_t i = 0; i < X.size(); ++i) {
         if (X[i].size() != expectedInput) {
             throw Seldon::NeuralNetException("Input row size does not match network input layer size");
@@ -354,7 +190,7 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
     valLossHistory.clear();
 
     for (size_t l = 1; l < m_layers.size(); ++l) {
-        m_layers[l].activation = (l == m_layers.size() - 1) ? hp.outputActivation : hp.activation;
+        m_layers[l].setActivation((l == m_layers.size() - 1) ? hp.outputActivation : hp.activation);
     }
 
     size_t valSize = static_cast<size_t>(X.size() * hp.valSplit);
@@ -424,7 +260,7 @@ double NeuralNet::runEpoch(const std::vector<std::vector<double>>& X, const std:
         size_t currentBatchEnd = std::min(i + hp.batchSize, trainSize);
         epochLoss += runBatch(X, Y, indices, i, currentBatchEnd, currentHp, t_step);
     }
-    double denom = static_cast<double>(trainSize * m_layers.back().size);
+    double denom = static_cast<double>(trainSize * m_layers.back().size());
     return denom > 0 ? epochLoss / denom : 0.0;
 }
 
@@ -437,10 +273,10 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X, const std:
         feedForward(X[indices[b]], true, hp.dropoutRate);
         backpropagate(Y[indices[b]], hp, t_step);
 
-        size_t outputSize = std::min(Y[indices[b]].size(), m_layers.back().outputs.size());
+        size_t outputSize = std::min(Y[indices[b]].size(), m_layers.back().outputs().size());
         for (size_t j = 0; j < outputSize; ++j) {
             double actual = Y[indices[b]][j];
-            double pred = m_layers.back().outputs[j];
+            double pred = m_layers.back().outputs()[j];
             if (hp.loss == LossFunction::CROSS_ENTROPY) {
                 pred = std::clamp(pred, 1e-15, 1.0 - 1e-15);
                 batchLoss -= (actual * std::log(pred) + (1.0 - actual) * std::log(1.0 - pred));
@@ -460,7 +296,7 @@ double NeuralNet::validate(const std::vector<std::vector<double>>& X, const std:
         feedForward(X[indices[i]], false);
         for (size_t j = 0; j < Y[indices[i]].size(); ++j) {
             double actual = Y[indices[i]][j];
-            double pred = m_layers.back().outputs[j];
+            double pred = m_layers.back().outputs()[j];
             if (hp.loss == LossFunction::CROSS_ENTROPY) {
                 pred = std::clamp(pred, 1e-15, 1.0 - 1e-15);
                 valLossSum -= (actual * std::log(pred) + (1.0 - actual) * std::log(1.0 - pred));
@@ -469,7 +305,7 @@ double NeuralNet::validate(const std::vector<std::vector<double>>& X, const std:
             }
         }
     }
-    double denom = static_cast<double>(valSize * m_layers.back().size);
+    double denom = static_cast<double>(valSize * m_layers.back().size());
     return denom > 0 ? valLossSum / denom : 0.0;
 }
 
@@ -486,8 +322,8 @@ std::vector<double> NeuralNet::predict(const std::vector<double>& inputValues) {
     feedForward(scaledInput, false);
     
     std::vector<double> result;
-    for (size_t i = 0; i < m_layers.back().size; ++i) {
-        double val = m_layers.back().outputs[i];
+    for (size_t i = 0; i < m_layers.back().size(); ++i) {
+        double val = m_layers.back().outputs()[i];
         if (!outputScales.empty() && i < outputScales.size()) {
             double range = outputScales[i].max - outputScales[i].min;
             if (range == 0) range = 1.0;
@@ -616,7 +452,7 @@ void NeuralNet::saveModelBinary(const std::string& filename) const {
     }
 
     for (const auto& layer : m_layers) {
-        int32_t act = static_cast<int32_t>(layer.activation);
+        int32_t act = static_cast<int32_t>(layer.activation());
         writeLE(out, act);
         updateChecksum(checksum, act);
     }
@@ -643,11 +479,11 @@ void NeuralNet::saveModelBinary(const std::string& filename) const {
 
     for (size_t l = 1; l < m_layers.size(); ++l) {
         const auto& layer = m_layers[l];
-        for (double b : layer.biases) {
+        for (double b : layer.biases()) {
             writeLE(out, b);
             updateChecksum(checksum, b);
         }
-        for (double w : layer.weights) {
+        for (double w : layer.weights()) {
             writeLE(out, w);
             updateChecksum(checksum, w);
         }
@@ -698,7 +534,7 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
             int32_t act;
             readLE(in, act);
             updateChecksum(computedChecksum, act);
-            m_layers[i].activation = static_cast<Activation>(act);
+            m_layers[i].setActivation(static_cast<Activation>(act));
         }
 
         uint64_t inS, outS;
@@ -724,11 +560,11 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
 
         for (size_t l = 1; l < m_layers.size(); ++l) {
             auto& layer = m_layers[l];
-            for (double& b : layer.biases) {
+            for (double& b : layer.biases()) {
                 readLE(in, b);
                 updateChecksum(computedChecksum, b);
             }
-            for (double& w : layer.weights) {
+            for (double& w : layer.weights()) {
                 readLE(in, w);
                 updateChecksum(computedChecksum, w);
             }

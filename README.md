@@ -280,6 +280,8 @@ Seldon intentionally favors a strong automated foundation over advanced model co
 - Neural optional mode (`neural_strategy=none`) enables lightweight runs on very large datasets.
 - Config parser supports practical YAML/JSON-like key:value files, not full spec-complete parsing.
 - `TypedDataset` is the production data path and orchestration targets full automation and dynamic model/feature selection.
+- Matrix inversion via Gaussian elimination is $O(n^3)$; for typical dataset sizes this is sufficient, while very large-scale use may benefit from a more numerically stable solver.
+- The neural network implementation is intentionally feature-rich but currently monolithic; future modularization (for example, introducing dedicated layer abstractions) would improve long-term maintainability.
 
 ## License
 
