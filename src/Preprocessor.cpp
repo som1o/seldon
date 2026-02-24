@@ -176,7 +176,7 @@ void addTemporalDateFeatures(TypedDataset& data, const AutoConfig& config) {
     if (datetimeIndices.empty()) return;
 
     std::vector<TypedColumn> engineered;
-    engineered.reserve(datetimeIndices.size() * 3);
+    engineered.reserve(datetimeIndices.size() * 5);
 
     for (size_t idx : datetimeIndices) {
         const auto& srcCol = data.columns()[idx];
@@ -194,6 +194,8 @@ void addTemporalDateFeatures(TypedDataset& data, const AutoConfig& config) {
 
         std::vector<double> dayOfWeek(imputedValues.size(), std::numeric_limits<double>::quiet_NaN());
         std::vector<double> month(imputedValues.size(), std::numeric_limits<double>::quiet_NaN());
+        std::vector<double> dayOfYear(imputedValues.size(), std::numeric_limits<double>::quiet_NaN());
+        std::vector<double> quarter(imputedValues.size(), std::numeric_limits<double>::quiet_NaN());
         std::vector<double> isWeekend(imputedValues.size(), std::numeric_limits<double>::quiet_NaN());
         MissingMask derivedMissing(imputedValues.size(), static_cast<uint8_t>(0));
 
@@ -207,11 +209,15 @@ void addTemporalDateFeatures(TypedDataset& data, const AutoConfig& config) {
             const int weekday = dayOfWeekFromUnixSeconds(ts);
             const int64_t days = floorDiv(ts, 86400);
             const auto [year, monthValue, day] = civilFromDays(days);
-            (void)year;
-            (void)day;
+            const bool leap = ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0));
+            static const int cumDaysNorm[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+            static const int cumDaysLeap[12] = {0,31,60,91,121,152,182,213,244,274,305,335};
+            const int* cum = leap ? cumDaysLeap : cumDaysNorm;
 
             dayOfWeek[r] = static_cast<double>(weekday);
             month[r] = static_cast<double>(monthValue);
+            dayOfYear[r] = static_cast<double>(cum[std::max(1u, monthValue) - 1] + static_cast<int>(day));
+            quarter[r] = static_cast<double>(((std::max(1u, monthValue) - 1) / 3) + 1);
             isWeekend[r] = (weekday == 0 || weekday == 6) ? 1.0 : 0.0;
         }
 
@@ -233,12 +239,79 @@ void addTemporalDateFeatures(TypedDataset& data, const AutoConfig& config) {
         weekendCol.name = uniqueColumnName(data, srcCol.name + "_IsWeekend");
         weekendCol.type = ColumnType::NUMERIC;
         weekendCol.values = std::move(isWeekend);
-        weekendCol.missing = std::move(derivedMissing);
+        weekendCol.missing = derivedMissing;
         engineered.push_back(std::move(weekendCol));
+
+        TypedColumn doyCol;
+        doyCol.name = uniqueColumnName(data, srcCol.name + "_DayOfYear");
+        doyCol.type = ColumnType::NUMERIC;
+        doyCol.values = std::move(dayOfYear);
+        doyCol.missing = derivedMissing;
+        engineered.push_back(std::move(doyCol));
+
+        TypedColumn quarterCol;
+        quarterCol.name = uniqueColumnName(data, srcCol.name + "_Quarter");
+        quarterCol.type = ColumnType::NUMERIC;
+        quarterCol.values = std::move(quarter);
+        quarterCol.missing = std::move(derivedMissing);
+        engineered.push_back(std::move(quarterCol));
     }
 
     auto& columns = data.columns();
     columns.insert(columns.end(), std::make_move_iterator(engineered.begin()), std::make_move_iterator(engineered.end()));
+}
+
+void addAutoNumericFeatureEngineering(TypedDataset& data) {
+    auto numericIdx = data.numericColumnIndices();
+    if (numericIdx.empty()) return;
+
+    const size_t maxBase = std::min<size_t>(numericIdx.size(), 6);
+    std::vector<size_t> base(numericIdx.begin(), numericIdx.begin() + maxBase);
+
+    std::vector<TypedColumn> engineered;
+    engineered.reserve(maxBase + (maxBase * (maxBase - 1)) / 2);
+
+    for (size_t idx : base) {
+        const auto& col = data.columns()[idx];
+        const auto& vals = std::get<NumVec>(col.values);
+        std::vector<double> sq(vals.size(), 0.0);
+        for (size_t i = 0; i < vals.size(); ++i) sq[i] = vals[i] * vals[i];
+        TypedColumn c;
+        c.name = uniqueColumnName(data, col.name + "_sq");
+        c.type = ColumnType::NUMERIC;
+        c.values = std::move(sq);
+        c.missing = col.missing;
+        engineered.push_back(std::move(c));
+    }
+
+    for (size_t i = 0; i < base.size(); ++i) {
+        for (size_t j = i + 1; j < base.size(); ++j) {
+            const auto& a = data.columns()[base[i]];
+            const auto& b = data.columns()[base[j]];
+            const auto& av = std::get<NumVec>(a.values);
+            const auto& bv = std::get<NumVec>(b.values);
+            const size_t n = std::min(av.size(), bv.size());
+            std::vector<double> inter(n, 0.0);
+            MissingMask miss(n, static_cast<uint8_t>(0));
+            for (size_t r = 0; r < n; ++r) {
+                if (a.missing[r] || b.missing[r]) {
+                    miss[r] = static_cast<uint8_t>(1);
+                    continue;
+                }
+                inter[r] = av[r] * bv[r];
+            }
+
+            TypedColumn c;
+            c.name = uniqueColumnName(data, a.name + "_x_" + b.name);
+            c.type = ColumnType::NUMERIC;
+            c.values = std::move(inter);
+            c.missing = std::move(miss);
+            engineered.push_back(std::move(c));
+        }
+    }
+
+    auto& cols = data.columns();
+    cols.insert(cols.end(), std::make_move_iterator(engineered.begin()), std::make_move_iterator(engineered.end()));
 }
 
 std::vector<bool> detectOutliersIQR(const NumVec& values, double iqrMultiplier) {
@@ -318,6 +391,122 @@ std::vector<bool> detectOutliersZObserved(const NumVec& values, const MissingMas
     return flags;
 }
 
+std::vector<bool> detectOutliersModifiedZObserved(const NumVec& values, const MissingMask& missing, double zThreshold) {
+    std::vector<bool> flags(values.size(), false);
+    NumVec observed;
+    std::vector<size_t> obsIdx;
+    for (size_t i = 0; i < values.size() && i < missing.size(); ++i) {
+        if (missing[i] || !std::isfinite(values[i])) continue;
+        observed.push_back(values[i]);
+        obsIdx.push_back(i);
+    }
+    if (observed.size() < 4) return flags;
+
+    const double med = CommonUtils::medianByNth(observed);
+    NumVec absDev(observed.size(), 0.0);
+    for (size_t i = 0; i < observed.size(); ++i) absDev[i] = std::abs(observed[i] - med);
+    const double mad = CommonUtils::medianByNth(absDev);
+    if (mad <= 1e-12) return flags;
+
+    for (size_t i = 0; i < observed.size(); ++i) {
+        const double mz = 0.6745 * (observed[i] - med) / mad;
+        if (std::abs(mz) > zThreshold) flags[obsIdx[i]] = true;
+    }
+    return flags;
+}
+
+std::vector<bool> detectOutliersAdjustedBoxplotObserved(const NumVec& values, const MissingMask& missing, double iqrMultiplier) {
+    std::vector<bool> flags(values.size(), false);
+    NumVec observed;
+    std::vector<size_t> obsIdx;
+    for (size_t i = 0; i < values.size() && i < missing.size(); ++i) {
+        if (missing[i] || !std::isfinite(values[i])) continue;
+        observed.push_back(values[i]);
+        obsIdx.push_back(i);
+    }
+    if (observed.size() < 8) return flags;
+
+    const double q1 = CommonUtils::quantileByNth(observed, 0.25);
+    const double med = CommonUtils::quantileByNth(observed, 0.50);
+    const double q3 = CommonUtils::quantileByNth(observed, 0.75);
+    const double iqr = q3 - q1;
+    if (iqr <= 1e-12) return flags;
+
+    const double bowleySkew = (q3 + q1 - 2.0 * med) / iqr;
+    const double loFactor = iqrMultiplier * std::exp(-4.0 * bowleySkew);
+    const double hiFactor = iqrMultiplier * std::exp(3.0 * bowleySkew);
+    const double lo = q1 - loFactor * iqr;
+    const double hi = q3 + hiFactor * iqr;
+
+    for (size_t i = 0; i < observed.size(); ++i) {
+        if (observed[i] < lo || observed[i] > hi) flags[obsIdx[i]] = true;
+    }
+    return flags;
+}
+
+std::vector<bool> detectOutliersLOFObserved(const NumVec& values, const MissingMask& missing) {
+    std::vector<bool> flags(values.size(), false);
+    NumVec observed;
+    std::vector<size_t> obsIdx;
+    for (size_t i = 0; i < values.size() && i < missing.size(); ++i) {
+        if (missing[i] || !std::isfinite(values[i])) continue;
+        observed.push_back(values[i]);
+        obsIdx.push_back(i);
+    }
+    if (observed.size() < 12) return flags;
+
+    const size_t n = observed.size();
+    const size_t k = std::min<size_t>(10, std::max<size_t>(3, n / 12));
+
+    std::vector<std::vector<double>> dist(n, std::vector<double>(n, 0.0));
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            const double d = std::abs(observed[i] - observed[j]);
+            dist[i][j] = d;
+            dist[j][i] = d;
+        }
+    }
+
+    std::vector<std::vector<size_t>> nbr(n);
+    std::vector<double> kdist(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        std::vector<std::pair<double, size_t>> ds;
+        ds.reserve(n - 1);
+        for (size_t j = 0; j < n; ++j) if (i != j) ds.push_back({dist[i][j], j});
+        std::nth_element(ds.begin(), ds.begin() + (k - 1), ds.end());
+        std::sort(ds.begin(), ds.begin() + k);
+        nbr[i].reserve(k);
+        for (size_t t = 0; t < k; ++t) nbr[i].push_back(ds[t].second);
+        kdist[i] = ds[k - 1].first;
+    }
+
+    std::vector<double> lrd(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        double reach = 0.0;
+        for (size_t nb : nbr[i]) reach += std::max(kdist[nb], dist[i][nb]);
+        lrd[i] = (reach <= 1e-12) ? 0.0 : (static_cast<double>(k) / reach);
+    }
+
+    std::vector<double> lof(n, 1.0);
+    for (size_t i = 0; i < n; ++i) {
+        if (lrd[i] <= 1e-12) {
+            lof[i] = 1.0;
+            continue;
+        }
+        double ratioSum = 0.0;
+        for (size_t nb : nbr[i]) ratioSum += (lrd[nb] / lrd[i]);
+        lof[i] = ratioSum / static_cast<double>(k);
+    }
+
+    const double q3 = CommonUtils::quantileByNth(lof, 0.75);
+    const double q1 = CommonUtils::quantileByNth(lof, 0.25);
+    const double threshold = std::max(1.5, q3 + 1.5 * (q3 - q1));
+    for (size_t i = 0; i < n; ++i) {
+        if (lof[i] > threshold) flags[obsIdx[i]] = true;
+    }
+    return flags;
+}
+
 void capOutliers(NumVec& values, const std::vector<bool>& flags) {
     NumVec inliers;
     for (size_t i = 0; i < values.size(); ++i) if (!flags[i]) inliers.push_back(values[i]);
@@ -337,6 +526,7 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
     report.originalRowCount = data.rowCount();
 
     addTemporalDateFeatures(data, config);
+    addAutoNumericFeatureEngineering(data);
 
     // Outlier flags are computed from observed raw numeric values before imputation.
     std::unordered_map<std::string, std::vector<bool>> detectedFlags;
@@ -344,9 +534,19 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
         if (col.type != ColumnType::NUMERIC) continue;
         const auto& values = std::get<NumVec>(col.values);
 
-        std::vector<bool> flags = (CommonUtils::toLower(config.outlierMethod) == "zscore")
-            ? detectOutliersZObserved(values, col.missing, config.tuning.outlierZThreshold)
-            : detectOutliersIQRObserved(values, col.missing, config.tuning.outlierIqrMultiplier);
+        const std::string method = CommonUtils::toLower(config.outlierMethod);
+        std::vector<bool> flags;
+        if (method == "zscore") {
+            flags = detectOutliersZObserved(values, col.missing, config.tuning.outlierZThreshold);
+        } else if (method == "modified_zscore") {
+            flags = detectOutliersModifiedZObserved(values, col.missing, config.tuning.outlierZThreshold);
+        } else if (method == "adjusted_boxplot") {
+            flags = detectOutliersAdjustedBoxplotObserved(values, col.missing, config.tuning.outlierIqrMultiplier);
+        } else if (method == "lof") {
+            flags = detectOutliersLOFObserved(values, col.missing);
+        } else {
+            flags = detectOutliersIQRObserved(values, col.missing, config.tuning.outlierIqrMultiplier);
+        }
 
         detectedFlags[col.name] = flags;
         report.outlierFlags[col.name] = flags;

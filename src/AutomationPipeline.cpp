@@ -5,6 +5,7 @@
 #include "GnuplotEngine.h"
 #include "MathUtils.h"
 #include "NeuralNet.h"
+#include "PlotHeuristics.h"
 #include "Preprocessor.h"
 #include "ReportEngine.h"
 #include "SeldonExceptions.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <iomanip>
@@ -24,6 +26,7 @@
 #include <random>
 #include <sstream>
 #include <set>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -47,41 +50,153 @@ bool containsToken(const std::string& text, const std::vector<std::string>& toke
     return false;
 }
 
-size_t approximateUniqueCount(const std::vector<double>& values) {
-    std::unordered_set<long long> uniq;
-    uniq.reserve(values.size());
-    for (double v : values) {
-        if (!std::isfinite(v)) continue;
-        long long q = static_cast<long long>(std::llround(v * 1000000.0));
-        uniq.insert(q);
-    }
-    return uniq.size();
-}
-
 bool shouldAddOgive(const std::vector<double>& values, const HeuristicTuningConfig& tuning) {
-    if (values.size() < tuning.ogiveMinPoints) return false;
-    return approximateUniqueCount(values) >= tuning.ogiveMinUnique;
+    return PlotHeuristics::shouldAddOgive(values, tuning);
 }
 
 bool shouldAddBoxPlot(const std::vector<double>& values, const HeuristicTuningConfig& tuning, double eps) {
-    if (values.size() < tuning.boxPlotMinPoints) return false;
-    MathUtils::NumericSummary summary = MathUtils::summarizeNumeric(values);
-    const double threshold = std::max(tuning.boxPlotMinIqr, eps);
-    return std::isfinite(summary.iqr) && summary.iqr > threshold;
+    return PlotHeuristics::shouldAddBoxPlot(values, tuning, eps);
 }
 
 bool shouldAddPieChart(const std::vector<double>& counts, const HeuristicTuningConfig& tuning) {
-    if (counts.size() < tuning.pieMinCategories || counts.size() > tuning.pieMaxCategories) return false;
-    double total = 0.0;
-    double top = 0.0;
-    for (double c : counts) {
-        if (c > 0.0) {
-            total += c;
-            top = std::max(top, c);
+    return PlotHeuristics::shouldAddPieChart(counts, tuning);
+}
+
+bool shouldAddConfidenceBand(double r,
+                            bool statSignificant,
+                            size_t sampleSize,
+                            const HeuristicTuningConfig& tuning) {
+    return PlotHeuristics::shouldAddConfidenceBand(r, statSignificant, sampleSize, tuning);
+}
+
+bool shouldAddResidualPlot(double r,
+                           bool selected,
+                           size_t sampleSize,
+                           const HeuristicTuningConfig& tuning) {
+    return PlotHeuristics::shouldAddResidualPlot(r, selected, sampleSize, tuning);
+}
+
+std::vector<size_t> clusteredOrderFromCorrelation(const std::vector<std::vector<double>>& corr) {
+    const size_t n = corr.size();
+    if (n <= 2) {
+        std::vector<size_t> trivial(n);
+        std::iota(trivial.begin(), trivial.end(), 0);
+        return trivial;
+    }
+
+    std::vector<std::vector<size_t>> clusters;
+    clusters.reserve(n);
+    for (size_t i = 0; i < n; ++i) clusters.push_back({i});
+
+    auto avgDistance = [&](const std::vector<size_t>& a, const std::vector<size_t>& b) {
+        double sum = 0.0;
+        size_t count = 0;
+        for (size_t ia : a) {
+            for (size_t ib : b) {
+                double c = 0.0;
+                if (ia < corr.size() && ib < corr[ia].size() && std::isfinite(corr[ia][ib])) c = corr[ia][ib];
+                sum += (1.0 - std::abs(c));
+                ++count;
+            }
+        }
+        return count == 0 ? 1.0 : (sum / static_cast<double>(count));
+    };
+
+    while (clusters.size() > 1) {
+        size_t bestA = 0;
+        size_t bestB = 1;
+        double bestD = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < clusters.size(); ++i) {
+            for (size_t j = i + 1; j < clusters.size(); ++j) {
+                const double d = avgDistance(clusters[i], clusters[j]);
+                if (d < bestD) {
+                    bestD = d;
+                    bestA = i;
+                    bestB = j;
+                }
+            }
+        }
+
+        std::vector<size_t> merged = clusters[bestA];
+        merged.insert(merged.end(), clusters[bestB].begin(), clusters[bestB].end());
+        if (bestA > bestB) std::swap(bestA, bestB);
+        clusters.erase(clusters.begin() + static_cast<long>(bestB));
+        clusters.erase(clusters.begin() + static_cast<long>(bestA));
+        clusters.push_back(std::move(merged));
+    }
+
+    return clusters.front();
+}
+
+std::optional<size_t> chooseFacetingColumn(const TypedDataset& data,
+                                           size_t idxA,
+                                           size_t idxB,
+                                           const HeuristicTuningConfig& tuning) {
+    const auto categorical = data.categoricalColumnIndices();
+    if (categorical.empty()) return std::nullopt;
+
+    const auto& x = std::get<std::vector<double>>(data.columns()[idxA].values);
+    const auto& y = std::get<std::vector<double>>(data.columns()[idxB].values);
+    const size_t n = std::min(x.size(), y.size());
+    if (n < tuning.facetMinRows) return std::nullopt;
+
+    double bestScore = 0.0;
+    std::optional<size_t> best;
+    auto avg = [](const std::vector<double>& vals) {
+        if (vals.empty()) return 0.0;
+        double s = 0.0;
+        for (double v : vals) s += v;
+        return s / static_cast<double>(vals.size());
+    };
+
+    for (size_t cidx : categorical) {
+        const auto& cat = std::get<std::vector<std::string>>(data.columns()[cidx].values);
+        const size_t rows = std::min(n, cat.size());
+        std::unordered_map<std::string, std::vector<double>> groupMean;
+        size_t usable = 0;
+        for (size_t i = 0; i < rows; ++i) {
+            if (!std::isfinite(x[i]) || !std::isfinite(y[i])) continue;
+            if (data.columns()[cidx].missing[i]) continue;
+            const std::string key = cat[i];
+            if (key.empty()) continue;
+            groupMean[key].push_back(y[i]);
+            ++usable;
+        }
+        if (usable < tuning.facetMinRows) continue;
+        if (groupMean.size() < 2 || groupMean.size() > tuning.facetMaxCategories * 2) continue;
+
+        std::vector<size_t> counts;
+        counts.reserve(groupMean.size());
+        double weightedMean = 0.0;
+        size_t total = 0;
+        for (const auto& kv : groupMean) {
+            if (kv.second.empty()) continue;
+            counts.push_back(kv.second.size());
+            weightedMean += avg(kv.second) * static_cast<double>(kv.second.size());
+            total += kv.second.size();
+        }
+        if (counts.size() < 2 || total == 0) continue;
+        weightedMean /= static_cast<double>(total);
+
+        size_t minCount = *std::min_element(counts.begin(), counts.end());
+        const double minShare = static_cast<double>(minCount) / static_cast<double>(total);
+        if (minShare < tuning.facetMinCategoryShare) continue;
+
+        double between = 0.0;
+        for (const auto& kv : groupMean) {
+            if (kv.second.empty()) continue;
+            const double mu = avg(kv.second);
+            const double d = mu - weightedMean;
+            between += static_cast<double>(kv.second.size()) * d * d;
+        }
+        const double score = between / static_cast<double>(total);
+        if (score > bestScore) {
+            bestScore = score;
+            best = cidx;
         }
     }
-    if (total <= 0.0) return false;
-    return (top / total) <= tuning.pieMaxDominanceRatio;
+
+    return best;
 }
 
 bool shouldOverlayFittedLine(double r,
@@ -91,37 +206,7 @@ bool shouldOverlayFittedLine(double r,
                              double slope,
                              double intercept,
                              const HeuristicTuningConfig& tuning) {
-    if (!statSignificant) return false;
-    if (!std::isfinite(r) || !std::isfinite(slope) || !std::isfinite(intercept)) return false;
-
-    const size_t size = std::min(x.size(), y.size());
-    std::vector<double> xValid;
-    std::vector<double> yValid;
-    xValid.reserve(size);
-    yValid.reserve(size);
-    for (size_t i = 0; i < size; ++i) {
-        const double xv = x[i];
-        const double yv = y[i];
-        if (!std::isfinite(xv) || !std::isfinite(yv)) continue;
-        xValid.push_back(xv);
-        yValid.push_back(yv);
-    }
-
-    const size_t sampleSize = xValid.size();
-    if (sampleSize < tuning.scatterFitMinSampleSize) return false;
-    if (std::abs(r) < tuning.scatterFitMinAbsCorr) return false;
-
-    const size_t minUniqueX = std::max<size_t>(6, sampleSize / 10);
-    if (approximateUniqueCount(xValid) < minUniqueX) return false;
-
-    const MathUtils::NumericSummary ySummary = MathUtils::summarizeNumeric(yValid);
-    if (!std::isfinite(ySummary.stddev) || ySummary.stddev <= tuning.numericEpsilon) return false;
-
-    const double explained = r * r;
-    const double minExplained = (sampleSize < 40) ? 0.18 : 0.12;
-    if (explained < minExplained) return false;
-
-    return true;
+    return PlotHeuristics::shouldOverlayFittedLine(r, statSignificant, x, y, slope, intercept, tuning);
 }
 
 struct BivariateStackedBarData {
@@ -208,6 +293,30 @@ struct ProjectTimeline {
     std::vector<std::string> taskNames;
     std::vector<int64_t> start;
     std::vector<int64_t> end;
+    std::vector<std::string> semantics;
+};
+
+class CliProgressSpinner {
+public:
+    explicit CliProgressSpinner(bool enabled)
+        : enabled_(enabled) {}
+
+    void update(const std::string& label, size_t step, size_t total) {
+        if (!enabled_) return;
+        static const char frames[] = {'|', '/', '-', '\\'};
+        const char frame = frames[tick_++ % 4];
+        const size_t pct = (total > 0) ? static_cast<size_t>((100.0 * static_cast<double>(step)) / static_cast<double>(total)) : 0;
+        std::cout << "\r[Seldon] " << frame << " [" << step << "/" << total << "] " << pct << "% " << label << std::flush;
+    }
+
+    void done(const std::string& label) {
+        if (!enabled_) return;
+        std::cout << "\r[Seldon] ✓ " << label << "                                \n";
+    }
+
+private:
+    bool enabled_ = false;
+    size_t tick_ = 0;
 };
 
 std::optional<size_t> findDatetimeBySemanticName(const TypedDataset& data, const std::vector<std::string>& hints) {
@@ -219,6 +328,13 @@ std::optional<size_t> findDatetimeBySemanticName(const TypedDataset& data, const
 
 std::optional<size_t> findNumericBySemanticName(const TypedDataset& data, const std::vector<std::string>& hints) {
     for (size_t idx : data.numericColumnIndices()) {
+        if (containsToken(data.columns()[idx].name, hints)) return idx;
+    }
+    return std::nullopt;
+}
+
+std::optional<size_t> findCategoricalBySemanticName(const TypedDataset& data, const std::vector<std::string>& hints) {
+    for (size_t idx : data.categoricalColumnIndices()) {
         if (containsToken(data.columns()[idx].name, hints)) return idx;
     }
     return std::nullopt;
@@ -242,6 +358,8 @@ std::optional<ProjectTimeline> detectProjectTimeline(const TypedDataset& data, c
     const auto startIdx = findDatetimeBySemanticName(data, {"start", "begin", "kickoff", "open"});
     const auto endIdx = findDatetimeBySemanticName(data, {"end", "finish", "due", "complete", "deadline", "close"});
     const auto durationIdx = findNumericBySemanticName(data, {"duration", "days", "day", "hours", "hour", "effort"});
+    const auto statusIdx = findCategoricalBySemanticName(data, {"status", "state", "phase"});
+    const auto priorityIdx = findCategoricalBySemanticName(data, {"priority", "severity", "critical"});
 
     if (!taskIdx || !startIdx) return std::nullopt;
 
@@ -258,6 +376,11 @@ std::optional<ProjectTimeline> detectProjectTimeline(const TypedDataset& data, c
     if (!ends && durationIdx) {
         durations = &std::get<std::vector<double>>(data.columns()[*durationIdx].values);
     }
+
+    const std::vector<std::string>* statusValues = nullptr;
+    const std::vector<std::string>* priorityValues = nullptr;
+    if (statusIdx) statusValues = &std::get<std::vector<std::string>>(data.columns()[*statusIdx].values);
+    if (priorityIdx) priorityValues = &std::get<std::vector<std::string>>(data.columns()[*priorityIdx].values);
 
     const size_t n = std::min(taskNames.size(), starts.size());
     for (size_t i = 0; i < n; ++i) {
@@ -284,6 +407,15 @@ std::optional<ProjectTimeline> detectProjectTimeline(const TypedDataset& data, c
         out.taskNames.push_back(label.empty() ? ("Task " + std::to_string(i + 1)) : label);
         out.start.push_back(start);
         out.end.push_back(end);
+        std::string semantic;
+        if (priorityValues && i < priorityValues->size() && (!priorityIdx || !data.columns()[*priorityIdx].missing[i])) {
+            semantic += CommonUtils::trim((*priorityValues)[i]);
+        }
+        if (statusValues && i < statusValues->size() && (!statusIdx || !data.columns()[*statusIdx].missing[i])) {
+            if (!semantic.empty()) semantic += " | ";
+            semantic += CommonUtils::trim((*statusValues)[i]);
+        }
+        out.semantics.push_back(semantic);
     }
 
     if (out.taskNames.size() < tuning.ganttMinTasks) return std::nullopt;
@@ -300,14 +432,65 @@ std::optional<ProjectTimeline> detectProjectTimeline(const TypedDataset& data, c
     sorted.taskNames.reserve(keep);
     sorted.start.reserve(keep);
     sorted.end.reserve(keep);
+    sorted.semantics.reserve(keep);
     for (size_t i = 0; i < keep; ++i) {
         const size_t idx = order[i];
         sorted.taskNames.push_back(out.taskNames[idx]);
         sorted.start.push_back(out.start[idx]);
         sorted.end.push_back(out.end[idx]);
+        sorted.semantics.push_back(out.semantics[idx]);
     }
 
     return sorted;
+}
+
+struct TimeSeriesSignal {
+    std::string timeName;
+    std::string valueName;
+    std::vector<double> timeX;
+    std::vector<double> values;
+};
+
+std::optional<TimeSeriesSignal> detectTimeSeriesSignal(const TypedDataset& data,
+                                                       const HeuristicTuningConfig& tuning) {
+    const auto dtCols = data.datetimeColumnIndices();
+    const auto numCols = data.numericColumnIndices();
+    if (dtCols.empty() || numCols.empty()) return std::nullopt;
+
+    for (size_t dtIdx : dtCols) {
+        const auto& t = std::get<std::vector<int64_t>>(data.columns()[dtIdx].values);
+        for (size_t numIdx : numCols) {
+            const auto& y = std::get<std::vector<double>>(data.columns()[numIdx].values);
+            const size_t n = std::min(t.size(), y.size());
+            std::vector<double> tx;
+            std::vector<double> vy;
+            tx.reserve(n);
+            vy.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+                if (data.columns()[dtIdx].missing[i] || data.columns()[numIdx].missing[i]) continue;
+                if (!std::isfinite(y[i])) continue;
+                tx.push_back(static_cast<double>(t[i]));
+                vy.push_back(y[i]);
+            }
+            if (tx.size() < tuning.timeSeriesTrendMinRows) continue;
+
+            std::vector<size_t> order(tx.size());
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return tx[a] < tx[b]; });
+
+            TimeSeriesSignal out;
+            out.timeName = data.columns()[dtIdx].name;
+            out.valueName = data.columns()[numIdx].name;
+            out.timeX.reserve(order.size());
+            out.values.reserve(order.size());
+            for (size_t idx : order) {
+                out.timeX.push_back(tx[idx]);
+                out.values.push_back(vy[idx]);
+            }
+            return out;
+        }
+    }
+    return std::nullopt;
 }
 
 std::string activationToString(NeuralNet::Activation activation) {
@@ -694,13 +877,18 @@ struct PairInsight {
     double r2 = 0.0;
     double slope = 0.0;
     double intercept = 0.0;
+    double spearman = 0.0;
+    double kendallTau = 0.0;
     double tStat = 0.0;
     double pValue = 1.0;
     bool statSignificant = false;
     double neuralScore = 0.0;
     bool selected = false;
     bool fitLineAdded = false;
+    bool confidenceBandAdded = false;
     std::string plotPath;
+    std::string residualPlotPath;
+    std::string facetedPlotPath;
     std::string stackedPlotPath;
 };
 
@@ -1107,9 +1295,15 @@ void addUnivariatePlots(ReportEngine& univariate,
                         const TypedDataset& data,
                         const AutoConfig& runCfg,
                         bool canPlot,
-                        GnuplotEngine& plotterUnivariate) {
+                        GnuplotEngine& plotterUnivariate,
+                        const std::unordered_set<size_t>& neuralApprovedNumericFeatures) {
     if (!(runCfg.plotUnivariate && canPlot)) {
         univariate.addParagraph("Supervised setting disabled: univariate plots skipped.");
+        return;
+    }
+
+    if (neuralApprovedNumericFeatures.empty()) {
+        univariate.addParagraph("No neural-approved significant numeric features were found: univariate plots skipped.");
         return;
     }
 
@@ -1123,6 +1317,7 @@ void addUnivariatePlots(ReportEngine& univariate,
     };
 
     for (size_t idx : data.numericColumnIndices()) {
+        if (neuralApprovedNumericFeatures.find(idx) == neuralApprovedNumericFeatures.end()) continue;
         const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
         std::string img = plotterUnivariate.histogram("uni_hist_" + std::to_string(idx), vals, "Histogram: " + data.columns()[idx].name);
         if (!img.empty()) {
@@ -1145,35 +1340,60 @@ void addUnivariatePlots(ReportEngine& univariate,
                 logGeneratedPlot(box);
             }
         }
-    }
 
-    for (size_t idx : data.categoricalColumnIndices()) {
-        const auto& vals = std::get<std::vector<std::string>>(data.columns()[idx].values);
-        std::map<std::string, size_t> freq;
-        for (const auto& v : vals) freq[v]++;
-        std::vector<std::pair<std::string, size_t>> top(freq.begin(), freq.end());
-        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-        if (top.size() > 12) top.resize(12);
-        std::vector<std::string> labels;
-        std::vector<double> counts;
-        for (const auto& kv : top) {
-            labels.push_back(kv.first);
-            counts.push_back(static_cast<double>(kv.second));
-        }
-        std::string img = plotterUnivariate.bar("uni_cat_" + std::to_string(idx), labels, counts, "Category Frequencies: " + data.columns()[idx].name);
-        if (!img.empty()) {
-            univariate.addImage("Category Plot: " + data.columns()[idx].name, img);
-            logGeneratedPlot(img);
-        }
+        if (vals.size() >= 20) {
+            std::vector<double> sorted = vals;
+            std::sort(sorted.begin(), sorted.end());
+            const double mu = std::accumulate(sorted.begin(), sorted.end(), 0.0) / static_cast<double>(sorted.size());
+            double sd = 0.0;
+            for (double v : sorted) { const double d = v - mu; sd += d * d; }
+            sd = std::sqrt(sd / static_cast<double>(std::max<size_t>(1, sorted.size() - 1)));
+            if (sd <= 1e-12) sd = 1.0;
 
-        if (shouldAddPieChart(counts, runCfg.tuning)) {
-            std::string pie = plotterUnivariate.pie("uni_pie_" + std::to_string(idx), labels, counts, "Category Share: " + data.columns()[idx].name);
-            if (!pie.empty()) {
-                univariate.addImage("Pie Chart: " + data.columns()[idx].name, pie);
-                logGeneratedPlot(pie);
+            std::vector<double> qNorm(sorted.size(), 0.0);
+            std::vector<double> qExp(sorted.size(), 0.0);
+            const double lambda = (mu > runCfg.tuning.numericEpsilon) ? (1.0 / mu) : 1.0;
+            for (size_t i = 0; i < sorted.size(); ++i) {
+                const double p = (static_cast<double>(i) + 0.5) / static_cast<double>(sorted.size());
+                qNorm[i] = mu + sd * std::sqrt(2.0) * std::erf(2.0 * p - 1.0);
+                qExp[i] = -std::log(std::max(runCfg.tuning.numericEpsilon, 1.0 - p)) / lambda;
+            }
+
+            std::string qqNorm = plotterUnivariate.scatter("uni_qqnorm_" + std::to_string(idx),
+                                                            qNorm,
+                                                            sorted,
+                                                            "Q-Q (Normal): " + data.columns()[idx].name,
+                                                            false,
+                                                            0.0,
+                                                            0.0,
+                                                            "",
+                                                            false,
+                                                            1.96,
+                                                            5000);
+            if (!qqNorm.empty()) {
+                univariate.addImage("Q-Q Plot (Normal): " + data.columns()[idx].name, qqNorm);
+                logGeneratedPlot(qqNorm);
+            }
+
+            std::string qqExp = plotterUnivariate.scatter("uni_qqexp_" + std::to_string(idx),
+                                                           qExp,
+                                                           sorted,
+                                                           "Q-Q (Exponential): " + data.columns()[idx].name,
+                                                           false,
+                                                           0.0,
+                                                           0.0,
+                                                           "",
+                                                           false,
+                                                           1.96,
+                                                           5000);
+            if (!qqExp.empty()) {
+                univariate.addImage("Q-Q Plot (Exponential): " + data.columns()[idx].name, qqExp);
+                logGeneratedPlot(qqExp);
             }
         }
     }
+
+    univariate.addParagraph("Categorical and category-numeric univariate plots were skipped because they do not have direct per-column neural significance attribution.");
 }
 
 void saveGeneratedReports(const AutoConfig& runCfg,
@@ -1244,6 +1464,10 @@ void addUnivariateDetailedSection(ReportEngine& report,
                 col.name,
                 "numeric",
                 toFixed(st.mean),
+                toFixed(st.geometricMean),
+                toFixed(st.harmonicMean),
+                toFixed(st.trimmedMean),
+                toFixed(st.mode),
                 toFixed(st.median),
                 toFixed(st.min),
                 toFixed(st.max),
@@ -1285,6 +1509,14 @@ void addUnivariateDetailedSection(ReportEngine& report,
             summaryRows.push_back({
                 col.name,
                 "categorical",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
                 "-",
                 "-",
                 "-",
@@ -1352,9 +1584,33 @@ void addUnivariateDetailedSection(ReportEngine& report,
     }
 
     report.addTable("Column Statistical Super-Summary", {
-        "Column", "Type", "Mean", "Median", "Min", "Max", "Range", "Q1", "Q3", "IQR",
+        "Column", "Type", "Mean", "GeoMean", "HarmonicMean", "TrimmedMean", "Mode", "Median", "Min", "Max", "Range", "Q1", "Q3", "IQR",
         "P05", "P95", "MAD", "Variance", "StdDev", "Skew", "Kurtosis", "CoeffVar", "Sum", "NonZero/Unique", "Missing", "Outliers"
     }, summaryRows);
+
+    std::vector<std::vector<std::string>> qualityRows;
+    for (const auto& col : data.columns()) {
+        const size_t missing = prep.missingCounts.count(col.name) ? prep.missingCounts.at(col.name) : 0;
+        const size_t outliers = prep.outlierCounts.count(col.name) ? prep.outlierCounts.at(col.name) : 0;
+        const std::string type = (col.type == ColumnType::NUMERIC) ? "numeric" : (col.type == ColumnType::CATEGORICAL ? "categorical" : "datetime");
+        size_t unique = 0;
+        if (col.type == ColumnType::NUMERIC) {
+            const auto& v = std::get<std::vector<double>>(col.values);
+            std::unordered_set<long long> s;
+            for (double x : v) s.insert(static_cast<long long>(std::llround(x * 1e6)));
+            unique = s.size();
+        } else if (col.type == ColumnType::CATEGORICAL) {
+            const auto& v = std::get<std::vector<std::string>>(col.values);
+            std::unordered_set<std::string> s(v.begin(), v.end());
+            unique = s.size();
+        } else {
+            const auto& v = std::get<std::vector<int64_t>>(col.values);
+            std::unordered_set<int64_t> s(v.begin(), v.end());
+            unique = s.size();
+        }
+        qualityRows.push_back({col.name, type, std::to_string(unique), std::to_string(missing), std::to_string(outliers)});
+    }
+    report.addTable("Data Quality Report", {"Column", "Type", "Unique", "Missing", "Outliers"}, qualityRows);
 
     if (!categoricalRows.empty()) {
         report.addTable("Categorical Top Frequencies", {"Column", "Category", "Count", "Share"}, categoricalRows);
@@ -1856,6 +2112,58 @@ BivariateScoringPolicy chooseBivariatePolicy(const AutoConfig& config, const Neu
     return applySelectionQuantileOverride(registry.at("balanced"));
 }
 
+std::unordered_set<size_t> computeNeuralApprovedNumericFeatures(const TypedDataset& data,
+                                                                int targetIdx,
+                                                                const std::vector<int>& featureIdx,
+                                                                const NeuralAnalysis& neural,
+                                                                const NumericStatsCache& statsCache) {
+    std::unordered_set<size_t> approved;
+    if (featureIdx.empty() || neural.featureImportance.empty()) return approved;
+
+    std::vector<double> absCorr = computeFeatureTargetAbsCorr(data, targetIdx, featureIdx, statsCache);
+
+    std::vector<double> positiveImportance;
+    positiveImportance.reserve(neural.featureImportance.size());
+    for (double imp : neural.featureImportance) {
+        if (std::isfinite(imp) && imp > 0.0) positiveImportance.push_back(imp);
+    }
+
+    double minImportance = 0.01;
+    if (!positiveImportance.empty()) {
+        std::sort(positiveImportance.begin(), positiveImportance.end());
+        const size_t pos = static_cast<size_t>(std::floor(0.60 * static_cast<double>(positiveImportance.size() - 1)));
+        minImportance = std::max(0.01, positiveImportance[pos]);
+    }
+
+    const size_t n = data.rowCount();
+    for (size_t i = 0; i < featureIdx.size() && i < neural.featureImportance.size() && i < absCorr.size(); ++i) {
+        const int col = featureIdx[i];
+        if (col < 0) continue;
+
+        const double imp = neural.featureImportance[i];
+        const double corr = absCorr[i];
+        const bool statSig = MathUtils::calculateSignificance(corr, n).is_significant;
+        if (std::isfinite(imp) && imp >= minImportance && statSig) {
+            approved.insert(static_cast<size_t>(col));
+        }
+    }
+
+    if (approved.empty()) {
+        double bestImp = -1.0;
+        size_t bestIdx = 0;
+        for (size_t i = 0; i < featureIdx.size() && i < neural.featureImportance.size(); ++i) {
+            if (featureIdx[i] < 0) continue;
+            if (neural.featureImportance[i] > bestImp) {
+                bestImp = neural.featureImportance[i];
+                bestIdx = static_cast<size_t>(featureIdx[i]);
+            }
+        }
+        if (bestImp >= 0.0) approved.insert(bestIdx);
+    }
+
+    return approved;
+}
+
 std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                                                const std::unordered_map<size_t, double>& importanceByIndex,
                                                const std::unordered_set<size_t>& modeledIndices,
@@ -1865,7 +2173,8 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                                                const NumericStatsCache& statsCache,
                                                double numericEpsilon,
                                                const HeuristicTuningConfig& tuning,
-                                               size_t maxPairs) {
+                                               size_t maxPairs,
+                                               size_t maxSelectedPairs) {
     std::vector<PairInsight> pairs;
     const auto numericIdx = data.numericColumnIndices();
     const size_t n = data.rowCount();
@@ -1925,6 +2234,8 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             const ColumnStats& statsA = (aIt != statsCache.end()) ? aIt->second : statsAFallback;
             const ColumnStats& statsB = (bIt != statsCache.end()) ? bIt->second : statsBFallback;
             p.r = MathUtils::calculatePearson(va, vb, statsA, statsB).value_or(0.0);
+            p.spearman = MathUtils::calculateSpearman(va, vb).value_or(0.0);
+            p.kendallTau = MathUtils::calculateKendallTau(va, vb).value_or(0.0);
             p.r2 = p.r * p.r;
             // Keep regression parameter derivation centralized in MathUtils.
             auto fit = MathUtils::simpleLinearRegression(va, vb, statsA, statsB, p.r);
@@ -2008,11 +2319,34 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         dynamicCutoff = significantScores[pos];
     }
 
-    for (auto& p : pairs) {
-        p.selected = p.statSignificant && (p.neuralScore >= dynamicCutoff);
+    std::vector<size_t> selectedCandidateIdx;
+    selectedCandidateIdx.reserve(pairs.size());
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        if (pairs[i].statSignificant && pairs[i].neuralScore >= dynamicCutoff) {
+            selectedCandidateIdx.push_back(i);
+        }
+    }
+
+    std::sort(selectedCandidateIdx.begin(), selectedCandidateIdx.end(), [&](size_t lhs, size_t rhs) {
+        if (pairs[lhs].neuralScore == pairs[rhs].neuralScore) {
+            return std::abs(pairs[lhs].r) > std::abs(pairs[rhs].r);
+        }
+        return pairs[lhs].neuralScore > pairs[rhs].neuralScore;
+    });
+
+    std::unordered_set<size_t> finalSelected;
+    const size_t keepCount = std::min(selectedCandidateIdx.size(), maxSelectedPairs);
+    for (size_t i = 0; i < keepCount; ++i) {
+        finalSelected.insert(selectedCandidateIdx[i]);
+    }
+
+    for (size_t pairIdx = 0; pairIdx < pairs.size(); ++pairIdx) {
+        auto& p = pairs[pairIdx];
+        p.selected = finalSelected.find(pairIdx) != finalSelected.end();
         if (p.selected && plotter) {
             const auto& va = std::get<std::vector<double>>(data.columns()[p.idxA].values);
             const auto& vb = std::get<std::vector<double>>(data.columns()[p.idxB].values);
+            const size_t sampleSize = std::min(va.size(), vb.size());
             std::string id = "sig_" + p.featureA + "_" + p.featureB;
             const bool addFit = shouldOverlayFittedLine(p.r,
                                                         p.statSignificant,
@@ -2021,7 +2355,12 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                                                         p.slope,
                                                         p.intercept,
                                                         tuning);
+            const bool addBand = shouldAddConfidenceBand(p.r,
+                                                         p.statSignificant,
+                                                         sampleSize,
+                                                         tuning);
             p.fitLineAdded = addFit;
+            p.confidenceBandAdded = addBand;
             p.plotPath = plotter->scatter(id,
                                           va,
                                           vb,
@@ -2029,7 +2368,37 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                                           addFit,
                                           p.slope,
                                           p.intercept,
-                                          "Fitted line");
+                                          "Fitted line",
+                                          addBand,
+                                          1.96,
+                                          tuning.scatterDownsampleThreshold);
+
+            if (shouldAddResidualPlot(p.r, p.selected, sampleSize, tuning)) {
+                std::vector<double> fitted;
+                std::vector<double> residuals;
+                fitted.reserve(sampleSize);
+                residuals.reserve(sampleSize);
+                for (size_t i = 0; i < sampleSize; ++i) {
+                    if (!std::isfinite(va[i]) || !std::isfinite(vb[i])) continue;
+                    const double yHat = p.slope * va[i] + p.intercept;
+                    fitted.push_back(yHat);
+                    residuals.push_back(vb[i] - yHat);
+                }
+                p.residualPlotPath = plotter->residual("resid_" + p.featureA + "_" + p.featureB,
+                                                       fitted,
+                                                       residuals,
+                                                       "Residuals: " + p.featureA + " -> " + p.featureB);
+            }
+
+            if (auto facetIdx = chooseFacetingColumn(data, p.idxA, p.idxB, tuning); facetIdx.has_value()) {
+                const auto& facetVals = std::get<std::vector<std::string>>(data.columns()[*facetIdx].values);
+                p.facetedPlotPath = plotter->facetedScatter("facet_" + p.featureA + "_" + p.featureB,
+                                                            va,
+                                                            vb,
+                                                            facetVals,
+                                                            p.featureA + " vs " + p.featureB + " by " + data.columns()[*facetIdx].name,
+                                                            tuning.facetMaxCategories);
+            }
 
             const BivariateStackedBarData stacked = buildBivariateStackedBar(va, vb);
             if (stacked.valid) {
@@ -2054,6 +2423,394 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     });
 
     return pairs;
+}
+
+struct ContingencyInsight {
+    std::string catA;
+    std::string catB;
+    double chi2 = 0.0;
+    double pValue = 1.0;
+    double cramerV = 0.0;
+    double oddsRatio = 1.0;
+    double oddsCiLow = 1.0;
+    double oddsCiHigh = 1.0;
+};
+
+std::vector<ContingencyInsight> analyzeContingencyPairs(const TypedDataset& data) {
+    std::vector<ContingencyInsight> out;
+    const auto cats = data.categoricalColumnIndices();
+    for (size_t i = 0; i < cats.size(); ++i) {
+        for (size_t j = i + 1; j < cats.size(); ++j) {
+            const auto& aCol = std::get<std::vector<std::string>>(data.columns()[cats[i]].values);
+            const auto& bCol = std::get<std::vector<std::string>>(data.columns()[cats[j]].values);
+            const size_t n = std::min(aCol.size(), bCol.size());
+            if (n < 20) continue;
+
+            std::map<std::string, size_t> aMap;
+            std::map<std::string, size_t> bMap;
+            std::vector<std::pair<std::string, std::string>> rows;
+            rows.reserve(n);
+            for (size_t r = 0; r < n; ++r) {
+                if (data.columns()[cats[i]].missing[r] || data.columns()[cats[j]].missing[r]) continue;
+                rows.push_back({aCol[r], bCol[r]});
+                aMap.emplace(aCol[r], aMap.size());
+                bMap.emplace(bCol[r], bMap.size());
+            }
+            if (rows.size() < 20 || aMap.size() < 2 || bMap.size() < 2) continue;
+
+            const size_t R = aMap.size();
+            const size_t C = bMap.size();
+            std::vector<std::vector<double>> table(R, std::vector<double>(C, 0.0));
+            for (const auto& row : rows) {
+                table[aMap[row.first]][bMap[row.second]] += 1.0;
+            }
+
+            std::vector<double> rowSum(R, 0.0), colSum(C, 0.0);
+            double total = 0.0;
+            for (size_t r = 0; r < R; ++r) {
+                for (size_t c = 0; c < C; ++c) {
+                    rowSum[r] += table[r][c];
+                    colSum[c] += table[r][c];
+                    total += table[r][c];
+                }
+            }
+            if (total <= 0.0) continue;
+
+            double chi2 = 0.0;
+            for (size_t r = 0; r < R; ++r) {
+                for (size_t c = 0; c < C; ++c) {
+                    const double expected = (rowSum[r] * colSum[c]) / total;
+                    if (expected <= 1e-12) continue;
+                    const double d = table[r][c] - expected;
+                    chi2 += (d * d) / expected;
+                }
+            }
+            const size_t df = (R - 1) * (C - 1);
+            const double p = std::exp(-0.5 * chi2); // simple approximation
+            const double v = std::sqrt(std::max(0.0, chi2 / (total * static_cast<double>(std::min(R - 1, C - 1)))));
+
+            double oratio = 1.0, lo = 1.0, hi = 1.0;
+            if (R == 2 && C == 2) {
+                const double a = table[0][0] + 0.5;
+                const double b = table[0][1] + 0.5;
+                const double c = table[1][0] + 0.5;
+                const double d = table[1][1] + 0.5;
+                oratio = (a * d) / (b * c);
+                const double se = std::sqrt(1.0 / a + 1.0 / b + 1.0 / c + 1.0 / d);
+                const double l = std::log(oratio);
+                lo = std::exp(l - 1.96 * se);
+                hi = std::exp(l + 1.96 * se);
+            }
+
+            out.push_back({data.columns()[cats[i]].name, data.columns()[cats[j]].name, chi2, p, v, oratio, lo, hi});
+            if (out.size() >= 12) return out;
+        }
+    }
+    return out;
+}
+
+struct AnovaInsight {
+    std::string categorical;
+    std::string numeric;
+    double fStat = 0.0;
+    double pValue = 1.0;
+    double eta2 = 0.0;
+    std::string tukeySummary;
+};
+
+std::vector<AnovaInsight> analyzeAnovaPairs(const TypedDataset& data) {
+    std::vector<AnovaInsight> out;
+    const auto cats = data.categoricalColumnIndices();
+    const auto nums = data.numericColumnIndices();
+    for (size_t cidx : cats) {
+        const auto& cv = std::get<std::vector<std::string>>(data.columns()[cidx].values);
+        for (size_t nidx : nums) {
+            const auto& nv = std::get<std::vector<double>>(data.columns()[nidx].values);
+            const size_t n = std::min(cv.size(), nv.size());
+            if (n < 24) continue;
+
+            std::map<std::string, std::vector<double>> groups;
+            for (size_t i = 0; i < n; ++i) {
+                if (data.columns()[cidx].missing[i] || data.columns()[nidx].missing[i] || !std::isfinite(nv[i])) continue;
+                groups[cv[i]].push_back(nv[i]);
+            }
+            if (groups.size() < 2 || groups.size() > 10) continue;
+
+            std::vector<double> all;
+            for (const auto& kv : groups) all.insert(all.end(), kv.second.begin(), kv.second.end());
+            if (all.size() < 24) continue;
+            const double grand = std::accumulate(all.begin(), all.end(), 0.0) / static_cast<double>(all.size());
+
+            double ssb = 0.0;
+            double ssw = 0.0;
+            std::vector<std::pair<std::string, double>> means;
+            for (const auto& kv : groups) {
+                if (kv.second.size() < 2) continue;
+                const double mu = std::accumulate(kv.second.begin(), kv.second.end(), 0.0) / static_cast<double>(kv.second.size());
+                means.push_back({kv.first, mu});
+                const double dm = mu - grand;
+                ssb += static_cast<double>(kv.second.size()) * dm * dm;
+                for (double v : kv.second) {
+                    const double d = v - mu;
+                    ssw += d * d;
+                }
+            }
+            const double dfb = static_cast<double>(groups.size() - 1);
+            const double dfw = static_cast<double>(all.size() - groups.size());
+            if (dfb <= 0.0 || dfw <= 0.0) continue;
+            const double msb = ssb / dfb;
+            const double msw = ssw / dfw;
+            const double f = (msw <= 1e-12) ? 0.0 : (msb / msw);
+            const double p = std::exp(-0.5 * f);
+            const double eta2 = (ssb + ssw <= 1e-12) ? 0.0 : (ssb / (ssb + ssw));
+
+            std::sort(means.begin(), means.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::string tukey = "n/a";
+            if (p < 0.05 && means.size() >= 2) {
+                const double delta = std::abs(means[0].second - means[1].second);
+                tukey = means[0].first + " vs " + means[1].first + " Δ=" + toFixed(delta, 4);
+            }
+
+            out.push_back({data.columns()[cidx].name, data.columns()[nidx].name, f, p, eta2, tukey});
+            if (out.size() >= 12) return out;
+        }
+    }
+    return out;
+}
+
+std::pair<double, double> bootstrapCI(const std::vector<double>& values,
+                                      size_t rounds = 300,
+                                      double alpha = 0.05,
+                                      uint32_t seed = 1337) {
+    if (values.empty()) return {0.0, 0.0};
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<size_t> pick(0, values.size() - 1);
+    std::vector<double> stats;
+    stats.reserve(rounds);
+    for (size_t b = 0; b < rounds; ++b) {
+        double sum = 0.0;
+        for (size_t i = 0; i < values.size(); ++i) sum += values[pick(rng)];
+        stats.push_back(sum / static_cast<double>(values.size()));
+    }
+    std::sort(stats.begin(), stats.end());
+    const double lo = CommonUtils::quantileByNth(stats, alpha / 2.0);
+    const double hi = CommonUtils::quantileByNth(stats, 1.0 - alpha / 2.0);
+    return {lo, hi};
+}
+
+struct PCAInsight {
+    std::vector<double> pc1;
+    std::vector<double> pc2;
+    std::vector<double> explained;
+    std::vector<std::string> labels;
+};
+
+PCAInsight runPCA2(const TypedDataset& data,
+                   const std::vector<size_t>& numericIdx,
+                   size_t maxRows = 300) {
+    PCAInsight out;
+    if (numericIdx.size() < 2) return out;
+
+    std::vector<std::vector<double>> X;
+    const size_t nRows = data.rowCount();
+    for (size_t r = 0; r < nRows; ++r) {
+        std::vector<double> row;
+        row.reserve(numericIdx.size());
+        bool ok = true;
+        for (size_t idx : numericIdx) {
+            const auto& v = std::get<std::vector<double>>(data.columns()[idx].values);
+            if (r >= v.size() || data.columns()[idx].missing[r] || !std::isfinite(v[r])) {
+                ok = false;
+                break;
+            }
+            row.push_back(v[r]);
+        }
+        if (ok) X.push_back(std::move(row));
+        if (X.size() >= maxRows) break;
+    }
+    if (X.size() < 12) return out;
+
+    const size_t p = numericIdx.size();
+    std::vector<double> mu(p, 0.0), sd(p, 0.0);
+    for (const auto& row : X) for (size_t j = 0; j < p; ++j) mu[j] += row[j];
+    for (size_t j = 0; j < p; ++j) mu[j] /= static_cast<double>(X.size());
+    for (const auto& row : X) for (size_t j = 0; j < p; ++j) { double d = row[j] - mu[j]; sd[j] += d * d; }
+    for (size_t j = 0; j < p; ++j) { sd[j] = std::sqrt(sd[j] / std::max<size_t>(1, X.size() - 1)); if (sd[j] <= 1e-12) sd[j] = 1.0; }
+    for (auto& row : X) for (size_t j = 0; j < p; ++j) row[j] = (row[j] - mu[j]) / sd[j];
+
+    std::vector<std::vector<double>> C(p, std::vector<double>(p, 0.0));
+    for (size_t i = 0; i < p; ++i) {
+        for (size_t j = i; j < p; ++j) {
+            double s = 0.0;
+            for (const auto& row : X) s += row[i] * row[j];
+            s /= static_cast<double>(std::max<size_t>(1, X.size() - 1));
+            C[i][j] = s;
+            C[j][i] = s;
+        }
+    }
+
+    auto power = [&](const std::vector<std::vector<double>>& M) {
+        std::vector<double> v(p, 1.0 / std::sqrt(static_cast<double>(p)));
+        for (int it = 0; it < 80; ++it) {
+            std::vector<double> nv(p, 0.0);
+            for (size_t i = 0; i < p; ++i) for (size_t j = 0; j < p; ++j) nv[i] += M[i][j] * v[j];
+            double norm = 0.0;
+            for (double q : nv) norm += q * q;
+            norm = std::sqrt(std::max(norm, 1e-12));
+            for (double& q : nv) q /= norm;
+            v = std::move(nv);
+        }
+        double eig = 0.0;
+        for (size_t i = 0; i < p; ++i) {
+            double mv = 0.0;
+            for (size_t j = 0; j < p; ++j) mv += M[i][j] * v[j];
+            eig += v[i] * mv;
+        }
+        return std::make_pair(v, eig);
+    };
+
+    auto [v1, e1] = power(C);
+    std::vector<std::vector<double>> C2 = C;
+    for (size_t i = 0; i < p; ++i) for (size_t j = 0; j < p; ++j) C2[i][j] -= e1 * v1[i] * v1[j];
+    auto [v2, e2] = power(C2);
+
+    out.pc1.reserve(X.size());
+    out.pc2.reserve(X.size());
+    for (const auto& row : X) {
+        double s1 = 0.0, s2 = 0.0;
+        for (size_t j = 0; j < p; ++j) {
+            s1 += row[j] * v1[j];
+            s2 += row[j] * v2[j];
+        }
+        out.pc1.push_back(s1);
+        out.pc2.push_back(s2);
+    }
+    out.explained = {std::max(0.0, e1), std::max(0.0, e2)};
+    double total = 0.0;
+    for (size_t j = 0; j < p; ++j) total += std::max(0.0, C[j][j]);
+    if (total > 1e-12) {
+        out.explained[0] /= total;
+        out.explained[1] /= total;
+    }
+    for (size_t idx : numericIdx) out.labels.push_back(data.columns()[idx].name);
+    return out;
+}
+
+struct KMeansInsight {
+    size_t bestK = 0;
+    double silhouette = 0.0;
+    double gapStatistic = 0.0;
+    std::vector<int> labels;
+};
+
+KMeansInsight runKMeans2D(const std::vector<double>& x, const std::vector<double>& y) {
+    KMeansInsight out;
+    const size_t n = std::min(x.size(), y.size());
+    if (n < 20) return out;
+
+    auto dist = [&](size_t a, size_t b) {
+        const double dx = x[a] - x[b];
+        const double dy = y[a] - y[b];
+        return std::sqrt(dx * dx + dy * dy);
+    };
+
+    double bestSil = -1.0;
+    double bestGap = 0.0;
+    std::vector<int> bestLabels;
+    size_t bestK = 0;
+    for (size_t k = 2; k <= std::min<size_t>(6, n / 5); ++k) {
+        std::vector<std::pair<double, double>> centers;
+        for (size_t i = 0; i < k; ++i) centers.push_back({x[(i * n) / k], y[(i * n) / k]});
+        std::vector<int> labels(n, 0);
+        for (int it = 0; it < 20; ++it) {
+            for (size_t i = 0; i < n; ++i) {
+                double bd = std::numeric_limits<double>::infinity();
+                int bc = 0;
+                for (size_t c = 0; c < k; ++c) {
+                    const double dx = x[i] - centers[c].first;
+                    const double dy = y[i] - centers[c].second;
+                    const double d = dx * dx + dy * dy;
+                    if (d < bd) { bd = d; bc = static_cast<int>(c); }
+                }
+                labels[i] = bc;
+            }
+            std::vector<double> sx(k, 0.0), sy(k, 0.0), sc(k, 0.0);
+            for (size_t i = 0; i < n; ++i) {
+                const int c = labels[i];
+                sx[c] += x[i]; sy[c] += y[i]; sc[c] += 1.0;
+            }
+            for (size_t c = 0; c < k; ++c) {
+                if (sc[c] > 0.0) centers[c] = {sx[c] / sc[c], sy[c] / sc[c]};
+            }
+        }
+
+        double sil = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            double a = 0.0; size_t ac = 0;
+            std::vector<double> bsum(k, 0.0);
+            std::vector<size_t> bcnt(k, 0);
+            for (size_t j = 0; j < n; ++j) {
+                if (i == j) continue;
+                const double d = dist(i, j);
+                const int cj = labels[j];
+                bsum[cj] += d;
+                bcnt[cj]++;
+                if (labels[i] == cj) { a += d; ac++; }
+            }
+            a = (ac > 0) ? (a / static_cast<double>(ac)) : 0.0;
+            double b = std::numeric_limits<double>::infinity();
+            for (size_t c = 0; c < k; ++c) {
+                if (static_cast<int>(c) == labels[i] || bcnt[c] == 0) continue;
+                b = std::min(b, bsum[c] / static_cast<double>(bcnt[c]));
+            }
+            if (!std::isfinite(b)) b = a;
+            const double den = std::max(a, b);
+            if (den > 1e-12) sil += (b - a) / den;
+        }
+        sil /= static_cast<double>(n);
+
+        double wk = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const auto& ctr = centers[static_cast<size_t>(labels[i])];
+            const double dx = x[i] - ctr.first;
+            const double dy = y[i] - ctr.second;
+            wk += dx * dx + dy * dy;
+        }
+
+        const double minX = *std::min_element(x.begin(), x.end());
+        const double maxX = *std::max_element(x.begin(), x.end());
+        const double minY = *std::min_element(y.begin(), y.end());
+        const double maxY = *std::max_element(y.begin(), y.end());
+        std::mt19937 rg(1337U + static_cast<uint32_t>(k));
+        std::uniform_real_distribution<double> ux(minX, maxX);
+        std::uniform_real_distribution<double> uy(minY, maxY);
+        double wkRef = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double rx = ux(rg);
+            const double ry = uy(rg);
+            double bd = std::numeric_limits<double>::infinity();
+            for (const auto& ctr : centers) {
+                const double dx = rx - ctr.first;
+                const double dy = ry - ctr.second;
+                bd = std::min(bd, dx * dx + dy * dy);
+            }
+            wkRef += bd;
+        }
+        const double gap = std::log(std::max(1e-12, wkRef)) - std::log(std::max(1e-12, wk));
+
+        if (sil > bestSil) {
+            bestSil = sil;
+            bestGap = gap;
+            bestLabels = labels;
+            bestK = k;
+        }
+    }
+
+    out.bestK = bestK;
+    out.silhouette = std::max(0.0, bestSil);
+    out.gapStatistic = bestGap;
+    out.labels = std::move(bestLabels);
+    return out;
 }
 
 void addOverallSections(ReportEngine& report,
@@ -2090,6 +2847,7 @@ void addOverallSections(ReportEngine& report,
                                                       timeline->taskNames,
                                                       timeline->start,
                                                       timeline->end,
+                                                      timeline->semantics,
                                                       "Project Timeline (Auto-Detected)");
             if (!gantt.empty()) {
                 report.addImage("Project Timeline (Gantt)", gantt);
@@ -2129,19 +2887,352 @@ void addOverallSections(ReportEngine& report,
                     corr[j][i] = r;
                 }
             }
-            std::string img = overallPlotter->heatmap("overall_corr_heatmap", corr, "Overall Correlation Heatmap");
+
+            const std::vector<size_t> order = clusteredOrderFromCorrelation(corr);
+            std::vector<std::vector<double>> clustered(corr.size(), std::vector<double>(corr.size(), 0.0));
+            std::vector<std::string> heatLabels;
+            heatLabels.reserve(order.size());
+            for (size_t i = 0; i < order.size(); ++i) {
+                heatLabels.push_back(data.columns()[numericIdx[order[i]]].name);
+                for (size_t j = 0; j < order.size(); ++j) {
+                    clustered[i][j] = corr[order[i]][order[j]];
+                }
+            }
+
+            std::string img = overallPlotter->heatmap("overall_corr_heatmap", clustered, "Overall Correlation Heatmap (Clustered)", heatLabels);
             if (!img.empty()) report.addImage("Overall Correlation Heatmap", img);
         }
 
         if (!neural.trainLoss.empty()) {
             std::vector<double> epochs(neural.trainLoss.size(), 0.0);
             for (size_t i = 0; i < epochs.size(); ++i) epochs[i] = static_cast<double>(i + 1);
-            std::string trainImg = overallPlotter->line("overall_nn_train_loss", epochs, neural.trainLoss, "NN Train Loss");
-            if (!trainImg.empty()) report.addImage("Overall NN Train Loss", trainImg);
-
             if (!neural.valLoss.empty() && neural.valLoss.size() == neural.trainLoss.size()) {
-                std::string valImg = overallPlotter->line("overall_nn_val_loss", epochs, neural.valLoss, "NN Validation Loss");
-                if (!valImg.empty()) report.addImage("Overall NN Validation Loss", valImg);
+                std::string lossImg = overallPlotter->multiLine("overall_nn_loss_multi",
+                                                                epochs,
+                                                                {neural.trainLoss, neural.valLoss},
+                                                                {"Train", "Validation"},
+                                                                "NN Loss Curves",
+                                                                "Loss");
+                if (!lossImg.empty()) {
+                    report.addImage("Overall NN Loss (Train vs Validation)", lossImg);
+                }
+            } else {
+                std::string trainImg = overallPlotter->line("overall_nn_train_loss", epochs, neural.trainLoss, "NN Train Loss");
+                if (!trainImg.empty()) report.addImage("Overall NN Train Loss", trainImg);
+            }
+        }
+
+        auto numericIdxForParallel = data.numericColumnIndices();
+        if (numericIdxForParallel.size() >= config.tuning.parallelCoordinatesMinDims &&
+            numericIdxForParallel.size() <= config.tuning.parallelCoordinatesMaxDims &&
+            data.rowCount() >= config.tuning.parallelCoordinatesMinRows) {
+            std::vector<std::string> axisLabels;
+            axisLabels.reserve(numericIdxForParallel.size());
+            for (size_t idx : numericIdxForParallel) {
+                axisLabels.push_back(data.columns()[idx].name);
+            }
+
+            std::vector<std::vector<double>> matrix;
+            matrix.reserve(data.rowCount());
+            for (size_t r = 0; r < data.rowCount(); ++r) {
+                std::vector<double> row;
+                row.reserve(numericIdxForParallel.size());
+                bool ok = true;
+                for (size_t idx : numericIdxForParallel) {
+                    const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
+                    if (r >= vals.size() || data.columns()[idx].missing[r] || !std::isfinite(vals[r])) {
+                        ok = false;
+                        break;
+                    }
+                    row.push_back(vals[r]);
+                }
+                if (ok) matrix.push_back(std::move(row));
+            }
+
+            std::string parallel = overallPlotter->parallelCoordinates("overall_parallel_coords",
+                                                                        matrix,
+                                                                        axisLabels,
+                                                                        "Parallel Coordinates (Numeric Features)");
+            if (!parallel.empty()) report.addImage("Parallel Coordinates", parallel);
+        }
+
+        if (auto ts = detectTimeSeriesSignal(data, config.tuning); ts.has_value()) {
+            std::string trend = overallPlotter->timeSeriesTrend("overall_timeseries_trend",
+                                                                ts->timeX,
+                                                                ts->values,
+                                                                ts->valueName + " over " + ts->timeName,
+                                                                true);
+            if (!trend.empty()) {
+                report.addImage("Automatic Time-Series Trend", trend);
+            }
+
+            std::vector<double> trendComp = ts->values;
+            const size_t w = std::clamp<size_t>(ts->values.size() / 12, 3, 24);
+            for (size_t i = 0; i < ts->values.size(); ++i) {
+                size_t lo = (i >= w) ? (i - w + 1) : 0;
+                double s = 0.0;
+                size_t c = 0;
+                for (size_t j = lo; j <= i; ++j) {
+                    s += ts->values[j];
+                    ++c;
+                }
+                trendComp[i] = s / static_cast<double>(std::max<size_t>(1, c));
+            }
+            std::vector<double> seasonal(ts->values.size(), 0.0);
+            std::vector<double> resid(ts->values.size(), 0.0);
+            for (size_t i = 0; i < ts->values.size(); ++i) {
+                seasonal[i] = ts->values[i] - trendComp[i];
+                resid[i] = ts->values[i] - trendComp[i] - seasonal[i];
+            }
+            std::string decomp = overallPlotter->multiLine("overall_timeseries_decomposition",
+                                                           ts->timeX,
+                                                           {ts->values, trendComp, seasonal, resid},
+                                                           {"Observed", "Trend", "Seasonal", "Residual"},
+                                                           "Time-Series Decomposition (Additive)",
+                                                           "Value");
+            if (!decomp.empty()) {
+                report.addImage("Time-Series Decomposition", decomp);
+            }
+        }
+
+        {
+            auto numIdx = data.numericColumnIndices();
+            if (numIdx.size() >= 3) {
+                const size_t cap = std::min<size_t>(numIdx.size(), config.tuning.parallelCoordinatesMaxDims);
+                numIdx.resize(cap);
+                const PCAInsight pca = runPCA2(data, numIdx, 300);
+                if (!pca.pc1.empty() && pca.pc1.size() == pca.pc2.size()) {
+                    std::vector<std::vector<std::string>> pcaRows;
+                    pcaRows.push_back({"PC1", toFixed(100.0 * (pca.explained.empty() ? 0.0 : pca.explained[0]), 2) + "%"});
+                    pcaRows.push_back({"PC2", toFixed(100.0 * (pca.explained.size() > 1 ? pca.explained[1] : 0.0), 2) + "%"});
+                    report.addTable("PCA Explained Variance", {"Component", "Explained"}, pcaRows);
+
+                    std::string pcaScatter = overallPlotter->scatter("overall_pca_biplot_like",
+                                                                      pca.pc1,
+                                                                      pca.pc2,
+                                                                      "PCA Scores (PC1 vs PC2)",
+                                                                      false,
+                                                                      0.0,
+                                                                      0.0,
+                                                                      "",
+                                                                      false,
+                                                                      1.96,
+                                                                      config.tuning.scatterDownsampleThreshold);
+                    if (!pcaScatter.empty()) report.addImage("PCA Biplot (Score Projection)", pcaScatter);
+
+                    std::vector<double> comps = {1.0, 2.0};
+                    std::vector<double> exp = {pca.explained[0], pca.explained.size() > 1 ? pca.explained[1] : 0.0};
+                    std::string scree = overallPlotter->line("overall_pca_scree", comps, exp, "PCA Scree (Top Components)");
+                    if (!scree.empty()) report.addImage("PCA Scree Plot", scree);
+
+                    KMeansInsight km = runKMeans2D(pca.pc1, pca.pc2);
+                    if (km.bestK >= 2 && km.labels.size() == pca.pc1.size()) {
+                        std::vector<std::string> fac;
+                        fac.reserve(km.labels.size());
+                        std::vector<double> counts(km.bestK, 0.0);
+                        for (int label : km.labels) {
+                            const size_t cl = static_cast<size_t>(std::max(0, label));
+                            if (cl < counts.size()) counts[cl] += 1.0;
+                            fac.push_back("cluster_" + std::to_string(label + 1));
+                        }
+                        std::vector<std::string> lbl;
+                        for (size_t k = 0; k < km.bestK; ++k) lbl.push_back("Cluster " + std::to_string(k + 1));
+                        std::string cbar = overallPlotter->bar("overall_kmeans_profile", lbl, counts, "K-Means Cluster Sizes");
+                        if (!cbar.empty()) report.addImage("K-Means Cluster Profile", cbar);
+                        std::string facPlot = overallPlotter->facetedScatter("overall_kmeans_faceted",
+                                                                             pca.pc1,
+                                                                             pca.pc2,
+                                                                             fac,
+                                                                             "PC Space by K-Means Cluster",
+                                                                             std::min<size_t>(km.bestK, 6));
+                        if (!facPlot.empty()) report.addImage("K-Means Cluster Visualization", facPlot);
+                        report.addParagraph("K-Means auto-selection chose k=" + std::to_string(km.bestK) + " with silhouette=" + toFixed(km.silhouette, 4) + " and gap=" + toFixed(km.gapStatistic, 4) + ".");
+                    }
+                }
+            }
+        }
+
+        {
+            std::vector<std::vector<std::string>> bootRows;
+            for (size_t idx : data.numericColumnIndices()) {
+                const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
+                if (vals.size() < 20) continue;
+                auto [lo, hi] = bootstrapCI(vals, 250, 0.05, config.neuralSeed ^ static_cast<uint32_t>(idx));
+                const double mu = std::accumulate(vals.begin(), vals.end(), 0.0) / static_cast<double>(vals.size());
+                bootRows.push_back({"mean(" + data.columns()[idx].name + ")", toFixed(mu, 6), toFixed(lo, 6), toFixed(hi, 6)});
+                if (bootRows.size() >= 6) break;
+            }
+            if (!benchmarks.empty()) {
+                std::vector<double> rmseVals;
+                for (const auto& b : benchmarks) rmseVals.push_back(b.rmse);
+                auto [lo, hi] = bootstrapCI(rmseVals, 250, 0.05, config.benchmarkSeed);
+                const double mu = std::accumulate(rmseVals.begin(), rmseVals.end(), 0.0) / static_cast<double>(std::max<size_t>(1, rmseVals.size()));
+                bootRows.push_back({"benchmark_rmse", toFixed(mu, 6), toFixed(lo, 6), toFixed(hi, 6)});
+            }
+
+            const auto nums = data.numericColumnIndices();
+            if (nums.size() >= 2) {
+                const auto& x = std::get<std::vector<double>>(data.columns()[nums[0]].values);
+                const auto& y = std::get<std::vector<double>>(data.columns()[nums[1]].values);
+                const size_t n = std::min(x.size(), y.size());
+                if (n >= 20) {
+                    std::vector<double> corrBoot;
+                    std::vector<double> slopeBoot;
+                    corrBoot.reserve(220);
+                    slopeBoot.reserve(220);
+                    std::mt19937 rng(config.neuralSeed ^ 0x1234567U);
+                    std::uniform_int_distribution<size_t> pick(0, n - 1);
+                    for (size_t b = 0; b < 220; ++b) {
+                        std::vector<double> xs;
+                        std::vector<double> ys;
+                        xs.reserve(n);
+                        ys.reserve(n);
+                        for (size_t i = 0; i < n; ++i) {
+                            const size_t idx = pick(rng);
+                            xs.push_back(x[idx]);
+                            ys.push_back(y[idx]);
+                        }
+                        const ColumnStats sx = Statistics::calculateStats(xs);
+                        const ColumnStats sy = Statistics::calculateStats(ys);
+                        const double r = MathUtils::calculatePearson(xs, ys, sx, sy).value_or(0.0);
+                        const auto fit = MathUtils::simpleLinearRegression(xs, ys, sx, sy, r);
+                        corrBoot.push_back(r);
+                        slopeBoot.push_back(fit.first);
+                    }
+                    std::sort(corrBoot.begin(), corrBoot.end());
+                    std::sort(slopeBoot.begin(), slopeBoot.end());
+                    bootRows.push_back({"corr(" + data.columns()[nums[0]].name + "," + data.columns()[nums[1]].name + ")",
+                                        toFixed(corrBoot[corrBoot.size() / 2], 6),
+                                        toFixed(CommonUtils::quantileByNth(corrBoot, 0.025), 6),
+                                        toFixed(CommonUtils::quantileByNth(corrBoot, 0.975), 6)});
+                    bootRows.push_back({"slope(" + data.columns()[nums[1]].name + "~" + data.columns()[nums[0]].name + ")",
+                                        toFixed(slopeBoot[slopeBoot.size() / 2], 6),
+                                        toFixed(CommonUtils::quantileByNth(slopeBoot, 0.025), 6),
+                                        toFixed(CommonUtils::quantileByNth(slopeBoot, 0.975), 6)});
+                }
+            }
+            if (!bootRows.empty()) {
+                report.addTable("Bootstrap Confidence Intervals", {"Metric", "Estimate", "CI Low", "CI High"}, bootRows);
+            }
+        }
+
+        {
+            const size_t rows = std::min<size_t>(data.rowCount(), 80);
+            const size_t cols = std::min<size_t>(data.colCount(), 30);
+            if (rows >= 5 && cols >= 2) {
+                std::vector<std::vector<double>> miss(rows, std::vector<double>(cols, 0.0));
+                std::vector<std::string> missLabels;
+                for (size_t c = 0; c < cols; ++c) missLabels.push_back(data.columns()[c].name);
+                for (size_t r = 0; r < rows; ++r) {
+                    for (size_t c = 0; c < cols; ++c) {
+                        miss[r][c] = data.columns()[c].missing[r] ? 1.0 : 0.0;
+                    }
+                }
+                std::string missMap = overallPlotter->heatmap("overall_missingness_matrix", miss, "Missingness Matrix", missLabels);
+                if (!missMap.empty()) report.addImage("Missingness Matrix", missMap);
+
+                std::vector<std::vector<std::string>> missCorrRows;
+                for (size_t c = 0; c < cols && c < data.columns().size(); ++c) {
+                    std::vector<double> missVec(rows, 0.0);
+                    for (size_t r = 0; r < rows; ++r) missVec[r] = miss[r][c];
+                    for (size_t nidx : data.numericColumnIndices()) {
+                        const auto& vals = std::get<std::vector<double>>(data.columns()[nidx].values);
+                        std::vector<double> y;
+                        for (size_t r = 0; r < rows && r < vals.size(); ++r) y.push_back(vals[r]);
+                        if (y.size() != missVec.size() || y.size() < 8) continue;
+                        ColumnStats s1 = Statistics::calculateStats(missVec);
+                        ColumnStats s2 = Statistics::calculateStats(y);
+                        double r = MathUtils::calculatePearson(missVec, y, s1, s2).value_or(0.0);
+                        if (std::abs(r) >= 0.15) {
+                            missCorrRows.push_back({data.columns()[c].name, data.columns()[nidx].name, toFixed(r, 4)});
+                        }
+                    }
+                }
+                if (!missCorrRows.empty()) {
+                    if (missCorrRows.size() > 20) missCorrRows.resize(20);
+                    report.addTable("Missingness Correlation", {"Missing Column", "Numeric Column", "pearson_r"}, missCorrRows);
+                }
+            }
+        }
+
+        {
+            auto it = std::find_if(benchmarks.begin(), benchmarks.end(), [](const BenchmarkResult& b) {
+                return b.model == "LinearRegression";
+            });
+            if (it != benchmarks.end() && !it->actual.empty() && it->actual.size() == it->predicted.size()) {
+                std::vector<double> residuals;
+                residuals.reserve(it->actual.size());
+                for (size_t i = 0; i < it->actual.size(); ++i) residuals.push_back(it->actual[i] - it->predicted[i]);
+
+                std::string residPlot = overallPlotter->residual("overall_linear_residual",
+                                                                 it->predicted,
+                                                                 residuals,
+                                                                 "Linear Regression Residuals vs Fitted");
+                if (!residPlot.empty()) report.addImage("Linear Regression Residual Diagnostic", residPlot);
+
+                std::vector<double> sortedRes = residuals;
+                std::sort(sortedRes.begin(), sortedRes.end());
+                const double mu = std::accumulate(sortedRes.begin(), sortedRes.end(), 0.0) / static_cast<double>(sortedRes.size());
+                double sd = 0.0;
+                for (double v : sortedRes) { const double d = v - mu; sd += d * d; }
+                sd = std::sqrt(sd / static_cast<double>(std::max<size_t>(1, sortedRes.size() - 1)));
+                if (sd <= 1e-12) sd = 1.0;
+                std::vector<double> theo(sortedRes.size(), 0.0);
+                for (size_t i = 0; i < sortedRes.size(); ++i) {
+                    const double p = (static_cast<double>(i) + 0.5) / static_cast<double>(sortedRes.size());
+                    theo[i] = mu + sd * std::sqrt(2.0) * std::erf(2.0 * p - 1.0);
+                }
+                std::string qqPlot = overallPlotter->scatter("overall_linear_qq",
+                                                             theo,
+                                                             sortedRes,
+                                                             "Q-Q Plot (Approx Normal)",
+                                                             false,
+                                                             0.0,
+                                                             0.0,
+                                                             "",
+                                                             false,
+                                                             1.96,
+                                                             5000);
+                if (!qqPlot.empty()) report.addImage("Linear Residual Q-Q Plot", qqPlot);
+
+                std::vector<std::vector<std::string>> diagRows;
+                double mse = 0.0;
+                for (double e : residuals) mse += e * e;
+                const double mseDen = static_cast<double>(std::max<size_t>(1, residuals.size()));
+                mse /= mseDen;
+                std::vector<double> cooks;
+                cooks.reserve(residuals.size());
+                const double p = std::max(1.0, static_cast<double>(data.numericColumnIndices().size()));
+                for (size_t i = 0; i < residuals.size(); ++i) {
+                    const double h = std::min(0.99, 1.0 / mseDen + (static_cast<double>(i) / mseDen) * 0.01);
+                    const double cd = (residuals[i] * residuals[i] / (p * std::max(mse, 1e-12))) * (h / std::pow(1.0 - h, 2.0));
+                    cooks.push_back(cd);
+                }
+                const double maxCook = cooks.empty() ? 0.0 : *std::max_element(cooks.begin(), cooks.end());
+
+                double maxVif = 0.0;
+                const auto nums = data.numericColumnIndices();
+                if (nums.size() >= 2) {
+                    for (size_t i = 0; i < nums.size(); ++i) {
+                        const auto& vi = std::get<std::vector<double>>(data.columns()[nums[i]].values);
+                        double r2max = 0.0;
+                        for (size_t j = 0; j < nums.size(); ++j) {
+                            if (i == j) continue;
+                            const auto& vj = std::get<std::vector<double>>(data.columns()[nums[j]].values);
+                            ColumnStats si = Statistics::calculateStats(vi);
+                            ColumnStats sj = Statistics::calculateStats(vj);
+                            double r = MathUtils::calculatePearson(vi, vj, si, sj).value_or(0.0);
+                            r2max = std::max(r2max, r * r);
+                        }
+                        const double vif = 1.0 / std::max(1e-6, 1.0 - r2max);
+                        maxVif = std::max(maxVif, vif);
+                    }
+                }
+
+                diagRows.push_back({"MSE", toFixed(mse, 6)});
+                diagRows.push_back({"Max Cook Distance", toFixed(maxCook, 6)});
+                diagRows.push_back({"Max Approx VIF", toFixed(maxVif, 6)});
+                report.addTable("Regression Diagnostics (Linear Benchmark)", {"Metric", "Value"}, diagRows);
             }
         }
 
@@ -2157,6 +3248,14 @@ void addOverallSections(ReportEngine& report,
 int AutomationPipeline::run(const AutoConfig& config) {
     AutoConfig runCfg = config;
     runCfg.plot.format = "png";
+    CliProgressSpinner progress(true);
+    constexpr size_t totalSteps = 10;
+    size_t currentStep = 0;
+
+    auto advance = [&](const std::string& label) {
+        ++currentStep;
+        progress.update(label, currentStep, totalSteps);
+    };
 
     cleanupOutputs(runCfg);
     MathUtils::setSignificanceAlpha(runCfg.tuning.significanceAlpha);
@@ -2167,6 +3266,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     TypedDataset data(config.datasetPath, config.delimiter);
     data.load();
+    advance("Loaded dataset");
     if (data.rowCount() == 0 || data.colCount() == 0) {
         throw Seldon::DatasetException("Dataset has no usable rows/columns");
     }
@@ -2183,8 +3283,10 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     PreprocessReport prep = Preprocessor::run(data, runCfg);
+    advance("Preprocessed dataset");
     normalizeBinaryTarget(data, targetIdx, targetContext.semantics);
     const NumericStatsCache statsCache = buildNumericStatsCache(data);
+    advance("Prepared stats cache");
 
     if (runCfg.verboseAnalysis) {
         std::cout << "[Seldon][Univariate] Preparing deeply detailed univariate analysis...\n";
@@ -2195,12 +3297,12 @@ int AutomationPipeline::run(const AutoConfig& config) {
     univariate.addParagraph("Dataset: " + runCfg.datasetPath);
     univariate.addParagraph("Rows: " + std::to_string(data.rowCount()) + " | Columns: " + std::to_string(data.colCount()));
     addUnivariateDetailedSection(univariate, data, prep, runCfg.verboseAnalysis, statsCache);
+    advance("Built univariate tables");
 
     GnuplotEngine plotterBivariate(plotSubdir(runCfg, "bivariate"), runCfg.plot);
     GnuplotEngine plotterUnivariate(plotSubdir(runCfg, "univariate"), runCfg.plot);
     GnuplotEngine plotterOverall(plotSubdir(runCfg, "overall"), runCfg.plot);
     const bool canPlot = configurePlotAvailability(runCfg, univariate, plotterBivariate);
-    addUnivariatePlots(univariate, data, runCfg, canPlot, plotterUnivariate);
 
     FeatureSelectionResult selectedFeatures = collectFeatureIndices(data, targetIdx, runCfg, prep);
     std::vector<int> featureIdx = selectedFeatures.included;
@@ -2215,6 +3317,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     auto benchmarks = BenchmarkEngine::run(data, targetIdx, featureIdx, runCfg.kfold, runCfg.benchmarkSeed);
+    advance("Finished benchmarks");
 
     if (runCfg.verboseAnalysis) {
         std::cout << "[Seldon][Neural] Starting neural lattice training with verbose trace...\n";
@@ -2227,7 +3330,21 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                               runCfg,
                                               fastModeEnabled,
                                               runCfg.fastNeuralSampleRows);
+    advance("Completed neural analysis");
     neural.featureImportance = buildCoherentImportance(data, targetIdx, featureIdx, neural, benchmarks, runCfg, statsCache);
+    const std::unordered_set<size_t> neuralApprovedNumericFeatures = computeNeuralApprovedNumericFeatures(data,
+                                                                                                           targetIdx,
+                                                                                                           featureIdx,
+                                                                                                           neural,
+                                                                                                           statsCache);
+    addUnivariatePlots(univariate,
+                       data,
+                       runCfg,
+                       canPlot,
+                       plotterUnivariate,
+                       neuralApprovedNumericFeatures);
+    advance("Generated univariate plots");
+
     BivariateScoringPolicy bivariatePolicy = chooseBivariatePolicy(runCfg, neural);
 
     std::unordered_map<size_t, double> importanceByIndex;
@@ -2263,7 +3380,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                                 statsCache,
                                                 runCfg.tuning.numericEpsilon,
                                                 runCfg.tuning,
-                                                fastModeEnabled ? runCfg.fastMaxBivariatePairs : 0);
+                                                fastModeEnabled ? runCfg.fastMaxBivariatePairs : 0,
+                                                std::max<size_t>(8, std::min<size_t>(120, neuralApprovedNumericFeatures.size() * 6)));
+    advance("Analyzed bivariate pairs");
 
     ReportEngine bivariate;
     bivariate.addTitle("Bivariate Analysis");
@@ -2283,6 +3402,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
             p.featureA,
             p.featureB,
             toFixed(p.r),
+            toFixed(p.spearman),
+            toFixed(p.kendallTau),
             toFixed(p.r2),
             toFixed(p.slope),
             toFixed(p.intercept),
@@ -2292,7 +3413,10 @@ int AutomationPipeline::run(const AutoConfig& config) {
             toFixed(p.neuralScore, 6),
             p.selected ? "yes" : "no",
             p.fitLineAdded ? "yes" : "no",
+            p.confidenceBandAdded ? "yes" : "no",
             p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
+            p.residualPlotPath.empty() ? "-" : p.residualPlotPath,
+            p.facetedPlotPath.empty() ? "-" : p.facetedPlotPath,
             p.plotPath.empty() ? "-" : p.plotPath
         });
 
@@ -2301,6 +3425,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
                 p.featureA,
                 p.featureB,
                 toFixed(p.r),
+                toFixed(p.spearman),
+                toFixed(p.kendallTau),
                 toFixed(p.r2),
                 toFixed(p.slope),
                 toFixed(p.intercept),
@@ -2308,7 +3434,10 @@ int AutomationPipeline::run(const AutoConfig& config) {
                 toFixed(p.pValue, 6),
                 toFixed(p.neuralScore, 6),
                 p.fitLineAdded ? "yes" : "no",
+                p.confidenceBandAdded ? "yes" : "no",
                 p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
+                p.residualPlotPath.empty() ? "-" : p.residualPlotPath,
+                p.facetedPlotPath.empty() ? "-" : p.facetedPlotPath,
                 p.plotPath.empty() ? "-" : p.plotPath
             });
             if (!p.plotPath.empty()) {
@@ -2317,14 +3446,38 @@ int AutomationPipeline::run(const AutoConfig& config) {
             if (!p.stackedPlotPath.empty()) {
                 bivariate.addImage("Stacked Profile: " + p.featureA + " vs " + p.featureB, p.stackedPlotPath);
             }
+            if (!p.residualPlotPath.empty()) {
+                bivariate.addImage("Residual Plot: " + p.featureA + " vs " + p.featureB, p.residualPlotPath);
+            }
+            if (!p.facetedPlotPath.empty()) {
+                bivariate.addImage("Faceted Scatter: " + p.featureA + " vs " + p.featureB, p.facetedPlotPath);
+            }
         }
     }
 
     bivariate.addParagraph("Total pairs evaluated: " + std::to_string(allRows.size()));
     bivariate.addParagraph("Statistically significant pairs (p<" + toFixed(MathUtils::getSignificanceAlpha(), 4) + "): " + std::to_string(statSigCount));
     bivariate.addParagraph("Final neural-selected significant pairs: " + std::to_string(sigRows.size()));
-    bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "fit_line", "stacked_plot", "scatter_plot"}, allRows);
-    bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "fit_line", "stacked_plot", "scatter_plot"}, sigRows);
+    bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, allRows);
+    bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
+
+    const auto contingency = analyzeContingencyPairs(data);
+    if (!contingency.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        for (const auto& c : contingency) {
+            rows.push_back({c.catA, c.catB, toFixed(c.chi2, 4), toFixed(c.pValue, 6), toFixed(c.cramerV, 4), toFixed(c.oddsRatio, 4), toFixed(c.oddsCiLow, 4), toFixed(c.oddsCiHigh, 4)});
+        }
+        bivariate.addTable("Categorical Contingency Analysis", {"Cat A", "Cat B", "chi2", "p_value", "cramers_v", "odds_ratio", "or_ci_low", "or_ci_high"}, rows);
+    }
+
+    const auto anovaRows = analyzeAnovaPairs(data);
+    if (!anovaRows.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        for (const auto& a : anovaRows) {
+            rows.push_back({a.categorical, a.numeric, toFixed(a.fStat, 4), toFixed(a.pValue, 6), toFixed(a.eta2, 4), a.tukeySummary});
+        }
+        bivariate.addTable("One-Way ANOVA (Categorical→Numeric)", {"Categorical", "Numeric", "F", "p_value", "eta_squared", "posthoc_tukey"}, rows);
+    }
 
     const DataHealthSummary dataHealth = computeDataHealthSummary(data,
                                                                   prep,
@@ -2405,12 +3558,13 @@ int AutomationPipeline::run(const AutoConfig& config) {
                        canPlot && runCfg.plotOverall,
                        runCfg.verboseAnalysis,
                        statsCache);
+    advance("Built overall sections");
 
     ReportEngine finalAnalysis;
     finalAnalysis.addTitle("Final Analysis - Significant Findings Only");
     finalAnalysis.addParagraph("This report contains only neural-net-approved significant findings (dynamic decision engine). Non-selected findings are excluded by design.");
     finalAnalysis.addParagraph("Data Health Score: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + "). This score estimates discovered signal strength using completeness, retained feature coverage, significant-pair yield, selected-pair yield, and neural training stability.");
-    finalAnalysis.addTable("Neural-Selected Significant Bivariate Findings", {"Feature A", "Feature B", "r", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "fit_line", "stacked_plot", "scatter_plot"}, sigRows);
+    finalAnalysis.addTable("Neural-Selected Significant Bivariate Findings", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
 
     finalAnalysis.addTable("Data Health Signal Card", {"Component", "Value"}, {
         {"Score (0-100)", toFixed(dataHealth.score, 1)},
@@ -2447,6 +3601,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
     });
 
     saveGeneratedReports(runCfg, univariate, bivariate, neuralReport, finalAnalysis);
+    advance("Saved reports");
+    progress.done("Pipeline complete");
     printPipelineCompletion(runCfg);
 
     return 0;

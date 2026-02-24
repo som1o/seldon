@@ -464,7 +464,6 @@ std::vector<double> NeuralNet::predict(const std::vector<double>& inputValues) {
     }
     return result;
 }
-// Textual save/load logic removed for V3. Refer to binary persistence.
 
 std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std::vector<double>>& X, 
                                                const std::vector<std::vector<double>>& Y,

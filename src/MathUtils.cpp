@@ -7,6 +7,7 @@
 #include <numeric>
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
 #ifdef USE_OPENMP
 #include <omp.h>
 #endif
@@ -142,6 +143,26 @@ bool solveLowerFromUpperTranspose(const MathUtils::Matrix& R,
     }
     return true;
 }
+
+std::vector<double> averageRanks(const std::vector<double>& values) {
+    std::vector<size_t> idx(values.size());
+    std::iota(idx.begin(), idx.end(), 0);
+    std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+        if (values[a] == values[b]) return a < b;
+        return values[a] < values[b];
+    });
+
+    std::vector<double> ranks(values.size(), 0.0);
+    size_t i = 0;
+    while (i < idx.size()) {
+        size_t j = i + 1;
+        while (j < idx.size() && values[idx[j]] == values[idx[i]]) ++j;
+        const double rank = (static_cast<double>(i + 1) + static_cast<double>(j)) * 0.5;
+        for (size_t k = i; k < j; ++k) ranks[idx[k]] = rank;
+        i = j;
+    }
+    return ranks;
+}
 }
 
 // Regularized incomplete beta function I_x(a, b) using continued fractions (Lentz's method)
@@ -273,6 +294,48 @@ std::optional<double> MathUtils::calculatePearson(const std::vector<double>& x, 
     // Pearson r = Covariance(X,Y) / (StdDevX * StdDevY)
     double covariance = covarianceSum / (n - 1);
     return covariance / (statsX.stddev * statsY.stddev);
+}
+
+std::optional<double> MathUtils::calculateSpearman(const std::vector<double>& x, const std::vector<double>& y) {
+    if (x.size() != y.size() || x.size() < 3) return std::nullopt;
+    const std::vector<double> rx = averageRanks(x);
+    const std::vector<double> ry = averageRanks(y);
+    const ColumnStats sx = Statistics::calculateStats(rx);
+    const ColumnStats sy = Statistics::calculateStats(ry);
+    return calculatePearson(rx, ry, sx, sy);
+}
+
+std::optional<double> MathUtils::calculateKendallTau(const std::vector<double>& x, const std::vector<double>& y) {
+    if (x.size() != y.size() || x.size() < 3) return std::nullopt;
+    long long concordant = 0;
+    long long discordant = 0;
+    long long tieX = 0;
+    long long tieY = 0;
+
+    for (size_t i = 0; i < x.size(); ++i) {
+        for (size_t j = i + 1; j < x.size(); ++j) {
+            const double dx = x[i] - x[j];
+            const double dy = y[i] - y[j];
+            const int sx = (dx > 0.0) - (dx < 0.0);
+            const int sy = (dy > 0.0) - (dy < 0.0);
+            if (sx == 0 && sy == 0) continue;
+            if (sx == 0) {
+                ++tieX;
+            } else if (sy == 0) {
+                ++tieY;
+            } else if (sx == sy) {
+                ++concordant;
+            } else {
+                ++discordant;
+            }
+        }
+    }
+
+    const double a = static_cast<double>(concordant + discordant + tieX);
+    const double b = static_cast<double>(concordant + discordant + tieY);
+    const double denom = std::sqrt(std::max(0.0, a * b));
+    if (denom <= 1e-12) return std::nullopt;
+    return static_cast<double>(concordant - discordant) / denom;
 }
 
 std::pair<double, double> MathUtils::simpleLinearRegression(const std::vector<double>& x, const std::vector<double>& y,
@@ -411,6 +474,7 @@ MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>&
 
     const ColumnStats stats = precomputedStats ? *precomputedStats : Statistics::calculateStats(values);
     out.mean = stats.mean;
+    const double trimQ = 0.10;
     out.median = stats.median;
     out.variance = stats.variance;
     out.stddev = stats.stddev;
@@ -428,12 +492,56 @@ MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>&
     out.p95 = CommonUtils::quantileByNth(values, 0.95);
 
     std::vector<double> absDev(values.size(), 0.0);
+    std::vector<double> sorted = values;
+    std::sort(sorted.begin(), sorted.end());
+    const size_t trimN = static_cast<size_t>(std::floor(trimQ * static_cast<double>(sorted.size())));
+    const size_t keepStart = std::min(trimN, sorted.size());
+    const size_t keepEnd = std::max(keepStart, sorted.size() - trimN);
+    if (keepEnd > keepStart) {
+        double trimSum = 0.0;
+        for (size_t i = keepStart; i < keepEnd; ++i) trimSum += sorted[i];
+        out.trimmedMean = trimSum / static_cast<double>(keepEnd - keepStart);
+    } else {
+        out.trimmedMean = out.mean;
+    }
+
+    {
+        std::unordered_map<long long, size_t> freq;
+        size_t best = 0;
+        long long bestKey = 0;
+        for (double v : values) {
+            const long long q = static_cast<long long>(std::llround(v * 1e6));
+            size_t c = ++freq[q];
+            if (c > best) {
+                best = c;
+                bestKey = q;
+            }
+        }
+        out.mode = static_cast<double>(bestKey) / 1e6;
+    }
+
+    bool allPositive = true;
+    double logSum = 0.0;
+    double invSum = 0.0;
     for (size_t i = 0; i < values.size(); ++i) {
         absDev[i] = std::abs(values[i] - out.median);
         out.sum += values[i];
         if (std::abs(values[i]) > 1e-12) out.nonZero++;
+        if (values[i] <= 0.0) {
+            allPositive = false;
+        } else {
+            logSum += std::log(values[i]);
+            invSum += 1.0 / values[i];
+        }
     }
     out.mad = CommonUtils::quantileByNth(absDev, 0.5);
+    if (allPositive && !values.empty()) {
+        out.geometricMean = std::exp(logSum / static_cast<double>(values.size()));
+        out.harmonicMean = static_cast<double>(values.size()) / std::max(invSum, 1e-12);
+    } else {
+        out.geometricMean = 0.0;
+        out.harmonicMean = 0.0;
+    }
 
     if (std::abs(out.mean) > 1e-12) out.coeffVar = out.stddev / std::abs(out.mean);
     return out;

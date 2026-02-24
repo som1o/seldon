@@ -15,6 +15,24 @@ struct PlotConfig {
 };
 
 struct HeuristicTuningConfig {
+    // Supported config keys (file/CLI aliases):
+    // significance_alpha, outlier_iqr_multiplier, outlier_z_threshold,
+    // feature_min_variance, feature_leakage_corr_threshold,
+    // feature_missing_q3_offset, feature_missing_floor, feature_missing_ceiling,
+    // feature_aggressive_delta, feature_lenient_delta,
+    // bivariate_selection_quantile,
+    // coherence_weight_small_dataset, coherence_weight_regular_dataset,
+    // coherence_overfit_penalty_train_ratio, coherence_benchmark_penalty_ratio,
+    // coherence_penalty_step, coherence_weight_min, coherence_weight_max,
+    // corr_heavy_max_importance_threshold, corr_heavy_concentration_threshold,
+    // importance_heavy_max_importance_threshold, importance_heavy_concentration_threshold,
+    // numeric_epsilon, beta_fallback_intervals_start, beta_fallback_intervals_max, beta_fallback_tolerance,
+    // overall_corr_heatmap_max_columns,
+    // ogive_min_points, ogive_min_unique,
+    // box_plot_min_points, box_plot_min_iqr,
+    // pie_min_categories, pie_max_categories, pie_max_dominance_ratio,
+    // scatter_fit_min_abs_corr, scatter_fit_min_sample_size,
+    // gantt_auto_enabled, gantt_min_tasks, gantt_max_tasks, gantt_duration_hours_threshold.
     // Global significance threshold used in pairwise significance checks.
     double significanceAlpha = 0.05;
     // IQR multiplier for Tukey-style outlier fence (lower/higher => more/less sensitive).
@@ -76,8 +94,38 @@ struct HeuristicTuningConfig {
 
     // Categorical pie-chart suitability tuning
     size_t pieMinCategories = 2;
-    size_t pieMaxCategories = 8;
-    double pieMaxDominanceRatio = 0.96;
+    size_t pieMaxCategories = 7;
+    double pieMaxDominanceRatio = 0.82;
+
+    // Categorical-vs-numeric split/facetting tuning
+    size_t facetMinRows = 30;
+    size_t facetMaxCategories = 6;
+    double facetMinCategoryShare = 0.05;
+
+    // Scatter downsampling + confidence interval tuning
+    size_t scatterDownsampleThreshold = 10000;
+    double scatterConfidenceMinAbsCorr = 0.45;
+    size_t scatterConfidenceMinSampleSize = 30;
+
+    // Residual plot gating for selected regressions
+    double residualPlotMinAbsCorr = 0.55;
+    size_t residualPlotMinSampleSize = 24;
+
+    // Distribution plot auto-mode tuning
+    size_t categoryNumericDistributionMinRows = 40;
+    size_t categoryNumericDistributionMaxPairs = 6;
+
+    // Density-overlay minimum sample size
+    size_t histogramDensityMinSample = 80;
+
+    // Parallel coordinates tuning
+    size_t parallelCoordinatesMinRows = 40;
+    size_t parallelCoordinatesMaxRows = 220;
+    size_t parallelCoordinatesMinDims = 4;
+    size_t parallelCoordinatesMaxDims = 10;
+
+    // Automatic time-series trend overlay tuning
+    size_t timeSeriesTrendMinRows = 18;
 
     // Scatter fitted-line suitability tuning
     double scatterFitMinAbsCorr = 0.35;
@@ -88,9 +136,29 @@ struct HeuristicTuningConfig {
     size_t ganttMinTasks = 3;
     size_t ganttMaxTasks = 25;
     double ganttDurationHoursThreshold = 72.0;
+
+    void validate() const;
 };
 
 struct AutoConfig {
+    // Supported top-level config keys:
+    // dataset, target, report, assets_dir, delimiter, exclude,
+    // outlier_method, outlier_action, scaling,
+    // kfold, max_feature_missing_ratio,
+    // target_strategy, feature_strategy, neural_strategy, bivariate_strategy,
+    // fast_mode, fast_max_bivariate_pairs, fast_neural_sample_rows,
+    // plot_univariate, plot_overall, plot_bivariate_significant, plots,
+    // plot_format, plot_theme, plot_grid, plot_width, plot_height, plot_point_size, plot_line_width,
+    // generate_html, verbose_analysis,
+    // neural_seed, benchmark_seed, gradient_clip_norm,
+    // neural_optimizer, neural_lookahead_fast_optimizer, neural_lookahead_sync_period, neural_lookahead_alpha,
+    // neural_use_batch_norm, neural_batch_norm_momentum, neural_batch_norm_epsilon,
+    // neural_use_layer_norm, neural_layer_norm_epsilon,
+    // neural_lr_decay, neural_lr_plateau_patience, neural_lr_cooldown_epochs,
+    // neural_max_lr_reductions, neural_min_learning_rate,
+    // neural_use_validation_loss_ema, neural_validation_loss_ema_beta,
+    // neural_categorical_input_l2_boost,
+    // impute.<column_name> (per-column imputation strategy).
     std::string datasetPath;
     std::string reportFile = "neural_synthesis.md";
     std::string assetsDir = "seldon_report_assets";
@@ -101,7 +169,7 @@ struct AutoConfig {
     std::vector<std::string> excludedColumns;
     std::unordered_map<std::string, std::string> columnImputation;
 
-    std::string outlierMethod = "iqr";      // iqr|zscore
+    std::string outlierMethod = "iqr";      // iqr|zscore|modified_zscore|adjusted_boxplot|lof
     std::string outlierAction = "flag";     // flag|remove|cap
 
     std::string scalingMethod = "auto";     // auto|zscore|minmax|none

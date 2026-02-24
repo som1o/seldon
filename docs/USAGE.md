@@ -151,7 +151,7 @@ impute.region: mode
 - `dataset`
 - `target`
 - `delimiter`
-- `outlier_method`: `iqr` | `zscore`
+- `outlier_method`: `iqr` | `zscore` | `modified_zscore` | `adjusted_boxplot` | `lof`
 - `outlier_action`: `flag` | `remove` | `cap`
 - `scaling`: `auto` | `zscore` | `minmax` | `none`
 - `max_feature_missing_ratio`: `-1` or `[0,1]`
@@ -169,7 +169,7 @@ impute.region: mode
 
 - `plots`: `none` | `bivariate` | `univariate` | `overall` | `all`
 - when no plot aliases/flags are provided, Seldon auto-enables a dynamic plot set for the current dataset (avoids under-plotting and suppresses low-value plot families on tiny datasets)
-- plot generation auto-selects suitable visuals by data shape (histogram, scatter with conditional fitted line, stacked bivariate profiles, heatmap, ogive, box plot, pie chart, and limited-scope Gantt for project-like timelines)
+- plot generation auto-selects suitable visuals by data shape (adaptive histogram with KDE, scatter with confidence/residual diagnostics, faceted scatter, stacked bivariate profiles, clustered heatmap, parallel coordinates, Q-Q plots, pie/bar fallback, and project-like Gantt)
 - `plot_univariate`
 - `plot_overall`
 - `plot_bivariate_significant`
@@ -238,6 +238,7 @@ Generated when `generate_html=true` and `pandoc` is available:
 - Feature-importance evaluation uses adaptive row sampling and trial limiting for large data.
 - Numeric parsing supports configurable separator policy for locale-like formats.
 - CSV load is streaming two-pass and avoids buffering full datasets in memory.
+- Automated EDA sections include contingency (chi-square/Cramér’s V/odds ratio), one-way ANOVA with post-hoc summary, PCA explained variance + projection plots, k-means profile with silhouette/gap summary, bootstrap confidence intervals, missingness matrix/correlation, and regression diagnostics (residual/Q-Q/Cook/VIF).
 
 ## Troubleshooting
 

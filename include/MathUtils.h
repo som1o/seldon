@@ -27,6 +27,10 @@ class MathUtils {
 public:
     struct NumericSummary {
         double mean = 0.0;
+        double geometricMean = 0.0;
+        double harmonicMean = 0.0;
+        double trimmedMean = 0.0;
+        double mode = 0.0;
         double median = 0.0;
         double variance = 0.0;
         double stddev = 0.0;
@@ -61,6 +65,9 @@ public:
      */
     static std::optional<double> calculatePearson(const std::vector<double>& x, const std::vector<double>& y, 
                                           const ColumnStats& statsX, const ColumnStats& statsY);
+
+    static std::optional<double> calculateSpearman(const std::vector<double>& x, const std::vector<double>& y);
+    static std::optional<double> calculateKendallTau(const std::vector<double>& x, const std::vector<double>& y);
 
     /**
      * @brief Computes t-statistic and p-value significance metadata for Pearson r.

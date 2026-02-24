@@ -30,6 +30,7 @@ public:
 
     /**
      * @brief Loads CSV content and infers per-column types.
+        * @details CSV parsing/tokenization is delegated to CSVUtils; this class owns type inference and typed storage.
      * @pre file exists and is readable.
      * @post columns() is populated with aligned typed vectors and missing masks.
      * @throws Seldon::IOException / Seldon::DatasetException on IO or parse failure.
@@ -65,7 +66,6 @@ private:
     size_t rowCount_ = 0;
     std::vector<TypedColumn> columns_;
 
-    std::vector<std::string> parseCSVLine(std::istream& is, bool& malformed) const;
     bool parseDouble(const std::string& v, double& out) const;
     static bool parseDateTime(const std::string& v, int64_t& outUnixSeconds);
 };

@@ -613,6 +613,67 @@ AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig&
     return config;
 }
 
+void HeuristicTuningConfig::validate() const {
+    if (featureLeakageCorrThreshold < 0.0 || featureLeakageCorrThreshold > 1.0) {
+        throw Seldon::ConfigurationException("feature_leakage_corr_threshold must be within [0,1]");
+    }
+    if (significanceAlpha <= 0.0 || significanceAlpha >= 1.0) {
+        throw Seldon::ConfigurationException("significance_alpha must be within (0,1)");
+    }
+    if (outlierIqrMultiplier <= 0.0) {
+        throw Seldon::ConfigurationException("outlier_iqr_multiplier must be > 0");
+    }
+    if (outlierZThreshold <= 0.0) {
+        throw Seldon::ConfigurationException("outlier_z_threshold must be > 0");
+    }
+    if (featureMissingAdaptiveMin > featureMissingAdaptiveMax) {
+        throw Seldon::ConfigurationException("feature_missing_floor must be <= feature_missing_ceiling");
+    }
+    if (bivariateSelectionQuantileOverride != -1.0 &&
+        (bivariateSelectionQuantileOverride < 0.0 || bivariateSelectionQuantileOverride > 1.0)) {
+        throw Seldon::ConfigurationException("bivariate_selection_quantile must be -1 or within [0,1]");
+    }
+    if (coherenceWeightMin > coherenceWeightMax) {
+        throw Seldon::ConfigurationException("coherence_weight_min must be <= coherence_weight_max");
+    }
+    if (betaFallbackIntervalsStart > betaFallbackIntervalsMax) {
+        throw Seldon::ConfigurationException("beta_fallback_intervals_start must be <= beta_fallback_intervals_max");
+    }
+    if (numericEpsilon <= 0.0 || betaFallbackTolerance <= 0.0) {
+        throw Seldon::ConfigurationException("numeric_epsilon and beta_fallback_tolerance must be > 0");
+    }
+    if (overallCorrHeatmapMaxColumns < 2) {
+        throw Seldon::ConfigurationException("overall_corr_heatmap_max_columns must be >= 2");
+    }
+    if (ogiveMinPoints < 2 || ogiveMinUnique < 2) {
+        throw Seldon::ConfigurationException("ogive_min_points and ogive_min_unique must be >= 2");
+    }
+    if (boxPlotMinPoints < 3) {
+        throw Seldon::ConfigurationException("box_plot_min_points must be >= 3");
+    }
+    if (boxPlotMinIqr < 0.0) {
+        throw Seldon::ConfigurationException("box_plot_min_iqr must be >= 0");
+    }
+    if (pieMinCategories < 2 || pieMaxCategories < pieMinCategories) {
+        throw Seldon::ConfigurationException("pie_min_categories must be >= 2 and <= pie_max_categories");
+    }
+    if (pieMaxDominanceRatio <= 0.0 || pieMaxDominanceRatio > 1.0) {
+        throw Seldon::ConfigurationException("pie_max_dominance_ratio must be within (0,1]");
+    }
+    if (scatterFitMinAbsCorr < 0.0 || scatterFitMinAbsCorr > 1.0) {
+        throw Seldon::ConfigurationException("scatter_fit_min_abs_corr must be within [0,1]");
+    }
+    if (scatterFitMinSampleSize < 3) {
+        throw Seldon::ConfigurationException("scatter_fit_min_sample_size must be >= 3");
+    }
+    if (ganttMinTasks < 1 || ganttMaxTasks < ganttMinTasks) {
+        throw Seldon::ConfigurationException("gantt_min_tasks must be >= 1 and <= gantt_max_tasks");
+    }
+    if (ganttDurationHoursThreshold <= 0.0) {
+        throw Seldon::ConfigurationException("gantt_duration_hours_threshold must be > 0");
+    }
+}
+
 void AutoConfig::validate() const {
     if (datasetPath.empty()) {
         throw Seldon::ConfigurationException("dataset path is required");
@@ -631,8 +692,8 @@ void AutoConfig::validate() const {
     if (plot.pointSize <= 0.0 || plot.lineWidth <= 0.0) {
         throw Seldon::ConfigurationException("plot_point_size and plot_line_width must be > 0");
     }
-    if (!isIn(outlierMethod, {"iqr", "zscore"})) {
-        throw Seldon::ConfigurationException("outlier_method must be iqr or zscore");
+    if (!isIn(outlierMethod, {"iqr", "zscore", "modified_zscore", "adjusted_boxplot", "lof"})) {
+        throw Seldon::ConfigurationException("outlier_method must be one of: iqr, zscore, modified_zscore, adjusted_boxplot, lof");
     }
     if (!isIn(outlierAction, {"flag", "remove", "cap"})) {
         throw Seldon::ConfigurationException("outlier_action must be flag, remove, or cap");
@@ -673,64 +734,7 @@ void AutoConfig::validate() const {
         throw Seldon::ConfigurationException("neural_validation_loss_ema_beta must be within [0,1)");
     }
 
-    if (tuning.featureLeakageCorrThreshold < 0.0 || tuning.featureLeakageCorrThreshold > 1.0) {
-        throw Seldon::ConfigurationException("feature_leakage_corr_threshold must be within [0,1]");
-    }
-    if (tuning.significanceAlpha <= 0.0 || tuning.significanceAlpha >= 1.0) {
-        throw Seldon::ConfigurationException("significance_alpha must be within (0,1)");
-    }
-    if (tuning.outlierIqrMultiplier <= 0.0) {
-        throw Seldon::ConfigurationException("outlier_iqr_multiplier must be > 0");
-    }
-    if (tuning.outlierZThreshold <= 0.0) {
-        throw Seldon::ConfigurationException("outlier_z_threshold must be > 0");
-    }
-    if (tuning.featureMissingAdaptiveMin > tuning.featureMissingAdaptiveMax) {
-        throw Seldon::ConfigurationException("feature_missing_floor must be <= feature_missing_ceiling");
-    }
-    if (tuning.bivariateSelectionQuantileOverride != -1.0 &&
-        (tuning.bivariateSelectionQuantileOverride < 0.0 || tuning.bivariateSelectionQuantileOverride > 1.0)) {
-        throw Seldon::ConfigurationException("bivariate_selection_quantile must be -1 or within [0,1]");
-    }
-    if (tuning.coherenceWeightMin > tuning.coherenceWeightMax) {
-        throw Seldon::ConfigurationException("coherence_weight_min must be <= coherence_weight_max");
-    }
-    if (tuning.betaFallbackIntervalsStart > tuning.betaFallbackIntervalsMax) {
-        throw Seldon::ConfigurationException("beta_fallback_intervals_start must be <= beta_fallback_intervals_max");
-    }
-    if (tuning.numericEpsilon <= 0.0 || tuning.betaFallbackTolerance <= 0.0) {
-        throw Seldon::ConfigurationException("numeric_epsilon and beta_fallback_tolerance must be > 0");
-    }
-    if (tuning.overallCorrHeatmapMaxColumns < 2) {
-        throw Seldon::ConfigurationException("overall_corr_heatmap_max_columns must be >= 2");
-    }
-    if (tuning.ogiveMinPoints < 2 || tuning.ogiveMinUnique < 2) {
-        throw Seldon::ConfigurationException("ogive_min_points and ogive_min_unique must be >= 2");
-    }
-    if (tuning.boxPlotMinPoints < 3) {
-        throw Seldon::ConfigurationException("box_plot_min_points must be >= 3");
-    }
-    if (tuning.boxPlotMinIqr < 0.0) {
-        throw Seldon::ConfigurationException("box_plot_min_iqr must be >= 0");
-    }
-    if (tuning.pieMinCategories < 2 || tuning.pieMaxCategories < tuning.pieMinCategories) {
-        throw Seldon::ConfigurationException("pie_min_categories must be >= 2 and <= pie_max_categories");
-    }
-    if (tuning.pieMaxDominanceRatio <= 0.0 || tuning.pieMaxDominanceRatio > 1.0) {
-        throw Seldon::ConfigurationException("pie_max_dominance_ratio must be within (0,1]");
-    }
-    if (tuning.scatterFitMinAbsCorr < 0.0 || tuning.scatterFitMinAbsCorr > 1.0) {
-        throw Seldon::ConfigurationException("scatter_fit_min_abs_corr must be within [0,1]");
-    }
-    if (tuning.scatterFitMinSampleSize < 3) {
-        throw Seldon::ConfigurationException("scatter_fit_min_sample_size must be >= 3");
-    }
-    if (tuning.ganttMinTasks < 1 || tuning.ganttMaxTasks < tuning.ganttMinTasks) {
-        throw Seldon::ConfigurationException("gantt_min_tasks must be >= 1 and <= gantt_max_tasks");
-    }
-    if (tuning.ganttDurationHoursThreshold <= 0.0) {
-        throw Seldon::ConfigurationException("gantt_duration_hours_threshold must be > 0");
-    }
+    tuning.validate();
 
     if (fastMaxBivariatePairs == 0 || fastNeuralSampleRows == 0) {
         throw Seldon::ConfigurationException("fast_max_bivariate_pairs and fast_neural_sample_rows must be > 0");

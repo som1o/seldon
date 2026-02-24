@@ -1,6 +1,6 @@
 # Seldon
 
-Seldon is a C++ automated analytics engine for CSV datasets.
+Seldon is an automated EDA engine written in C++ for CSV datasets.
 
 It performs typed ingestion, preprocessing, baseline benchmarking, neural relevance analysis, and report generation with minimal manual setup.
 
@@ -13,6 +13,8 @@ It performs typed ingestion, preprocessing, baseline benchmarking, neural releva
 - Feed-forward neural analysis for feature relevance
 - Bivariate significance + neural-aware selection
 - Markdown reports and optional plot assets
+- Automatic advanced plotting heuristics (downsampling, confidence bands, residual diagnostics, faceting, clustered heatmaps, trend overlays, and cache-aware regeneration)
+- Curriculum-grounded EDA extensions: non-parametric correlation, contingency + ANOVA analysis, PCA, k-means profiling, bootstrap confidence intervals, decomposition diagnostics, Q-Q plots, and structured data quality reporting
 
 ## Requirements
 
@@ -154,7 +156,7 @@ impute.region: mode
 
 ### Key options (summary)
 
-- `outlier_method`: `iqr` | `zscore`
+- `outlier_method`: `iqr` | `zscore` | `modified_zscore` | `adjusted_boxplot` | `lof`
 - `outlier_action`: `flag` | `remove` | `cap`
 - `scaling`: `auto` | `zscore` | `minmax` | `none`
 - `target_strategy`: `auto` | `quality` | `max_variance` | `last_numeric`
@@ -162,7 +164,7 @@ impute.region: mode
 - `neural_strategy`: `auto` | `none` | `fast` | `balanced` | `expressive`
 - `bivariate_strategy`: `auto` | `balanced` | `corr_heavy` | `importance_heavy`
 - `plots`: `none` | `bivariate` | `univariate` | `overall` | `all`
-- `plots` now auto-selects suitable chart families: histogram, scatter, heatmap, ogive, box plot, pie chart, and project-timeline Gantt (when timeline-like columns exist)
+- `plots` now auto-selects suitable chart families: adaptive histogram (+KDE overlay), scatter with intelligent downsampling, confidence-band fit overlays, residual diagnostics, faceted small-multiple scatter, clustered-correlation heatmap, parallel coordinates, category distribution (violin/boxen auto mode), pie/bar fallback, project-timeline Gantt with semantic coloring, and automatic time-series trend overlays
 - `plot_theme`: `auto` | `light` | `dark`
 - `plot_grid`: `true|false`, `plot_point_size`, `plot_line_width`
 - Suitability knobs: `ogive_min_points`, `ogive_min_unique`, `box_plot_min_points`, `box_plot_min_iqr`, `pie_min_categories`, `pie_max_categories`, `pie_max_dominance_ratio`
@@ -174,9 +176,12 @@ impute.region: mode
 
 - Outlier detection is performed on observed numeric values before imputation.
 - Correlation heatmap work is capped by `overall_corr_heatmap_max_columns` to avoid $O(n^2)$ blowups on very wide datasets.
+- Plot generation uses hash-based cache keys (data + script) to skip regenerating identical artifacts on repeated runs.
+- When gnuplot fails, full stderr output is captured and logged to help debugging failed plots.
 - Feature-importance evaluation uses adaptive sampling/trials on large datasets for runtime control.
 - Numeric parsing supports configurable separator handling for locale-like formats.
 - CSV loading is streaming/two-pass and does not keep the entire file buffered in memory.
+- Preprocessing now auto-engineers additional numeric features (squared/interactions) and richer datetime components (day-of-year, quarter, etc.).
 
 ## Project Layout
 

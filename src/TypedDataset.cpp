@@ -384,10 +384,6 @@ bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) 
     return true;
 }
 
-std::vector<std::string> TypedDataset::parseCSVLine(std::istream& is, bool& malformed) const {
-    return CSVUtils::parseCSVLine(is, delimiter_, &malformed, nullptr);
-}
-
 void TypedDataset::load() {
     std::ifstream in(filename_, std::ios::binary);
     if (!in) throw Seldon::IOException("Could not open file: " + filename_);
@@ -395,7 +391,7 @@ void TypedDataset::load() {
     CSVUtils::skipBOM(in);
 
     bool malformed = false;
-    auto header = parseCSVLine(in, malformed);
+    auto header = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
     if (malformed || header.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
     header = CSVUtils::normalizeHeader(header);
 
@@ -578,7 +574,7 @@ void TypedDataset::load() {
     std::vector<double> runningSums(header.size(), 0.0);
 
     while (in.peek() != EOF) {
-        auto row = parseCSVLine(in, malformed);
+        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
         if (row.empty() || malformed || isSkippableControlRow(row)) continue;
         reconcileRowWidth(row);
         repairDateShiftedRow(row);
@@ -654,13 +650,13 @@ void TypedDataset::load() {
     in.seekg(0, std::ios::beg);
     CSVUtils::skipBOM(in);
     malformed = false;
-    auto headerSecondPass = parseCSVLine(in, malformed);
+    auto headerSecondPass = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
     if (malformed || headerSecondPass.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
 
     size_t r = 0;
     std::fill(runningSums.begin(), runningSums.end(), 0.0);
     while (in.peek() != EOF) {
-        auto row = parseCSVLine(in, malformed);
+        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
         if (row.empty() || malformed || isSkippableControlRow(row)) continue;
         reconcileRowWidth(row);
         repairDateShiftedRow(row);
@@ -739,13 +735,13 @@ void TypedDataset::load() {
     in.seekg(0, std::ios::beg);
     CSVUtils::skipBOM(in);
     malformed = false;
-    auto headerThirdPass = parseCSVLine(in, malformed);
+    auto headerThirdPass = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
     if (malformed || headerThirdPass.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
 
     size_t rowIdx = 0;
     std::fill(runningSums.begin(), runningSums.end(), 0.0);
     while (in.peek() != EOF) {
-        auto row = parseCSVLine(in, malformed);
+        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
         if (row.empty() || malformed || isSkippableControlRow(row)) continue;
         reconcileRowWidth(row);
         repairDateShiftedRow(row);
