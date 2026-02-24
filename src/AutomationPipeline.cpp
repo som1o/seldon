@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -640,6 +641,8 @@ struct TargetChoice {
     std::string strategyUsed;
 };
 
+double safeEntropyFromCounts(const std::unordered_map<long long, size_t>& counts, size_t total);
+
 TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& config) {
     TargetChoice choice;
 
@@ -668,6 +671,7 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
         size_t nonZero = 0;
         double mean = 0.0;
         double m2 = 0.0;
+        std::unordered_map<long long, size_t> roundedCardinality;
         for (double v : values) {
             if (!std::isfinite(v)) continue;
             ++finiteCount;
@@ -676,6 +680,8 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
             const double delta2 = v - mean;
             m2 += delta * delta2;
             if (std::abs(v) > 1e-12) nonZero++;
+            const long long key = static_cast<long long>(std::llround(v * 1000.0));
+            roundedCardinality[key]++;
         }
         if (finiteCount < 3) return -1e9;
 
@@ -687,9 +693,19 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
         std::string lname = col.name;
         std::transform(lname.begin(), lname.end(), lname.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         double namePenalty = (lname.find("id") != std::string::npos || lname.find("index") != std::string::npos) ? 0.25 : 0.0;
+        if (containsToken(lname, {"timestamp", "created", "updated", "time", "date"})) {
+            namePenalty += 0.15;
+        }
+        const double cardRatio = static_cast<double>(roundedCardinality.size()) / static_cast<double>(std::max<size_t>(1, finiteCount));
+        if (cardRatio > 0.95) namePenalty += 0.20;
 
         double varianceScore = std::clamp(std::log1p(std::max(0.0, var)) / 4.0, 0.0, 1.0);
-        return 0.45 * (1.0 - missingRatio) + 0.35 * varianceScore + 0.20 * nonZeroRatio - namePenalty;
+        const double entropyScore = safeEntropyFromCounts(roundedCardinality, finiteCount);
+        return 0.30 * (1.0 - missingRatio)
+             + 0.25 * varianceScore
+             + 0.15 * nonZeroRatio
+             + 0.30 * entropyScore
+             - namePenalty;
     };
 
     auto pickByQuality = [&]() {
@@ -761,9 +777,26 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
 
 struct TargetSemantics {
     bool isBinary = false;
+    bool isOrdinal = false;
     double lowLabel = 0.0;
     double highLabel = 1.0;
+    size_t cardinality = 0;
+    std::string inferredTask = "regression";
 };
+
+double safeEntropyFromCounts(const std::unordered_map<long long, size_t>& counts, size_t total) {
+    if (total == 0 || counts.empty()) return 0.0;
+    double h = 0.0;
+    for (const auto& kv : counts) {
+        if (kv.second == 0) continue;
+        const double p = static_cast<double>(kv.second) / static_cast<double>(total);
+        if (p <= 0.0) continue;
+        h -= p * std::log2(p);
+    }
+    const double hmax = std::log2(static_cast<double>(counts.size()));
+    if (hmax <= 1e-12) return 0.0;
+    return std::clamp(h / hmax, 0.0, 1.0);
+}
 
 TargetSemantics inferTargetSemanticsRaw(const TypedDataset& ds, int targetIdx) {
     TargetSemantics out;
@@ -774,22 +807,38 @@ TargetSemantics inferTargetSemanticsRaw(const TypedDataset& ds, int targetIdx) {
     for (double v : y) {
         if (!std::isfinite(v)) continue;
         uniq.insert(v);
-        if (uniq.size() > 2) return out;
+        if (uniq.size() > 12) break;
     }
-    if (uniq.empty() || uniq.size() > 2) return out;
+    out.cardinality = uniq.size();
+    if (uniq.empty()) return out;
 
     if (uniq.size() == 1) {
         out.isBinary = true;
         out.lowLabel = *uniq.begin();
         out.highLabel = *uniq.begin();
+        out.inferredTask = "binary_classification";
         return out;
     }
 
-    auto it = uniq.begin();
-    out.lowLabel = *it;
-    ++it;
-    out.highLabel = *it;
-    out.isBinary = true;
+    if (uniq.size() == 2) {
+        auto it = uniq.begin();
+        out.lowLabel = *it;
+        ++it;
+        out.highLabel = *it;
+        out.isBinary = true;
+        out.inferredTask = "binary_classification";
+        return out;
+    }
+
+    if (uniq.size() <= 8) {
+        out.isOrdinal = true;
+        out.lowLabel = *uniq.begin();
+        out.highLabel = *uniq.rbegin();
+        out.inferredTask = "ordinal_classification";
+        return out;
+    }
+
+    out.inferredTask = "regression";
     return out;
 }
 
@@ -859,8 +908,18 @@ FeatureSelectionResult collectFeatureIndices(const TypedDataset& data,
         if (!std::isfinite(st.variance) || st.variance < minVar) continue;
         double r = std::abs(MathUtils::calculatePearson(values, targetVals, st, targetStats).value_or(0.0));
 
-        if (r >= leakageCorrThreshold) {
-            out.droppedByMissingness.push_back(name + " (auto_leak_guard abs_corr=" + toFixed(r, 4) + ")");
+        const std::string lname = CommonUtils::toLower(name);
+        const std::string tname = CommonUtils::toLower(data.columns()[static_cast<size_t>(targetIdx)].name);
+        const bool temporalLeakHint = containsToken(lname, {"future", "post", "after", "resolved", "actual", "outcome", "label"});
+        const bool targetEchoHint = (lname.find(tname) != std::string::npos && lname != tname);
+        const bool highRiskLeakage = (r >= std::max(0.995, leakageCorrThreshold)) || (r >= 0.98 && (temporalLeakHint || targetEchoHint));
+
+        if (highRiskLeakage) {
+            std::string reason = "auto_leak_guard abs_corr=" + toFixed(r, 4);
+            if (temporalLeakHint || targetEchoHint) {
+                reason += " semantic_hint";
+            }
+            out.droppedByMissingness.push_back(name + " (" + reason + ")");
             continue;
         }
 
@@ -1003,7 +1062,14 @@ struct PairInsight {
     double pValue = 1.0;
     bool statSignificant = false;
     double neuralScore = 0.0;
+    double effectSize = 0.0;
+    double foldStability = 0.0;
     bool selected = false;
+    bool filteredAsRedundant = false;
+    bool filteredAsStructural = false;
+    bool leakageRisk = false;
+    std::string relationLabel;
+    std::string redundancyGroup;
     bool fitLineAdded = false;
     bool confidenceBandAdded = false;
     std::string plotPath;
@@ -1408,7 +1474,9 @@ TargetContext resolveTargetContext(const TypedDataset& data, const AutoConfig& c
         std::cout << "[Seldon][Target] "
                   << (context.userProvidedTarget ? "Using user-selected target: " : "Auto-selected target: ")
                   << runCfg.targetColumn
-                  << " (strategy=" << context.choice.strategyUsed << ")\n";
+                  << " (strategy=" << context.choice.strategyUsed
+                  << ", task=" << context.semantics.inferredTask
+                  << ", cardinality=" << context.semantics.cardinality << ")\n";
     }
 
     return context;
@@ -2824,6 +2892,172 @@ std::unordered_set<size_t> computeNeuralApprovedNumericFeatures(const TypedDatas
     return approved;
 }
 
+struct StructuralRelation {
+    size_t a = 0;
+    size_t b = 0;
+    size_t c = 0;
+    std::string op;
+};
+
+std::vector<StructuralRelation> detectStructuralRelations(const TypedDataset& data,
+                                                          const std::vector<size_t>& numericIdx,
+                                                          size_t capColumns = 18,
+                                                          size_t capRows = 512) {
+    std::vector<StructuralRelation> out;
+    if (numericIdx.size() < 3) return out;
+
+    std::vector<size_t> cols = numericIdx;
+    if (cols.size() > capColumns) cols.resize(capColumns);
+
+    for (size_t ia = 0; ia < cols.size(); ++ia) {
+        const auto& av = std::get<std::vector<double>>(data.columns()[cols[ia]].values);
+        for (size_t ib = ia + 1; ib < cols.size(); ++ib) {
+            const auto& bv = std::get<std::vector<double>>(data.columns()[cols[ib]].values);
+            for (size_t ic = 0; ic < cols.size(); ++ic) {
+                if (ic == ia || ic == ib) continue;
+                const auto& cv = std::get<std::vector<double>>(data.columns()[cols[ic]].values);
+                const size_t n = std::min({av.size(), bv.size(), cv.size(), data.rowCount(), capRows});
+                if (n < 24) continue;
+
+                size_t valid = 0;
+                size_t addHits = 0;
+                size_t mulHits = 0;
+                for (size_t r = 0; r < n; ++r) {
+                    if (data.columns()[cols[ia]].missing[r] || data.columns()[cols[ib]].missing[r] || data.columns()[cols[ic]].missing[r]) {
+                        continue;
+                    }
+                    const double a = av[r];
+                    const double b = bv[r];
+                    const double c = cv[r];
+                    if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(c)) continue;
+                    const double addErr = std::abs((a + b) - c);
+                    const double addScale = std::max(1.0, std::abs(c));
+                    if (addErr <= (1e-5 * addScale + 1e-8)) addHits++;
+
+                    const double mulErr = std::abs((a * b) - c);
+                    const double mulScale = std::max(1.0, std::abs(c));
+                    if (mulErr <= (1e-4 * mulScale + 1e-8)) mulHits++;
+                    ++valid;
+                }
+                if (valid < 24) continue;
+
+                const double addRate = static_cast<double>(addHits) / static_cast<double>(valid);
+                const double mulRate = static_cast<double>(mulHits) / static_cast<double>(valid);
+                if (addRate >= 0.985) {
+                    out.push_back({cols[ia], cols[ib], cols[ic], "sum"});
+                } else if (mulRate >= 0.985) {
+                    out.push_back({cols[ia], cols[ib], cols[ic], "product"});
+                }
+            }
+        }
+    }
+
+    return out;
+}
+
+std::unordered_map<size_t, size_t> buildInformationClusters(const TypedDataset& data,
+                                                            const std::vector<size_t>& numericIdx,
+                                                            const NumericStatsCache& statsCache,
+                                                            const std::unordered_map<size_t, double>& importanceByIndex,
+                                                            double absCorrThreshold = 0.97) {
+    std::unordered_map<size_t, size_t> representativeByFeature;
+    if (numericIdx.empty()) return representativeByFeature;
+
+    std::unordered_map<size_t, size_t> parent;
+    for (size_t idx : numericIdx) parent[idx] = idx;
+
+    std::function<size_t(size_t)> findRoot = [&](size_t x) -> size_t {
+        auto it = parent.find(x);
+        if (it == parent.end()) return x;
+        if (it->second == x) return x;
+        it->second = findRoot(it->second);
+        return it->second;
+    };
+    auto unite = [&](size_t a, size_t b) {
+        const size_t ra = findRoot(a);
+        const size_t rb = findRoot(b);
+        if (ra == rb) return;
+        parent[rb] = ra;
+    };
+
+    for (size_t i = 0; i < numericIdx.size(); ++i) {
+        for (size_t j = i + 1; j < numericIdx.size(); ++j) {
+            const size_t ia = numericIdx[i];
+            const size_t ib = numericIdx[j];
+            const auto& va = std::get<std::vector<double>>(data.columns()[ia].values);
+            const auto& vb = std::get<std::vector<double>>(data.columns()[ib].values);
+            auto aIt = statsCache.find(ia);
+            auto bIt = statsCache.find(ib);
+            ColumnStats aFallback = Statistics::calculateStats(va);
+            ColumnStats bFallback = Statistics::calculateStats(vb);
+            const ColumnStats& sa = (aIt != statsCache.end()) ? aIt->second : aFallback;
+            const ColumnStats& sb = (bIt != statsCache.end()) ? bIt->second : bFallback;
+            const double r = std::abs(MathUtils::calculatePearson(va, vb, sa, sb).value_or(0.0));
+            if (r >= absCorrThreshold) unite(ia, ib);
+        }
+    }
+
+    std::unordered_map<size_t, std::vector<size_t>> members;
+    for (size_t idx : numericIdx) members[findRoot(idx)].push_back(idx);
+
+    for (const auto& kv : members) {
+        const auto& cluster = kv.second;
+        size_t rep = cluster.front();
+        double best = -1.0;
+        for (size_t idx : cluster) {
+            const double s = importanceByIndex.count(idx) ? importanceByIndex.at(idx) : 0.0;
+            if (s > best) {
+                best = s;
+                rep = idx;
+            }
+        }
+        for (size_t idx : cluster) representativeByFeature[idx] = rep;
+    }
+    return representativeByFeature;
+}
+
+double computeFoldStabilityFromCorrelation(const std::vector<double>& a,
+                                           const std::vector<double>& b,
+                                           size_t folds = 5) {
+    const size_t n = std::min(a.size(), b.size());
+    if (n < 30 || folds < 2) return 0.0;
+    const size_t foldCount = std::min(folds, n / 6);
+    if (foldCount < 2) return 0.0;
+
+    std::vector<double> foldScores;
+    foldScores.reserve(foldCount);
+    for (size_t f = 0; f < foldCount; ++f) {
+        const size_t s = (f * n) / foldCount;
+        const size_t e = ((f + 1) * n) / foldCount;
+        std::vector<double> xa;
+        std::vector<double> xb;
+        xa.reserve(e - s);
+        xb.reserve(e - s);
+        for (size_t i = s; i < e; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) continue;
+            xa.push_back(a[i]);
+            xb.push_back(b[i]);
+        }
+        if (xa.size() < 8) continue;
+        const ColumnStats sa = Statistics::calculateStats(xa);
+        const ColumnStats sb = Statistics::calculateStats(xb);
+        const double r = std::abs(MathUtils::calculatePearson(xa, xb, sa, sb).value_or(0.0));
+        if (std::isfinite(r)) foldScores.push_back(r);
+    }
+    if (foldScores.size() < 2) return 0.0;
+
+    const double mean = std::accumulate(foldScores.begin(), foldScores.end(), 0.0) / static_cast<double>(foldScores.size());
+    if (mean <= 1e-12) return 0.0;
+    double var = 0.0;
+    for (double v : foldScores) {
+        const double d = v - mean;
+        var += d * d;
+    }
+    var /= static_cast<double>(std::max<size_t>(1, foldScores.size() - 1));
+    const double cv = std::sqrt(var) / mean;
+    return std::clamp(1.0 - cv, 0.0, 1.0);
+}
+
 std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                                                const std::unordered_map<size_t, double>& importanceByIndex,
                                                const std::unordered_set<size_t>& modeledIndices,
@@ -2839,6 +3073,19 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     const auto numericIdx = data.numericColumnIndices();
     const size_t n = data.rowCount();
     std::vector<size_t> evalNumericIdx = numericIdx;
+
+    const auto representativeByFeature = buildInformationClusters(data, numericIdx, statsCache, importanceByIndex);
+    const auto structuralRelations = detectStructuralRelations(data, evalNumericIdx);
+    std::unordered_map<std::string, std::string> structuralPairLabel;
+    for (const auto& sr : structuralRelations) {
+        const size_t x = std::min(sr.a, sr.b);
+        const size_t y = std::max(sr.a, sr.b);
+        const std::string key = std::to_string(x) + "|" + std::to_string(y);
+        const std::string label = (sr.op == "sum")
+            ? (data.columns()[sr.a].name + " + " + data.columns()[sr.b].name + " ≈ " + data.columns()[sr.c].name)
+            : (data.columns()[sr.a].name + " × " + data.columns()[sr.b].name + " ≈ " + data.columns()[sr.c].name);
+        structuralPairLabel[key] = label;
+    }
 
     const size_t totalPairs = numericIdx.size() < 2 ? 0 : (numericIdx.size() * (numericIdx.size() - 1)) / 2;
     if (maxPairs > 0 && totalPairs > maxPairs) {
@@ -2912,6 +3159,30 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                 p.kendallTau = MathUtils::calculateKendallTau(va, vb).value_or(0.0);
             }
 
+            const bool monotonicIdentity = (std::abs(p.spearman) >= 0.999 && std::abs(p.r) < 0.9985);
+            const bool nearIdentity = std::abs(p.r) >= 0.9995;
+            if (nearIdentity || monotonicIdentity) {
+                p.filteredAsRedundant = true;
+                p.relationLabel = nearIdentity ? "Near-identical signal" : "Monotonic transform proxy";
+            }
+
+            const size_t repA = representativeByFeature.count(ia) ? representativeByFeature.at(ia) : ia;
+            const size_t repB = representativeByFeature.count(ib) ? representativeByFeature.at(ib) : ib;
+            if (repA == repB) {
+                p.filteredAsRedundant = true;
+                p.redundancyGroup = data.columns()[repA].name;
+                if (p.relationLabel.empty()) p.relationLabel = "Information cluster duplicate";
+            }
+
+            const size_t kx = std::min(ia, ib);
+            const size_t ky = std::max(ia, ib);
+            const std::string structuralKey = std::to_string(kx) + "|" + std::to_string(ky);
+            auto sit = structuralPairLabel.find(structuralKey);
+            if (sit != structuralPairLabel.end()) {
+                p.filteredAsStructural = true;
+                p.relationLabel = sit->second;
+            }
+
             double impA = 0.0;
             double impB = 0.0;
             auto ita = importanceByIndex.find(ia);
@@ -2919,12 +3190,21 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             if (ita != importanceByIndex.end()) impA = ita->second;
             if (itb != importanceByIndex.end()) impB = itb->second;
             double impScore = std::clamp((impA + impB) / 2.0, 0.0, 1.0);
-            double corrScore = std::clamp(std::abs(p.r), 0.0, 1.0);
-            double sigScore = std::clamp(-std::log10(std::max(p.pValue, numericEpsilon)) / 12.0, 0.0, 1.0);
+            p.effectSize = std::clamp(p.r2, 0.0, 1.0);
+            p.foldStability = computeFoldStabilityFromCorrelation(va, vb, 5);
             bool aModeled = modeledIndices.find(ia) != modeledIndices.end();
             bool bModeled = modeledIndices.find(ib) != modeledIndices.end();
             double coverageFactor = (aModeled && bModeled) ? policy.coverageBoth : ((aModeled || bModeled) ? policy.coverageOne : policy.coverageNone);
-            p.neuralScore = (policy.wImportance * impScore + policy.wCorrelation * corrScore + policy.wSignificance * sigScore) * coverageFactor;
+            const double effectWeighted = 0.60 * p.effectSize + 0.40 * std::clamp(std::abs(p.r), 0.0, 1.0);
+            p.neuralScore = (policy.wImportance * impScore + policy.wCorrelation * effectWeighted + policy.wSignificance * p.foldStability) * coverageFactor;
+
+            const bool leakageNameHint =
+                containsToken(CommonUtils::toLower(p.featureA), {"future", "post", "outcome", "label", "resolved", "actual"}) ||
+                containsToken(CommonUtils::toLower(p.featureB), {"future", "post", "outcome", "label", "resolved", "actual"});
+            p.leakageRisk = (std::abs(p.r) >= 0.995 && (leakageNameHint || p.filteredAsStructural));
+            if (p.leakageRisk && p.relationLabel.empty()) {
+                p.relationLabel = "Potential leakage proxy";
+            }
 
             return p;
     };
@@ -2996,6 +3276,7 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     std::vector<size_t> selectedCandidateIdx;
     selectedCandidateIdx.reserve(pairs.size());
     for (size_t i = 0; i < pairs.size(); ++i) {
+        if (pairs[i].filteredAsRedundant || pairs[i].filteredAsStructural || pairs[i].leakageRisk) continue;
         if (pairs[i].statSignificant && pairs[i].neuralScore >= dynamicCutoff) {
             selectedCandidateIdx.push_back(i);
         }
@@ -3003,7 +3284,7 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
 
     std::sort(selectedCandidateIdx.begin(), selectedCandidateIdx.end(), [&](size_t lhs, size_t rhs) {
         if (pairs[lhs].neuralScore == pairs[rhs].neuralScore) {
-            return std::abs(pairs[lhs].r) > std::abs(pairs[rhs].r);
+            return pairs[lhs].effectSize > pairs[rhs].effectSize;
         }
         return pairs[lhs].neuralScore > pairs[rhs].neuralScore;
     });
@@ -3093,7 +3374,8 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
 
     std::sort(pairs.begin(), pairs.end(), [](const PairInsight& lhs, const PairInsight& rhs) {
         if (lhs.selected != rhs.selected) return lhs.selected > rhs.selected;
-        return std::abs(lhs.r) > std::abs(rhs.r);
+        if (lhs.effectSize == rhs.effectSize) return std::abs(lhs.r) > std::abs(rhs.r);
+        return lhs.effectSize > rhs.effectSize;
     });
 
     return pairs;
@@ -4227,9 +4509,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
     if (totalPossiblePairs > bivariatePairs.size()) {
         bivariate.addParagraph("Fast mode active: pair evaluation was capped for runtime safety. Results below cover the highest-priority numeric columns only.");
     } else {
-        bivariate.addParagraph("All numeric pair combinations are included below (nC2). Significant table is dynamically filtered using statistical significance + neural relevance score.");
+        bivariate.addParagraph("All numeric pair combinations are included below (nC2). Significant table is dynamically filtered using statistical significance, effect size, and fold-stability-weighted neural relevance.");
     }
-    bivariate.addParagraph("Neural-lattice significance score drives final pair selection; only selected pairs are considered significant findings.");
+    bivariate.addParagraph("Neural-lattice relevance score prioritizes practical effect size over raw p-value magnitude; only selected pairs are considered significant findings.");
 
     std::vector<std::vector<std::string>> allRows;
     std::vector<std::vector<std::string>> sigRows;
@@ -4243,6 +4525,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
             toFixed(p.spearman),
             toFixed(p.kendallTau),
             toFixed(p.r2),
+            toFixed(p.effectSize, 6),
+            toFixed(p.foldStability, 6),
             toFixed(p.slope),
             toFixed(p.intercept),
             toFixed(p.tStat, 6),
@@ -4250,6 +4534,11 @@ int AutomationPipeline::run(const AutoConfig& config) {
             p.statSignificant ? "yes" : "no",
             toFixed(p.neuralScore, 6),
             p.selected ? "yes" : "no",
+            p.filteredAsRedundant ? "yes" : "no",
+            p.filteredAsStructural ? "yes" : "no",
+            p.leakageRisk ? "yes" : "no",
+            p.redundancyGroup.empty() ? "-" : p.redundancyGroup,
+            p.relationLabel.empty() ? "-" : p.relationLabel,
             p.fitLineAdded ? "yes" : "no",
             p.confidenceBandAdded ? "yes" : "no",
             p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
@@ -4266,11 +4555,14 @@ int AutomationPipeline::run(const AutoConfig& config) {
                 toFixed(p.spearman),
                 toFixed(p.kendallTau),
                 toFixed(p.r2),
+                toFixed(p.effectSize, 6),
+                toFixed(p.foldStability, 6),
                 toFixed(p.slope),
                 toFixed(p.intercept),
                 toFixed(p.tStat, 6),
                 toFixed(p.pValue, 6),
                 toFixed(p.neuralScore, 6),
+                p.relationLabel.empty() ? "-" : p.relationLabel,
                 p.fitLineAdded ? "yes" : "no",
                 p.confidenceBandAdded ? "yes" : "no",
                 p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
@@ -4293,11 +4585,59 @@ int AutomationPipeline::run(const AutoConfig& config) {
         }
     }
 
+    std::vector<std::string> topTakeaways;
+    std::unordered_set<size_t> usedFeatures;
+    std::vector<PairInsight> rankedTakeaways;
+    for (const auto& p : bivariatePairs) {
+        if (!p.selected) continue;
+        if (p.filteredAsRedundant || p.filteredAsStructural || p.leakageRisk) continue;
+        rankedTakeaways.push_back(p);
+    }
+    std::sort(rankedTakeaways.begin(), rankedTakeaways.end(), [](const PairInsight& a, const PairInsight& b) {
+        if (a.effectSize == b.effectSize) return a.neuralScore > b.neuralScore;
+        return a.effectSize > b.effectSize;
+    });
+    for (const auto& p : rankedTakeaways) {
+        if (topTakeaways.size() >= 3) break;
+        if (usedFeatures.count(p.idxA) || usedFeatures.count(p.idxB)) continue;
+        std::string label;
+        if (std::abs(p.r) >= 0.90) {
+            label = p.featureA + " is a strong proxy for " + p.featureB;
+        } else if (std::abs(p.r) >= 0.70) {
+            label = p.featureA + " and " + p.featureB + " encode overlapping signal";
+        } else {
+            label = p.featureA + " and " + p.featureB + " show moderate but stable association";
+        }
+        label += " (effect=" + toFixed(p.effectSize, 3) + ", stability=" + toFixed(p.foldStability, 3) + ")";
+        topTakeaways.push_back(label);
+        usedFeatures.insert(p.idxA);
+        usedFeatures.insert(p.idxB);
+    }
+
+    std::vector<std::string> redundancyDrops;
+    std::unordered_set<std::string> seenDrop;
+    for (const auto& p : bivariatePairs) {
+        if (!p.filteredAsRedundant || p.redundancyGroup.empty()) continue;
+        const double impA = importanceByIndex.count(p.idxA) ? importanceByIndex[p.idxA] : 0.0;
+        const double impB = importanceByIndex.count(p.idxB) ? importanceByIndex[p.idxB] : 0.0;
+        const std::string drop = (impA < impB) ? p.featureA : p.featureB;
+        const std::string keep = (impA < impB) ? p.featureB : p.featureA;
+        const std::string recommendation = "drop " + drop + " (redundant with " + keep + ")";
+        if (seenDrop.insert(recommendation).second) {
+            redundancyDrops.push_back(recommendation);
+            if (redundancyDrops.size() >= 8) break;
+        }
+    }
+
     bivariate.addParagraph("Total pairs evaluated: " + std::to_string(allRows.size()));
     bivariate.addParagraph("Statistically significant pairs (p<" + toFixed(MathUtils::getSignificanceAlpha(), 4) + "): " + std::to_string(statSigCount));
     bivariate.addParagraph("Final neural-selected significant pairs: " + std::to_string(sigRows.size()));
-    bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, allRows);
-    bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
+    const size_t redundantPairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.filteredAsRedundant; }));
+    const size_t structuralPairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.filteredAsStructural; }));
+    const size_t leakagePairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.leakageRisk; }));
+    bivariate.addParagraph("Information-theoretic filtering: redundant=" + std::to_string(redundantPairs) + ", structural=" + std::to_string(structuralPairs) + ", leakage-risk=" + std::to_string(leakagePairs) + ".");
+    bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "redundant", "structural", "leakage_risk", "cluster_rep", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, allRows);
+    bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
 
     const auto contingency = analyzeContingencyPairs(data);
     if (!contingency.empty()) {
@@ -4328,11 +4668,13 @@ int AutomationPipeline::run(const AutoConfig& config) {
     ReportEngine neuralReport;
     neuralReport.addTitle("Neural Synthesis");
     neuralReport.addParagraph("This synthesis captures detailed lattice training traces and how neural relevance influenced bivariate selection.");
-    neuralReport.addParagraph(std::string("Task type inferred from target: ") + (targetContext.semantics.isBinary ? "binary_classification" : "regression"));
+    neuralReport.addParagraph(std::string("Task type inferred from target: ") + targetContext.semantics.inferredTask);
     neuralReport.addTable("Auto Decision Log", {"Decision", "Value"}, {
         {"Target Selection", targetContext.userProvidedTarget ? "user-specified" : "auto"},
         {"Target Strategy", targetContext.choice.strategyUsed},
         {"Target Column", runCfg.targetColumn},
+        {"Target Task", targetContext.semantics.inferredTask},
+        {"Target Cardinality", std::to_string(targetContext.semantics.cardinality)},
         {"Feature Strategy", selectedFeatures.strategyUsed},
         {"Feature Missingness Threshold", toFixed(selectedFeatures.missingThresholdUsed, 4)},
         {"Features Retained", std::to_string(featureIdx.size())},
@@ -4430,7 +4772,24 @@ int AutomationPipeline::run(const AutoConfig& config) {
     finalAnalysis.addTitle("Final Analysis - Significant Findings Only");
     finalAnalysis.addParagraph("This report contains only neural-net-approved significant findings (dynamic decision engine). Non-selected findings are excluded by design.");
     finalAnalysis.addParagraph("Data Health Score: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + "). This score estimates discovered signal strength using completeness, retained feature coverage, significant-pair yield, selected-pair yield, and neural training stability.");
-    finalAnalysis.addTable("Neural-Selected Significant Bivariate Findings", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "slope", "intercept", "t_stat", "p_value", "neural_score", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
+
+    if (!topTakeaways.empty()) {
+        std::vector<std::vector<std::string>> takeawayRows;
+        for (size_t i = 0; i < topTakeaways.size(); ++i) {
+            takeawayRows.push_back({std::to_string(i + 1), topTakeaways[i]});
+        }
+        finalAnalysis.addTable("Top 3 Takeaways", {"Rank", "Takeaway"}, takeawayRows);
+    }
+
+    if (!redundancyDrops.empty()) {
+        std::vector<std::vector<std::string>> dropRows;
+        for (const auto& msg : redundancyDrops) {
+            dropRows.push_back({msg});
+        }
+        finalAnalysis.addTable("Redundancy Drop Recommendations", {"Action"}, dropRows);
+    }
+
+    finalAnalysis.addTable("Neural-Selected Significant Bivariate Findings", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
 
     finalAnalysis.addTable("Data Health Signal Card", {"Component", "Value"}, {
         {"Score (0-100)", toFixed(dataHealth.score, 1)},

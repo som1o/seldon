@@ -1,6 +1,8 @@
 #include "Preprocessor.h"
 #include "CommonUtils.h"
+#include "MathUtils.h"
 #include "SeldonExceptions.h"
+#include "Statistics.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -276,6 +278,47 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
     const size_t maxGenerated = std::max<size_t>(16, config.featureEngineeringMaxGeneratedColumns);
     bool capReached = false;
 
+    const int targetIdx = config.targetColumn.empty() ? -1 : data.findColumnIndex(config.targetColumn);
+    const bool hasNumericTarget =
+        targetIdx >= 0 &&
+        static_cast<size_t>(targetIdx) < data.columns().size() &&
+        data.columns()[static_cast<size_t>(targetIdx)].type == ColumnType::NUMERIC;
+
+    std::vector<double> targetVals;
+    MissingMask targetMissing;
+    if (hasNumericTarget) {
+        targetVals = std::get<NumVec>(data.columns()[static_cast<size_t>(targetIdx)].values);
+        targetMissing = data.columns()[static_cast<size_t>(targetIdx)].missing;
+    }
+
+    auto absCorrWithTarget = [&](const std::vector<double>& x, const MissingMask& xMissing) {
+        if (!hasNumericTarget) return 0.0;
+        const size_t n = std::min({x.size(), xMissing.size(), targetVals.size(), targetMissing.size()});
+        std::vector<double> cleanX;
+        std::vector<double> cleanY;
+        cleanX.reserve(n);
+        cleanY.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            if (xMissing[i] || targetMissing[i]) continue;
+            if (!std::isfinite(x[i]) || !std::isfinite(targetVals[i])) continue;
+            cleanX.push_back(x[i]);
+            cleanY.push_back(targetVals[i]);
+        }
+        if (cleanX.size() < 16) return 0.0;
+        const ColumnStats sx = Statistics::calculateStats(cleanX);
+        const ColumnStats sy = Statistics::calculateStats(cleanY);
+        return std::abs(MathUtils::calculatePearson(cleanX, cleanY, sx, sy).value_or(0.0));
+    };
+
+    std::unordered_map<size_t, double> baseCorr;
+    if (hasNumericTarget) {
+        for (size_t idx : base) {
+            const auto& col = data.columns()[idx];
+            const auto& vals = std::get<NumVec>(col.values);
+            baseCorr[idx] = absCorrWithTarget(vals, col.missing);
+        }
+    }
+
     auto canAddMore = [&]() {
         return engineered.size() < maxGenerated;
     };
@@ -360,6 +403,19 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
                 c.type = ColumnType::NUMERIC;
                 c.values = std::move(inter);
                 c.missing = std::move(miss);
+
+                if (hasNumericTarget) {
+                    const double interCorr = absCorrWithTarget(std::get<NumVec>(c.values), c.missing);
+                    const double baseA = baseCorr.count(base[i]) ? baseCorr[base[i]] : 0.0;
+                    const double baseB = baseCorr.count(base[j]) ? baseCorr[base[j]] : 0.0;
+                    const double baseBest = std::max(baseA, baseB);
+                    const double lift = interCorr - baseBest;
+                    const bool hasUsefulLift = (interCorr >= (baseBest * 1.05)) && (lift >= 0.03);
+                    if (!hasUsefulLift) {
+                        continue;
+                    }
+                }
+
                 engineered.push_back(std::move(c));
             }
             if (capReached) break;
