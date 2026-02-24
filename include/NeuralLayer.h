@@ -54,6 +54,13 @@ public:
                           NeuralOptimizer optimizer,
                           size_t tStep,
                           const std::vector<double>* inputL2Scales = nullptr);
+    void updateParametersAccumulated(double learningRate,
+                                     double l2Lambda,
+                                     NeuralOptimizer optimizer,
+                                     size_t tStep,
+                                     const std::vector<double>& gradBiasAccum,
+                                     const std::vector<double>& gradWeightAccum,
+                                     const std::vector<double>* inputL2Scales = nullptr);
 
 private:
     static double activate(double x, NeuralActivation activation);

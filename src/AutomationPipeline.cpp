@@ -28,6 +28,7 @@
 #include <random>
 #include <sstream>
 #include <set>
+#include <string_view>
 #include <sys/wait.h>
 #include <thread>
 #include <unordered_map>
@@ -286,7 +287,7 @@ CategoryFrequencyProfile buildCategoryFrequencyProfile(const std::vector<std::st
                                                       const MissingMask& missing,
                                                       size_t maxCategories = 12) {
     CategoryFrequencyProfile out;
-    std::unordered_map<std::string, double> freq;
+    std::unordered_map<std::string_view, double> freq;
     const size_t n = std::min(values.size(), missing.size());
     for (size_t i = 0; i < n; ++i) {
         if (missing[i]) continue;
@@ -295,7 +296,7 @@ CategoryFrequencyProfile buildCategoryFrequencyProfile(const std::vector<std::st
     }
     if (freq.size() < 2) return out;
 
-    std::vector<std::pair<std::string, double>> rows(freq.begin(), freq.end());
+    std::vector<std::pair<std::string_view, double>> rows(freq.begin(), freq.end());
     std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
         if (a.second == b.second) return a.first < b.first;
         return a.second > b.second;
@@ -305,7 +306,7 @@ CategoryFrequencyProfile buildCategoryFrequencyProfile(const std::vector<std::st
     double other = 0.0;
     for (size_t i = 0; i < rows.size(); ++i) {
         if (i < keep) {
-            out.labels.push_back(rows[i].first);
+            out.labels.push_back(std::string(rows[i].first));
             out.counts.push_back(rows[i].second);
         } else {
             other += rows[i].second;
@@ -419,6 +420,23 @@ public:
 private:
     bool enabled_ = false;
     size_t tick_ = 0;
+};
+
+struct FastRng {
+    uint64_t state;
+    explicit FastRng(uint64_t seed) : state(seed ? seed : 0x9e3779b97f4a7c15ULL) {}
+    uint64_t nextU64() {
+        uint64_t x = state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        state = x;
+        return x * 2685821657736338717ULL;
+    }
+    size_t uniformIndex(size_t upperExclusive) {
+        if (upperExclusive == 0) return 0;
+        return static_cast<size_t>(nextU64() % static_cast<uint64_t>(upperExclusive));
+    }
 };
 
 std::optional<size_t> findDatetimeBySemanticName(const TypedDataset& data, const std::vector<std::string>& hints) {
@@ -1188,7 +1206,7 @@ EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
 
     struct CategoryPlan {
         size_t columnIdx = 0;
-        std::vector<std::pair<std::string, size_t>> categories;
+        std::vector<std::pair<std::string_view, size_t>> categories;
         size_t keepCount = 0;
         bool includeOther = false;
     };
@@ -1213,7 +1231,7 @@ EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
         const auto& values = std::get<std::vector<std::string>>(data.columns()[idx].values);
         if (values.empty()) continue;
 
-        std::unordered_map<std::string, size_t> freq;
+        std::unordered_map<std::string_view, size_t> freq;
         for (const auto& v : values) {
             if (!v.empty()) freq[v]++;
         }
@@ -1242,7 +1260,11 @@ EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
         if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
         if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
         const auto& values = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
-        for (size_t r = 0; r < out.X.size() && r < values.size(); ++r) {
+        const size_t rowLimit = std::min(out.X.size(), values.size());
+        #ifdef USE_OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (size_t r = 0; r < rowLimit; ++r) {
             out.X[r].push_back(values[r]);
         }
         out.sourceNumericFeaturePos.push_back(static_cast<int>(featurePos));
@@ -1255,9 +1277,13 @@ EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
         std::unordered_set<std::string> kept;
         kept.reserve(keepCount);
         for (size_t i = 0; i < keepCount; ++i) {
-            const std::string& label = plan.categories[i].first;
+            const std::string label(plan.categories[i].first);
             kept.insert(label);
-            for (size_t r = 0; r < out.X.size() && r < values.size(); ++r) {
+            const size_t rowLimit = std::min(out.X.size(), values.size());
+            #ifdef USE_OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (size_t r = 0; r < rowLimit; ++r) {
                 out.X[r].push_back(values[r] == label ? 1.0 : 0.0);
             }
             out.sourceNumericFeaturePos.push_back(-1);
@@ -1265,7 +1291,11 @@ EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
         }
 
         if (plan.includeOther) {
-            for (size_t r = 0; r < out.X.size() && r < values.size(); ++r) {
+            const size_t rowLimit = std::min(out.X.size(), values.size());
+            #ifdef USE_OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (size_t r = 0; r < rowLimit; ++r) {
                 out.X[r].push_back(kept.find(values[r]) == kept.end() ? 1.0 : 0.0);
             }
             out.sourceNumericFeaturePos.push_back(-1);
@@ -1638,6 +1668,8 @@ void addUnivariateDetailedSection(ReportEngine& report,
                                   const NumericStatsCache& statsCache) {
     std::vector<std::vector<std::string>> summaryRows;
     std::vector<std::vector<std::string>> categoricalRows;
+    std::unordered_map<size_t, NumericDetailedStats> summaryCache;
+    summaryCache.reserve(data.numericColumnIndices().size());
     summaryRows.reserve(data.colCount());
 
     if (verbose) {
@@ -1657,7 +1689,19 @@ void addUnivariateDetailedSection(ReportEngine& report,
             int idx = data.findColumnIndex(col.name);
             const auto it = (idx >= 0) ? statsCache.find(static_cast<size_t>(idx)) : statsCache.end();
             const ColumnStats* precomputed = (it != statsCache.end()) ? &it->second : nullptr;
-            NumericDetailedStats st = detailedNumeric(vals, precomputed);
+            NumericDetailedStats st;
+            if (idx >= 0) {
+                const size_t key = static_cast<size_t>(idx);
+                const auto sit = summaryCache.find(key);
+                if (sit != summaryCache.end()) {
+                    st = sit->second;
+                } else {
+                    st = detailedNumeric(vals, precomputed);
+                    summaryCache.emplace(key, st);
+                }
+            } else {
+                st = detailedNumeric(vals, precomputed);
+            }
 
             summaryRows.push_back({
                 col.name,
@@ -2054,6 +2098,65 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     size_t outputNodes = std::max<size_t>(1, Ynn.empty() ? 1 : Ynn.front().size());
 
     if (inputNodes >= 48 && Xnn.size() >= 64) {
+        if (inputNodes > 96 && !Ynn.empty() && !Ynn.front().empty()) {
+            const size_t preProbeCap = std::clamp<size_t>(std::max<size_t>(64, Xnn.size() / 3), 64, 192);
+            if (preProbeCap < inputNodes) {
+                std::vector<std::pair<size_t, double>> ranked;
+                ranked.reserve(inputNodes);
+
+                double yMean = 0.0;
+                for (const auto& row : Ynn) yMean += row[0];
+                yMean /= static_cast<double>(std::max<size_t>(1, Ynn.size()));
+                double yVar = 0.0;
+                for (const auto& row : Ynn) {
+                    const double d = row[0] - yMean;
+                    yVar += d * d;
+                }
+                yVar = std::max(1e-12, yVar);
+
+                for (size_t c = 0; c < inputNodes; ++c) {
+                    double xMean = 0.0;
+                    for (const auto& row : Xnn) xMean += row[c];
+                    xMean /= static_cast<double>(std::max<size_t>(1, Xnn.size()));
+                    double xVar = 0.0;
+                    double cov = 0.0;
+                    for (size_t r = 0; r < Xnn.size(); ++r) {
+                        const double dx = Xnn[r][c] - xMean;
+                        const double dy = Ynn[r][0] - yMean;
+                        xVar += dx * dx;
+                        cov += dx * dy;
+                    }
+                    const double score = (xVar > 1e-12) ? std::abs(cov) / std::sqrt(std::max(1e-12, xVar * yVar)) : 0.0;
+                    ranked.push_back({c, std::isfinite(score) ? score : 0.0});
+                }
+
+                std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                    if (a.second == b.second) return a.first < b.first;
+                    return a.second > b.second;
+                });
+                ranked.resize(preProbeCap);
+                std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+                std::vector<std::vector<double>> reducedX(Xnn.size(), std::vector<double>{});
+                for (size_t r = 0; r < Xnn.size(); ++r) {
+                    reducedX[r].reserve(ranked.size());
+                    for (const auto& kv : ranked) reducedX[r].push_back(Xnn[r][kv.first]);
+                }
+
+                std::vector<int> reducedSource;
+                reducedSource.reserve(ranked.size());
+                for (const auto& kv : ranked) {
+                    const size_t idx = kv.first;
+                    reducedSource.push_back((idx < encoded.sourceNumericFeaturePos.size()) ? encoded.sourceNumericFeaturePos[idx] : -1);
+                }
+
+                Xnn = std::move(reducedX);
+                encoded.sourceNumericFeaturePos = std::move(reducedSource);
+                inputNodes = Xnn.empty() ? 0 : Xnn.front().size();
+                analysis.inputNodes = inputNodes;
+            }
+        }
+
         const size_t probeRows = std::min<size_t>(Xnn.size(), std::max<size_t>(256, std::min<size_t>(config.neuralImportanceMaxRows, static_cast<size_t>(2000))));
         std::vector<size_t> probeOrder(Xnn.size());
         std::iota(probeOrder.begin(), probeOrder.end(), 0);
@@ -2288,6 +2391,11 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     hp.lrCooldownEpochs = config.neuralLrCooldownEpochs;
     hp.maxLrReductions = config.neuralMaxLrReductions;
     hp.minLearningRate = config.neuralMinLearningRate;
+    hp.lrWarmupEpochs = static_cast<size_t>(std::max(0, config.neuralLrWarmupEpochs));
+    hp.useCosineAnnealing = config.neuralUseCosineAnnealing;
+    hp.useCyclicalLr = config.neuralUseCyclicalLr;
+    hp.lrCycleEpochs = static_cast<size_t>(std::max(2, config.neuralLrCycleEpochs));
+    hp.lrScheduleMinFactor = config.neuralLrScheduleMinFactor;
     hp.useValidationLossEma = config.neuralUseValidationLossEma;
     hp.validationLossEmaBeta = config.neuralValidationLossEmaBeta;
     hp.dropoutRate = dynamicDropout;
@@ -2318,6 +2426,16 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     hp.verbose = verbose;
     hp.seed = config.neuralSeed;
     hp.gradientClipNorm = config.gradientClipNorm;
+    hp.adaptiveGradientClipping = config.neuralUseAdaptiveGradientClipping;
+    hp.adaptiveClipBeta = config.neuralAdaptiveClipBeta;
+    hp.adaptiveClipMultiplier = config.neuralAdaptiveClipMultiplier;
+    hp.adaptiveClipMin = config.neuralAdaptiveClipMin;
+    hp.gradientNoiseStd = config.neuralGradientNoiseStd;
+    hp.gradientNoiseDecay = config.neuralGradientNoiseDecay;
+    hp.useEmaWeights = config.neuralUseEmaWeights;
+    hp.emaDecay = config.neuralEmaDecay;
+    hp.labelSmoothing = config.neuralLabelSmoothing;
+    hp.gradientAccumulationSteps = static_cast<size_t>(std::max(1, config.neuralGradientAccumulationSteps));
 
     std::vector<double> inputL2Scales(inputNodes, 1.0);
     for (size_t i = 0; i < inputL2Scales.size() && i < encoded.sourceNumericFeaturePos.size(); ++i) {
@@ -2776,8 +2894,8 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             const ColumnStats& statsA = (aIt != statsCache.end()) ? aIt->second : statsAFallback;
             const ColumnStats& statsB = (bIt != statsCache.end()) ? bIt->second : statsBFallback;
             p.r = MathUtils::calculatePearson(va, vb, statsA, statsB).value_or(0.0);
-            p.spearman = MathUtils::calculateSpearman(va, vb).value_or(0.0);
-            p.kendallTau = MathUtils::calculateKendallTau(va, vb).value_or(0.0);
+            p.spearman = 0.0;
+            p.kendallTau = 0.0;
             p.r2 = p.r * p.r;
             // Keep regression parameter derivation centralized in MathUtils.
             auto fit = MathUtils::simpleLinearRegression(va, vb, statsA, statsB, p.r);
@@ -2788,6 +2906,11 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             p.pValue = sig.p_value;
             p.tStat = sig.t_stat;
             p.statSignificant = sig.is_significant;
+
+            if (p.statSignificant || std::abs(p.r) >= 0.20) {
+                p.spearman = MathUtils::calculateSpearman(va, vb).value_or(0.0);
+                p.kendallTau = MathUtils::calculateKendallTau(va, vb).value_or(0.0);
+            }
 
             double impA = 0.0;
             double impB = 0.0;
@@ -3135,13 +3258,12 @@ std::pair<double, double> bootstrapCI(const std::vector<double>& values,
                                       bool showProgress = false,
                                       const std::string& label = "bootstrap") {
     if (values.empty()) return {0.0, 0.0};
-    std::mt19937 rng(seed);
-    std::uniform_int_distribution<size_t> pick(0, values.size() - 1);
+    FastRng rng(static_cast<uint64_t>(seed) ^ 0x9e3779b97f4a7c15ULL);
     std::vector<double> stats;
     stats.reserve(rounds);
     for (size_t b = 0; b < rounds; ++b) {
         double sum = 0.0;
-        for (size_t i = 0; i < values.size(); ++i) sum += values[pick(rng)];
+        for (size_t i = 0; i < values.size(); ++i) sum += values[rng.uniformIndex(values.size())];
         stats.push_back(sum / static_cast<double>(values.size()));
         if (showProgress && (((b + 1) % std::max<size_t>(1, rounds / 25)) == 0 || (b + 1) == rounds)) {
             printProgressBar(label, b + 1, rounds);
@@ -3749,15 +3871,14 @@ void addOverallSections(ReportEngine& report,
                     std::vector<double> slopeBoot;
                     corrBoot.reserve(220);
                     slopeBoot.reserve(220);
-                    std::mt19937 rng(config.neuralSeed ^ 0x1234567U);
-                    std::uniform_int_distribution<size_t> pick(0, n - 1);
+                    FastRng rng(static_cast<uint64_t>(config.neuralSeed) ^ 0x1234567ULL);
                     for (size_t b = 0; b < 220; ++b) {
                         std::vector<double> xs;
                         std::vector<double> ys;
                         xs.reserve(n);
                         ys.reserve(n);
                         for (size_t i = 0; i < n; ++i) {
-                            const size_t idx = pick(rng);
+                            const size_t idx = rng.uniformIndex(n);
                             xs.push_back(x[idx]);
                             ys.push_back(y[idx]);
                         }

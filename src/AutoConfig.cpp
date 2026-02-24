@@ -385,8 +385,12 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"generate_html", &AutoConfig::generateHtml},
         {"verbose_analysis", &AutoConfig::verboseAnalysis},
         {"neural_use_batch_norm", &AutoConfig::neuralUseBatchNorm},
+        {"neural_use_cosine_annealing", &AutoConfig::neuralUseCosineAnnealing},
+        {"neural_use_cyclical_lr", &AutoConfig::neuralUseCyclicalLr},
         {"neural_use_layer_norm", &AutoConfig::neuralUseLayerNorm},
         {"neural_use_validation_loss_ema", &AutoConfig::neuralUseValidationLossEma},
+        {"neural_use_adaptive_gradient_clipping", &AutoConfig::neuralUseAdaptiveGradientClipping},
+        {"neural_use_ema_weights", &AutoConfig::neuralUseEmaWeights},
         {"fast_mode", &AutoConfig::fastMode},
         {"neural_streaming_mode", &AutoConfig::neuralStreamingMode},
         {"neural_multi_output", &AutoConfig::neuralMultiOutput},
@@ -405,6 +409,9 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_lr_plateau_patience", {&AutoConfig::neuralLrPlateauPatience, 1}},
         {"neural_lr_cooldown_epochs", {&AutoConfig::neuralLrCooldownEpochs, 0}},
         {"neural_max_lr_reductions", {&AutoConfig::neuralMaxLrReductions, 0}},
+        {"neural_lr_warmup_epochs", {&AutoConfig::neuralLrWarmupEpochs, 0}},
+        {"neural_lr_cycle_epochs", {&AutoConfig::neuralLrCycleEpochs, 2}},
+        {"neural_gradient_accumulation_steps", {&AutoConfig::neuralGradientAccumulationSteps, 1}},
         {"neural_min_layers", {&AutoConfig::neuralMinLayers, 1}},
         {"neural_max_layers", {&AutoConfig::neuralMaxLayers, 1}},
         {"neural_fixed_layers", {&AutoConfig::neuralFixedLayers, 0}},
@@ -435,9 +442,17 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_batch_norm_epsilon", {&AutoConfig::neuralBatchNormEpsilon, 1e-12}},
         {"neural_layer_norm_epsilon", {&AutoConfig::neuralLayerNormEpsilon, 1e-12}},
         {"neural_lr_decay", {&AutoConfig::neuralLrDecay, 0.0}},
+        {"neural_lr_schedule_min_factor", {&AutoConfig::neuralLrScheduleMinFactor, 0.0}},
         {"neural_min_learning_rate", {&AutoConfig::neuralMinLearningRate, 0.0}},
         {"neural_validation_loss_ema_beta", {&AutoConfig::neuralValidationLossEmaBeta, 0.0}},
-        {"neural_categorical_input_l2_boost", {&AutoConfig::neuralCategoricalInputL2Boost, 0.0}}
+        {"neural_categorical_input_l2_boost", {&AutoConfig::neuralCategoricalInputL2Boost, 0.0}},
+        {"neural_adaptive_clip_beta", {&AutoConfig::neuralAdaptiveClipBeta, 0.0}},
+        {"neural_adaptive_clip_multiplier", {&AutoConfig::neuralAdaptiveClipMultiplier, 0.0}},
+        {"neural_adaptive_clip_min", {&AutoConfig::neuralAdaptiveClipMin, 0.0}},
+        {"neural_gradient_noise_std", {&AutoConfig::neuralGradientNoiseStd, 0.0}},
+        {"neural_gradient_noise_decay", {&AutoConfig::neuralGradientNoiseDecay, 0.0}},
+        {"neural_ema_decay", {&AutoConfig::neuralEmaDecay, 0.0}},
+        {"neural_label_smoothing", {&AutoConfig::neuralLabelSmoothing, 0.0}}
     };
     static const std::unordered_map<std::string, PlotIntRule> plotIntFields = {
         {"plot_width", {&PlotConfig::width, 320}},
@@ -643,6 +658,16 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.neuralLayerNormEpsilon = parseDoubleStrict(argv[++i], "--neural-layer-norm-epsilon", 1e-12);
         } else if (arg == "--neural-lr-decay" && i + 1 < argc) {
             config.neuralLrDecay = parseDoubleStrict(argv[++i], "--neural-lr-decay", 0.0);
+        } else if (arg == "--neural-lr-warmup-epochs" && i + 1 < argc) {
+            config.neuralLrWarmupEpochs = parseIntStrict(argv[++i], "--neural-lr-warmup-epochs", 0);
+        } else if (arg == "--neural-use-cosine-annealing" && i + 1 < argc) {
+            config.neuralUseCosineAnnealing = parseBoolStrict(argv[++i], "--neural-use-cosine-annealing");
+        } else if (arg == "--neural-use-cyclical-lr" && i + 1 < argc) {
+            config.neuralUseCyclicalLr = parseBoolStrict(argv[++i], "--neural-use-cyclical-lr");
+        } else if (arg == "--neural-lr-cycle-epochs" && i + 1 < argc) {
+            config.neuralLrCycleEpochs = parseIntStrict(argv[++i], "--neural-lr-cycle-epochs", 2);
+        } else if (arg == "--neural-lr-schedule-min-factor" && i + 1 < argc) {
+            config.neuralLrScheduleMinFactor = parseDoubleStrict(argv[++i], "--neural-lr-schedule-min-factor", 0.0);
         } else if (arg == "--neural-lr-plateau-patience" && i + 1 < argc) {
             config.neuralLrPlateauPatience = parseIntStrict(argv[++i], "--neural-lr-plateau-patience", 1);
         } else if (arg == "--neural-lr-cooldown-epochs" && i + 1 < argc) {
@@ -657,6 +682,26 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.neuralValidationLossEmaBeta = parseDoubleStrict(argv[++i], "--neural-validation-loss-ema-beta", 0.0);
         } else if (arg == "--neural-categorical-input-l2-boost" && i + 1 < argc) {
             config.neuralCategoricalInputL2Boost = parseDoubleStrict(argv[++i], "--neural-categorical-input-l2-boost", 0.0);
+        } else if (arg == "--neural-use-adaptive-gradient-clipping" && i + 1 < argc) {
+            config.neuralUseAdaptiveGradientClipping = parseBoolStrict(argv[++i], "--neural-use-adaptive-gradient-clipping");
+        } else if (arg == "--neural-adaptive-clip-beta" && i + 1 < argc) {
+            config.neuralAdaptiveClipBeta = parseDoubleStrict(argv[++i], "--neural-adaptive-clip-beta", 0.0);
+        } else if (arg == "--neural-adaptive-clip-multiplier" && i + 1 < argc) {
+            config.neuralAdaptiveClipMultiplier = parseDoubleStrict(argv[++i], "--neural-adaptive-clip-multiplier", 0.0);
+        } else if (arg == "--neural-adaptive-clip-min" && i + 1 < argc) {
+            config.neuralAdaptiveClipMin = parseDoubleStrict(argv[++i], "--neural-adaptive-clip-min", 0.0);
+        } else if (arg == "--neural-gradient-noise-std" && i + 1 < argc) {
+            config.neuralGradientNoiseStd = parseDoubleStrict(argv[++i], "--neural-gradient-noise-std", 0.0);
+        } else if (arg == "--neural-gradient-noise-decay" && i + 1 < argc) {
+            config.neuralGradientNoiseDecay = parseDoubleStrict(argv[++i], "--neural-gradient-noise-decay", 0.0);
+        } else if (arg == "--neural-use-ema-weights" && i + 1 < argc) {
+            config.neuralUseEmaWeights = parseBoolStrict(argv[++i], "--neural-use-ema-weights");
+        } else if (arg == "--neural-ema-decay" && i + 1 < argc) {
+            config.neuralEmaDecay = parseDoubleStrict(argv[++i], "--neural-ema-decay", 0.0);
+        } else if (arg == "--neural-label-smoothing" && i + 1 < argc) {
+            config.neuralLabelSmoothing = parseDoubleStrict(argv[++i], "--neural-label-smoothing", 0.0);
+        } else if (arg == "--neural-gradient-accumulation-steps" && i + 1 < argc) {
+            config.neuralGradientAccumulationSteps = parseIntStrict(argv[++i], "--neural-gradient-accumulation-steps", 1);
         } else if (arg == "--neural-learning-rate" && i + 1 < argc) {
             config.neuralLearningRate = parseDoubleStrict(argv[++i], "--neural-learning-rate", 1e-8);
         } else if (arg == "--neural-min-layers" && i + 1 < argc) {
@@ -987,8 +1032,35 @@ void AutoConfig::validate() const {
     if (neuralLrDecay <= 0.0 || neuralLrDecay >= 1.0) {
         throw Seldon::ConfigurationException("neural_lr_decay must be within (0,1)");
     }
+    if (neuralLrWarmupEpochs < 0) {
+        throw Seldon::ConfigurationException("neural_lr_warmup_epochs must be >= 0");
+    }
+    if (neuralLrCycleEpochs < 2) {
+        throw Seldon::ConfigurationException("neural_lr_cycle_epochs must be >= 2");
+    }
+    if (neuralLrScheduleMinFactor < 0.0 || neuralLrScheduleMinFactor > 1.0) {
+        throw Seldon::ConfigurationException("neural_lr_schedule_min_factor must be within [0,1]");
+    }
     if (neuralValidationLossEmaBeta < 0.0 || neuralValidationLossEmaBeta >= 1.0) {
         throw Seldon::ConfigurationException("neural_validation_loss_ema_beta must be within [0,1)");
+    }
+    if (neuralAdaptiveClipBeta < 0.0 || neuralAdaptiveClipBeta >= 1.0) {
+        throw Seldon::ConfigurationException("neural_adaptive_clip_beta must be within [0,1)");
+    }
+    if (neuralAdaptiveClipMultiplier <= 0.0) {
+        throw Seldon::ConfigurationException("neural_adaptive_clip_multiplier must be > 0");
+    }
+    if (neuralGradientNoiseDecay < 0.0 || neuralGradientNoiseDecay > 1.0) {
+        throw Seldon::ConfigurationException("neural_gradient_noise_decay must be within [0,1]");
+    }
+    if (neuralEmaDecay < 0.0 || neuralEmaDecay >= 1.0) {
+        throw Seldon::ConfigurationException("neural_ema_decay must be within [0,1)");
+    }
+    if (neuralLabelSmoothing < 0.0 || neuralLabelSmoothing > 0.25) {
+        throw Seldon::ConfigurationException("neural_label_smoothing must be within [0,0.25]");
+    }
+    if (neuralGradientAccumulationSteps < 1) {
+        throw Seldon::ConfigurationException("neural_gradient_accumulation_steps must be >= 1");
     }
     if (neuralLearningRate <= 0.0) {
         throw Seldon::ConfigurationException("neural_learning_rate must be > 0");

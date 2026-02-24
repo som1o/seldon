@@ -67,7 +67,7 @@ double midpointIntegrateBetaAdaptive(double a, double b, double x) {
 }
 
 std::pair<double, bool> betaContinuedFraction(double a, double b, double x) {
-    constexpr int maxIter = 400;
+    const int maxIter = std::clamp<int>(400 + static_cast<int>(std::ceil((a + b) * 0.75)), 400, 2000);
     constexpr double eps = 3e-14;
     constexpr double fpmin = 1e-300;
 
@@ -210,30 +210,25 @@ double MathUtils::getPValueFromT(double t, size_t df) {
 }
 
 double MathUtils::getCriticalT(double alpha, size_t df) {
-    if (df == 0) return 0.0;
-    
-    // For alpha = 0.05, two-tailed z = 1.96
-    double p = 1.0 - alpha / 2.0;
-    
-    // Simple z-approximation for large df
-    double z = 0.0;
-    if (p < 0.5) {
-        // Not expected for common alpha like 0.05
-        z = -std::sqrt(-2.0 * std::log(p));
-    } else {
-        z = std::sqrt(-2.0 * std::log(1.0 - p));
+    if (df == 0 || !std::isfinite(alpha) || alpha <= 0.0 || alpha >= 1.0) return 0.0;
+
+    const double target = alpha;
+    double lo = 0.0;
+    double hi = 2.0;
+    while (getPValueFromT(hi, df) > target && hi < 1e6) {
+        hi *= 2.0;
     }
-    
-    // Refine z (Abramowitz and Stegun)
-    const double c0 = 2.515517, c1 = 0.802853, c2 = 0.010328;
-    const double d1 = 1.432788, d2 = 0.189269, d3 = 0.001308;
-    double t = std::sqrt(-2.0 * std::log(1.0 - p));
-    z = t - ((c2 * t + c1) * t + c0) / (((d3 * t + d2) * t + d1) * t + 1.0);
 
-    if (df > 100) return z;
-
-    // Student's t adjustment for smaller df
-    return z * (1.0 + (z * z + 1.0) / (4.0 * df) + (5.0 * z * z * z * z + 16.0 * z * z + 3.0) / (96.0 * df * df));
+    for (int it = 0; it < 70; ++it) {
+        const double mid = 0.5 * (lo + hi);
+        const double p = getPValueFromT(mid, df);
+        if (p > target) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return 0.5 * (lo + hi);
 }
 
 void MathUtils::setSignificanceAlpha(double alpha) {
@@ -340,11 +335,16 @@ std::optional<double> MathUtils::calculateKendallTau(const std::vector<double>& 
 
 std::pair<double, double> MathUtils::simpleLinearRegression(const std::vector<double>& /*x*/, const std::vector<double>& /*y*/,
                                                             const ColumnStats& statsX, const ColumnStats& statsY, double pearsonR) {
-    if (statsX.stddev == 0) return {0.0, 0.0};
+    if (!std::isfinite(statsX.stddev) || !std::isfinite(statsY.stddev) || !std::isfinite(statsX.mean) || !std::isfinite(statsY.mean)) {
+        return {0.0, 0.0};
+    }
+    if (!std::isfinite(pearsonR)) return {0.0, 0.0};
+    if (std::abs(statsX.stddev) <= runtimeConfig().numericEpsilon) return {0.0, statsY.mean};
     // m = r * (Sy / Sx)
     double m = pearsonR * (statsY.stddev / statsX.stddev);
     // c = My - m*Mx
     double c = statsY.mean - (m * statsX.mean);
+    if (!std::isfinite(m) || !std::isfinite(c)) return {0.0, statsY.mean};
     return {m, c};
 }
 

@@ -24,6 +24,11 @@ public:
         int lrCooldownEpochs = 2;
         int maxLrReductions = 8;
         double minLearningRate = 1e-6;
+        size_t lrWarmupEpochs = 5;
+        bool useCosineAnnealing = true;
+        bool useCyclicalLr = false;
+        size_t lrCycleEpochs = 24;
+        double lrScheduleMinFactor = 0.15;
         size_t epochs = 100;
         size_t batchSize = 32;
         Activation activation = Activation::GELU;
@@ -47,6 +52,16 @@ public:
         int earlyStoppingPatience = 10;
         double minDelta = 1e-4;       // Minimum improvement for early stopping
         double gradientClipNorm = 5.0;
+        bool adaptiveGradientClipping = true;
+        double adaptiveClipBeta = 0.90;
+        double adaptiveClipMultiplier = 1.6;
+        double adaptiveClipMin = 1.0;
+        double gradientNoiseStd = 0.01;
+        double gradientNoiseDecay = 0.995;
+        bool useEmaWeights = true;
+        double emaDecay = 0.995;
+        double labelSmoothing = 0.02;
+        size_t gradientAccumulationSteps = 2;
         bool incrementalMode = false;
         size_t importanceMaxRows = 5000;
         bool importanceParallel = true;
@@ -126,6 +141,8 @@ private:
                      const Hyperparameters& hp, size_t& t_step);
     double validate(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
                     const std::vector<size_t>& indices, size_t trainSize, const Hyperparameters& hp);
+    void updateEmaWeights(double decay);
+    void applyEmaWeights();
 
     std::vector<DenseLayer> m_layers;
     std::vector<size_t> topology;
@@ -148,6 +165,11 @@ private:
     bool m_lookaheadInitialized = false;
     std::vector<std::vector<double>> m_lookaheadSlowWeights;
     std::vector<std::vector<double>> m_lookaheadSlowBiases;
+    bool m_emaInitialized = false;
+    std::vector<std::vector<double>> m_emaWeights;
+    std::vector<std::vector<double>> m_emaBiases;
+    double m_runningGradNormEma = 0.0;
+    bool m_runningGradNormReady = false;
 
     // Persistent RNG for performance and consistency
     std::mt19937 rng;

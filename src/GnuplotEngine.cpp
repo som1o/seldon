@@ -329,6 +329,30 @@ std::vector<std::pair<double, double>> downsampleEvenly(const std::vector<std::p
                                                         size_t maxPoints) {
     if (values.size() <= maxPoints || maxPoints < 50) return values;
 
+    if (values.size() > 1000000) {
+        std::vector<std::pair<double, double>> sample;
+        sample.reserve(maxPoints);
+        uint64_t state = 0x9e3779b97f4a7c15ULL;
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i < maxPoints) {
+                sample.push_back(values[i]);
+            } else {
+                state ^= (state << 7);
+                state ^= (state >> 9);
+                state += 0x9e3779b97f4a7c15ULL + static_cast<uint64_t>(i);
+                const size_t j = static_cast<size_t>(state % static_cast<uint64_t>(i + 1));
+                if (j < maxPoints) {
+                    sample[j] = values[i];
+                }
+            }
+        }
+        std::sort(sample.begin(), sample.end(), [](const auto& a, const auto& b) {
+            if (a.first == b.first) return a.second < b.second;
+            return a.first < b.first;
+        });
+        return sample;
+    }
+
     std::vector<std::pair<double, double>> sorted = values;
     std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
         if (a.first == b.first) return a.second < b.second;
@@ -654,13 +678,15 @@ std::string GnuplotEngine::runScript(const std::string& id, const std::string& d
     const std::string errFile = assetsDir_ + "/" + safeId + ".err.log";
     const std::string cacheHashFile = assetsDir_ + "/.plot_cache/" + safeId + ".hash";
 
-    const std::string cacheKey = toHex(fnv1a64(
-        dataContent + "\n@@\n" + scriptContent +
+    const std::string combined = dataContent + "\n@@\n" + scriptContent +
         "\nfmt=" + cfg_.format +
         "\ntheme=" + cfg_.theme +
         "\ngrid=" + std::string(cfg_.showGrid ? "1" : "0") +
         "\nlineWidth=" + std::to_string(cfg_.lineWidth) +
-        "\npointSize=" + std::to_string(cfg_.pointSize)));
+        "\npointSize=" + std::to_string(cfg_.pointSize);
+    const uint64_t h1 = fnv1a64(combined);
+    const uint64_t h2 = fnv1a64(std::string(combined.rbegin(), combined.rend()));
+    const std::string cacheKey = toHex(h1) + ":" + toHex(h2) + ":" + std::to_string(combined.size());
 
     {
         std::ifstream in(cacheHashFile);

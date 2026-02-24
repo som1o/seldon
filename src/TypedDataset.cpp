@@ -620,6 +620,8 @@ void TypedDataset::load() {
     std::vector<size_t> datetimeHits(header.size(), 0);
     std::vector<size_t> nonMissing(header.size(), 0);
     rowCount_ = 0;
+    std::vector<uint8_t> acceptedRowMask;
+    acceptedRowMask.reserve(8192);
 
     std::vector<size_t> dateLikeHeaderIndices;
     dateLikeHeaderIndices.reserve(header.size());
@@ -683,6 +685,9 @@ void TypedDataset::load() {
         };
 
         while (row.size() > header.size()) {
+            if (row.size() < 2) {
+                break;
+            }
             size_t bestIndex = std::numeric_limits<size_t>::max();
             int bestScore = -1;
 
@@ -717,7 +722,10 @@ void TypedDataset::load() {
             }
 
             if (bestIndex == std::numeric_limits<size_t>::max()) {
-                bestIndex = header.empty() ? 0 : std::min(header.size() - 1, row.size() - 2);
+                if (header.empty() || row.size() < 2) {
+                    break;
+                }
+                bestIndex = std::min(header.size() - 1, row.size() - 2);
             }
 
             row[bestIndex] += delimiter_;
@@ -798,7 +806,9 @@ void TypedDataset::load() {
         if (row.empty() || malformed || isSkippableControlRow(row)) continue;
         reconcileRowWidth(row);
         repairDateShiftedRow(row);
-        if (isLikelyMetadataRow(row, runningSums, rowCount_)) continue;
+        const bool accepted = !isLikelyMetadataRow(row, runningSums, rowCount_);
+        acceptedRowMask.push_back(static_cast<uint8_t>(accepted ? 1 : 0));
+        if (!accepted) continue;
         ++rowCount_;
 
         const size_t cols = std::min(row.size(), header.size());
@@ -887,13 +897,21 @@ void TypedDataset::load() {
     if (malformed || headerSecondPass.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
 
     size_t r = 0;
+    size_t decisionIdx = 0;
     std::fill(runningSums.begin(), runningSums.end(), 0.0);
     while (in.peek() != EOF) {
         auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
         if (row.empty() || malformed || isSkippableControlRow(row)) continue;
         reconcileRowWidth(row);
         repairDateShiftedRow(row);
-        if (isLikelyMetadataRow(row, runningSums, r)) continue;
+        bool accepted = true;
+        if (decisionIdx < acceptedRowMask.size()) {
+            accepted = (acceptedRowMask[decisionIdx] != 0);
+        } else {
+            accepted = !isLikelyMetadataRow(row, runningSums, r);
+        }
+        ++decisionIdx;
+        if (!accepted) continue;
         if (r >= rowCount_) break;
 
         size_t cols = std::min(row.size(), header.size());
@@ -973,13 +991,21 @@ void TypedDataset::load() {
     if (malformed || headerThirdPass.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
 
     size_t rowIdx = 0;
+    size_t fallbackDecisionIdx = 0;
     std::fill(runningSums.begin(), runningSums.end(), 0.0);
     while (in.peek() != EOF) {
         auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
         if (row.empty() || malformed || isSkippableControlRow(row)) continue;
         reconcileRowWidth(row);
         repairDateShiftedRow(row);
-        if (isLikelyMetadataRow(row, runningSums, rowIdx)) continue;
+        bool accepted = true;
+        if (fallbackDecisionIdx < acceptedRowMask.size()) {
+            accepted = (acceptedRowMask[fallbackDecisionIdx] != 0);
+        } else {
+            accepted = !isLikelyMetadataRow(row, runningSums, rowIdx);
+        }
+        ++fallbackDecisionIdx;
+        if (!accepted) continue;
         if (rowIdx >= rowCount_) break;
 
         const size_t cols = std::min(row.size(), header.size());

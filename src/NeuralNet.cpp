@@ -125,6 +125,47 @@ void NeuralNet::setInputL2Scales(const std::vector<double>& scales) {
     m_inputL2Scales = scales;
 }
 
+void NeuralNet::updateEmaWeights(double decay) {
+    const double d = std::clamp(decay, 0.0, 0.999999);
+    if (!m_emaInitialized) {
+        m_emaWeights.clear();
+        m_emaBiases.clear();
+        m_emaWeights.reserve(m_layers.size());
+        m_emaBiases.reserve(m_layers.size());
+        for (const auto& layer : m_layers) {
+            m_emaWeights.push_back(layer.weights());
+            m_emaBiases.push_back(layer.biases());
+        }
+        m_emaInitialized = true;
+        return;
+    }
+
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        auto& ew = m_emaWeights[l];
+        auto& eb = m_emaBiases[l];
+        const auto& w = m_layers[l].weights();
+        const auto& b = m_layers[l].biases();
+        for (size_t i = 0; i < ew.size() && i < w.size(); ++i) {
+            ew[i] = d * ew[i] + (1.0 - d) * w[i];
+        }
+        for (size_t i = 0; i < eb.size() && i < b.size(); ++i) {
+            eb[i] = d * eb[i] + (1.0 - d) * b[i];
+        }
+    }
+}
+
+void NeuralNet::applyEmaWeights() {
+    if (!m_emaInitialized) return;
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        if (l < m_emaWeights.size() && m_emaWeights[l].size() == m_layers[l].weights().size()) {
+            m_layers[l].weights() = m_emaWeights[l];
+        }
+        if (l < m_emaBiases.size() && m_emaBiases[l].size() == m_layers[l].biases().size()) {
+            m_layers[l].biases() = m_emaBiases[l];
+        }
+    }
+}
+
 void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTraining, double dropoutRate) {
     if (m_layers.empty()) throw Seldon::NeuralNetException("Network has no layers");
 
@@ -247,13 +288,75 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
                            size_t batchEnd,
                            const Hyperparameters& hp,
                            size_t& t_step) {
-    ++t_step;
     double batchLoss = 0.0;
+    const size_t outDim = m_layers.back().size();
+    const size_t accumSteps = std::max<size_t>(1, hp.gradientAccumulationSteps);
+
+    Optimizer fastOptimizer = hp.optimizer;
+    if (hp.optimizer == Optimizer::LOOKAHEAD) {
+        fastOptimizer = hp.lookaheadFastOptimizer;
+        if (fastOptimizer == Optimizer::LOOKAHEAD) fastOptimizer = Optimizer::ADAM;
+    }
+
+    std::vector<std::vector<double>> gradBAccum(m_layers.size());
+    std::vector<std::vector<double>> gradWAccum(m_layers.size());
+    std::vector<std::vector<double>> gradBWork(m_layers.size());
+    std::vector<std::vector<double>> gradWWork(m_layers.size());
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        gradBAccum[l].assign(m_layers[l].size(), 0.0);
+        gradWAccum[l].assign(m_layers[l].weights().size(), 0.0);
+        gradBWork[l].assign(m_layers[l].size(), 0.0);
+        gradWWork[l].assign(m_layers[l].weights().size(), 0.0);
+    }
+
+    std::vector<double> targetWork(outDim, 0.0);
+    size_t microCount = 0;
 
     for (size_t b = batchStart; b < batchEnd; ++b) {
         const size_t idx = indices[b];
         feedForward(X[idx], true, hp.dropoutRate);
-        backpropagate(Y[idx], hp, t_step);
+
+        const double smoothing = std::clamp(hp.labelSmoothing, 0.0, 0.25);
+        if (hp.loss == LossFunction::CROSS_ENTROPY && smoothing > 0.0) {
+            const size_t yDim = std::min(outDim, Y[idx].size());
+            const double smoothTarget = 0.5 * smoothing;
+            for (size_t j = 0; j < yDim; ++j) {
+                const double y = std::clamp(Y[idx][j], 0.0, 1.0);
+                targetWork[j] = y * (1.0 - smoothing) + smoothTarget;
+            }
+            for (size_t j = yDim; j < outDim; ++j) targetWork[j] = smoothTarget;
+            computeGradients(targetWork, hp.loss);
+        } else {
+            computeGradients(Y[idx], hp.loss);
+        }
+
+        if (hp.gradientNoiseStd > 0.0) {
+            const double decay = std::clamp(hp.gradientNoiseDecay, 0.0, 1.0);
+            const double noiseStd = hp.gradientNoiseStd * std::pow(decay, static_cast<double>(t_step));
+            if (noiseStd > 0.0) {
+                std::normal_distribution<double> noiseDist(0.0, noiseStd);
+                for (size_t l = 1; l < m_layers.size(); ++l) {
+                    auto& g = m_layers[l].gradients();
+                    for (double& v : g) v += noiseDist(rng);
+                }
+            }
+        }
+
+        for (size_t l = 1; l < m_layers.size(); ++l) {
+            const auto& prevOut = m_layers[l - 1].outputs();
+            const auto& g = m_layers[l].gradients();
+            auto& gb = gradBAccum[l];
+            auto& gw = gradWAccum[l];
+            for (size_t n = 0; n < g.size(); ++n) {
+                gb[n] += g[n];
+                const size_t offset = n * prevOut.size();
+                for (size_t pn = 0; pn < prevOut.size(); ++pn) {
+                    gw[offset + pn] += g[n] * prevOut[pn];
+                }
+            }
+        }
+
+        ++microCount;
 
         const auto& out = m_layers.back().outputs();
         if (hp.loss == LossFunction::CROSS_ENTROPY) {
@@ -265,6 +368,100 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
         } else {
             batchLoss += meanSquaredError(out, Y[idx], std::min(out.size(), Y[idx].size()));
         }
+
+        const bool shouldStep = (microCount >= accumSteps) || (b + 1 == batchEnd);
+        if (!shouldStep) continue;
+
+        const double invMicro = 1.0 / static_cast<double>(std::max<size_t>(1, microCount));
+        double sqNorm = 0.0;
+        for (size_t l = 1; l < m_layers.size(); ++l) {
+            for (double v : gradBAccum[l]) {
+                const double g = v * invMicro;
+                sqNorm += g * g;
+            }
+            for (double v : gradWAccum[l]) {
+                const double g = v * invMicro;
+                sqNorm += g * g;
+            }
+        }
+
+        const double gradNorm = std::sqrt(std::max(0.0, sqNorm));
+        double clipThreshold = hp.gradientClipNorm;
+        if (hp.adaptiveGradientClipping) {
+            const double beta = std::clamp(hp.adaptiveClipBeta, 0.0, 0.9999);
+            if (!m_runningGradNormReady) {
+                m_runningGradNormEma = gradNorm;
+                m_runningGradNormReady = true;
+            } else {
+                m_runningGradNormEma = beta * m_runningGradNormEma + (1.0 - beta) * gradNorm;
+            }
+            const double adaptive = std::max(hp.adaptiveClipMin, m_runningGradNormEma * hp.adaptiveClipMultiplier);
+            clipThreshold = (clipThreshold > 0.0) ? std::max(clipThreshold, adaptive) : adaptive;
+        }
+
+        double clipScale = 1.0;
+        if (clipThreshold > 0.0 && gradNorm > clipThreshold && gradNorm > kNumericEps) {
+            clipScale = clipThreshold / gradNorm;
+        }
+
+        ++t_step;
+        for (size_t l = 1; l < m_layers.size(); ++l) {
+            auto& gb = gradBWork[l];
+            auto& gw = gradWWork[l];
+            for (size_t i = 0; i < gb.size(); ++i) gb[i] = gradBAccum[l][i] * invMicro * clipScale;
+            for (size_t i = 0; i < gw.size(); ++i) gw[i] = gradWAccum[l][i] * invMicro * clipScale;
+
+            const std::vector<double>* l2Scales = nullptr;
+            if (l == 1 && !m_inputL2Scales.empty()) l2Scales = &m_inputL2Scales;
+            m_layers[l].updateParametersAccumulated(hp.learningRate,
+                                                    hp.l2Lambda,
+                                                    fastOptimizer,
+                                                    t_step,
+                                                    gb,
+                                                    gw,
+                                                    l2Scales);
+
+            std::fill(gradBAccum[l].begin(), gradBAccum[l].end(), 0.0);
+            std::fill(gradWAccum[l].begin(), gradWAccum[l].end(), 0.0);
+        }
+
+        if (hp.optimizer == Optimizer::LOOKAHEAD) {
+            if (!m_lookaheadInitialized) {
+                m_lookaheadSlowWeights.clear();
+                m_lookaheadSlowBiases.clear();
+                m_lookaheadSlowWeights.reserve(m_layers.size());
+                m_lookaheadSlowBiases.reserve(m_layers.size());
+                for (const auto& layer : m_layers) {
+                    m_lookaheadSlowWeights.push_back(layer.weights());
+                    m_lookaheadSlowBiases.push_back(layer.biases());
+                }
+                m_lookaheadInitialized = true;
+            }
+
+            const size_t k = std::max<size_t>(1, hp.lookaheadSyncPeriod);
+            const double alpha = std::clamp(hp.lookaheadAlpha, 0.0, 1.0);
+            if (t_step % k == 0) {
+                for (size_t l = 1; l < m_layers.size(); ++l) {
+                    auto& w = m_layers[l].weights();
+                    auto& b = m_layers[l].biases();
+                    auto& sw = m_lookaheadSlowWeights[l];
+                    auto& sb = m_lookaheadSlowBiases[l];
+
+                    for (size_t i = 0; i < w.size() && i < sw.size(); ++i) {
+                        sw[i] += alpha * (w[i] - sw[i]);
+                        w[i] = sw[i];
+                    }
+                    for (size_t i = 0; i < b.size() && i < sb.size(); ++i) {
+                        sb[i] += alpha * (b[i] - sb[i]);
+                        b[i] = sb[i];
+                    }
+                }
+            }
+        }
+        if (hp.useEmaWeights) {
+            updateEmaWeights(hp.emaDecay);
+        }
+        microCount = 0;
     }
 
     return batchLoss;
@@ -375,6 +572,14 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
         weightMeanAbsHistory.clear();
     }
 
+    if (!hp.incrementalMode) {
+        m_emaInitialized = false;
+        m_emaWeights.clear();
+        m_emaBiases.clear();
+        m_runningGradNormEma = 0.0;
+        m_runningGradNormReady = false;
+    }
+
     m_lookaheadInitialized = false;
     m_lookaheadSlowWeights.clear();
     m_lookaheadSlowBiases.clear();
@@ -425,7 +630,31 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
         std::shuffle(indices.begin(), indices.end(), rng);
 
         Hyperparameters h = hp;
-        h.learningRate = lr;
+        const size_t warmupEpochs = std::min(hp.lrWarmupEpochs, hp.epochs);
+        double scheduledLr = lr;
+        if (warmupEpochs > 0 && epoch < warmupEpochs) {
+            const double warm = static_cast<double>(epoch + 1) / static_cast<double>(warmupEpochs);
+            scheduledLr *= std::clamp(warm, 0.0, 1.0);
+        }
+
+        const double lrFloorFactor = std::clamp(hp.lrScheduleMinFactor, 0.0, 1.0);
+        const double lrFloor = std::max(hp.minLearningRate, lr * lrFloorFactor);
+        if (epoch >= warmupEpochs) {
+            if (hp.useCosineAnnealing) {
+                const size_t span = std::max<size_t>(1, hp.epochs - warmupEpochs);
+                const double t = static_cast<double>(epoch - warmupEpochs) / static_cast<double>(span);
+                const double cosine = 0.5 * (1.0 + std::cos(3.14159265358979323846 * std::clamp(t, 0.0, 1.0)));
+                scheduledLr = lrFloor + (lr - lrFloor) * cosine;
+            } else if (hp.useCyclicalLr) {
+                const size_t cycle = std::max<size_t>(2, hp.lrCycleEpochs);
+                const size_t cyclePos = (epoch - warmupEpochs) % cycle;
+                const double phase = static_cast<double>(cyclePos) / static_cast<double>(cycle - 1);
+                const double tri = 1.0 - std::abs(2.0 * phase - 1.0);
+                scheduledLr = lrFloor + (lr - lrFloor) * tri;
+            }
+        }
+
+        h.learningRate = std::max(hp.minLearningRate, scheduledLr);
         const double trainLoss = runEpoch(X, Y, indices, trainSize, h, t_step);
         const double rawVal = (valSize > 0) ? validate(X, Y, indices, trainSize, hp) : 0.0;
 
@@ -496,6 +725,10 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
             m_layers[l].weights() = bestW[l];
             m_layers[l].biases() = bestB[l];
         }
+    }
+
+    if (hp.useEmaWeights && m_emaInitialized) {
+        applyEmaWeights();
     }
 
     std::cout << "\r[Agent] Training Neural Lattice: [100%] Complete.          " << std::endl;

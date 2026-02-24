@@ -220,9 +220,24 @@ struct AutoConfig {
     int neuralLrCooldownEpochs = 2;
     int neuralMaxLrReductions = 8;
     double neuralMinLearningRate = 1e-6;
+    int neuralLrWarmupEpochs = 5;
+    bool neuralUseCosineAnnealing = true;
+    bool neuralUseCyclicalLr = false;
+    int neuralLrCycleEpochs = 24;
+    double neuralLrScheduleMinFactor = 0.15;
     bool neuralUseValidationLossEma = true;
     double neuralValidationLossEmaBeta = 0.6;
     double neuralCategoricalInputL2Boost = 3.0;
+    bool neuralUseAdaptiveGradientClipping = true;
+    double neuralAdaptiveClipBeta = 0.90;
+    double neuralAdaptiveClipMultiplier = 1.6;
+    double neuralAdaptiveClipMin = 1.0;
+    double neuralGradientNoiseStd = 0.01;
+    double neuralGradientNoiseDecay = 0.995;
+    bool neuralUseEmaWeights = true;
+    double neuralEmaDecay = 0.995;
+    double neuralLabelSmoothing = 0.02;
+    int neuralGradientAccumulationSteps = 2;
 
     // Advanced neural controls
     double neuralLearningRate = 0.001;

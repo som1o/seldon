@@ -120,6 +120,12 @@ void DenseLayer::forward(const DenseLayer& prev,
         #pragma omp simd reduction(+:sum)
         #endif
         for (size_t pn = 0; pn < m_prevSize; ++pn) {
+            #if defined(__GNUC__) || defined(__clang__)
+            if (pn + 16 < m_prevSize) {
+                __builtin_prefetch(&prev.outputs()[pn + 16], 0, 1);
+                __builtin_prefetch(&m_weights[weightOffset + pn + 16], 0, 1);
+            }
+            #endif
             sum += prev.outputs()[pn] * m_weights[weightOffset + pn];
         }
 
@@ -275,6 +281,61 @@ void DenseLayer::updateParameters(const DenseLayer& prev,
                 m_vWeights[weightOffset + pn] = beta2 * m_vWeights[weightOffset + pn] + (1.0 - beta2) * gradW * gradW;
                 const double mHat = m_mWeights[weightOffset + pn] / beta1_t;
                 const double vHat = m_vWeights[weightOffset + pn] / beta2_t;
+                m_weights[weightOffset + pn] -= learningRate * (mHat / (std::sqrt(vHat) + epsilon));
+            } else {
+                m_weights[weightOffset + pn] -= learningRate * gradW;
+            }
+        }
+    }
+}
+
+void DenseLayer::updateParametersAccumulated(double learningRate,
+                                             double l2Lambda,
+                                             NeuralOptimizer optimizer,
+                                             size_t tStep,
+                                             const std::vector<double>& gradBiasAccum,
+                                             const std::vector<double>& gradWeightAccum,
+                                             const std::vector<double>* inputL2Scales) {
+    if (m_prevSize == 0) return;
+    if (gradBiasAccum.size() != m_size || gradWeightAccum.size() != m_weights.size()) return;
+
+    const double beta1 = 0.9;
+    const double beta2 = 0.999;
+    const double epsilon = 1e-8;
+    const double beta1_t = 1.0 - std::pow(beta1, static_cast<double>(tStep));
+    const double beta2_t = 1.0 - std::pow(beta2, static_cast<double>(tStep));
+
+    #ifdef USE_OPENMP
+    #pragma omp parallel for
+    #endif
+    for (size_t n = 0; n < m_size; ++n) {
+        const double gradBias = gradBiasAccum[n];
+        if (optimizer == NeuralOptimizer::ADAM) {
+            m_mBiases[n] = beta1 * m_mBiases[n] + (1.0 - beta1) * gradBias;
+            m_vBiases[n] = beta2 * m_vBiases[n] + (1.0 - beta2) * gradBias * gradBias;
+            const double mHat = m_mBiases[n] / std::max(1e-12, beta1_t);
+            const double vHat = m_vBiases[n] / std::max(1e-12, beta2_t);
+            m_biases[n] -= learningRate * (mHat / (std::sqrt(vHat) + epsilon));
+        } else {
+            m_biases[n] -= learningRate * gradBias;
+        }
+
+        const size_t weightOffset = n * m_prevSize;
+        #ifdef USE_OPENMP
+        #pragma omp simd
+        #endif
+        for (size_t pn = 0; pn < m_prevSize; ++pn) {
+            double gradW = gradWeightAccum[weightOffset + pn];
+            const double l2Scale = (inputL2Scales != nullptr && pn < inputL2Scales->size())
+                ? std::max(0.0, (*inputL2Scales)[pn])
+                : 1.0;
+            gradW += (l2Lambda * l2Scale) * m_weights[weightOffset + pn];
+
+            if (optimizer == NeuralOptimizer::ADAM) {
+                m_mWeights[weightOffset + pn] = beta1 * m_mWeights[weightOffset + pn] + (1.0 - beta1) * gradW;
+                m_vWeights[weightOffset + pn] = beta2 * m_vWeights[weightOffset + pn] + (1.0 - beta2) * gradW * gradW;
+                const double mHat = m_mWeights[weightOffset + pn] / std::max(1e-12, beta1_t);
+                const double vHat = m_vWeights[weightOffset + pn] / std::max(1e-12, beta2_t);
                 m_weights[weightOffset + pn] -= learningRate * (mHat / (std::sqrt(vHat) + epsilon));
             } else {
                 m_weights[weightOffset + pn] -= learningRate * gradW;

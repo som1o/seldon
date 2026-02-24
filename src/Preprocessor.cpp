@@ -10,6 +10,9 @@
 #include <tuple>
 #include <utility>
 #include <unordered_map>
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
 
 namespace {
 using NumVec = std::vector<double>;
@@ -509,7 +512,7 @@ std::vector<bool> detectOutliersLOFObserved(const NumVec& values, const MissingM
     if (observed.size() < 12) return flags;
 
     const size_t n = observed.size();
-    constexpr size_t kLofMaxRows = 200000;
+    constexpr size_t kLofMaxRows = 120000;
     if (n > kLofMaxRows) {
         return detectOutliersModifiedZObserved(values, missing, 3.5);
     }
@@ -533,6 +536,9 @@ std::vector<bool> detectOutliersLOFObserved(const NumVec& values, const MissingM
 
     std::vector<std::vector<size_t>> nbr(n);
     std::vector<double> kdist(n, 0.0);
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (size_t i = 0; i < n; ++i) {
         const size_t rank = rankByIndex[i];
         size_t left = rank;
@@ -570,6 +576,9 @@ std::vector<bool> detectOutliersLOFObserved(const NumVec& values, const MissingM
     }
 
     std::vector<double> lrd(n, 0.0);
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (size_t i = 0; i < n; ++i) {
         double reach = 0.0;
         for (size_t nb : nbr[i]) {
@@ -579,6 +588,9 @@ std::vector<bool> detectOutliersLOFObserved(const NumVec& values, const MissingM
     }
 
     std::vector<double> lof(n, 1.0);
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (size_t i = 0; i < n; ++i) {
         if (lrd[i] <= 1e-12) {
             lof[i] = 1.0;
