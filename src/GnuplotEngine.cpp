@@ -35,6 +35,85 @@ std::string normalizePlotLabel(const std::string& label, size_t maxLen = 28) {
     return out;
 }
 
+std::string normalizePlotTitle(const std::string& title,
+                               size_t wrapAt = 54,
+                               size_t maxTotal = 140) {
+    std::string cleaned;
+    cleaned.reserve(title.size() + 16);
+
+    auto appendSpaceIfNeeded = [&]() {
+        if (!cleaned.empty() && cleaned.back() != ' ' && cleaned.back() != '\n') cleaned.push_back(' ');
+    };
+
+    for (size_t i = 0; i < title.size(); ++i) {
+        const char ch = title[i];
+        if (ch == '_' || ch == '-') {
+            appendSpaceIfNeeded();
+            continue;
+        }
+        if (ch == '\n' || ch == '\t' || ch == '\r') {
+            appendSpaceIfNeeded();
+            continue;
+        }
+
+        const bool isUpper = std::isupper(static_cast<unsigned char>(ch));
+        const bool isDigit = std::isdigit(static_cast<unsigned char>(ch));
+        const bool prevLower = !cleaned.empty() && std::islower(static_cast<unsigned char>(cleaned.back()));
+        const bool prevDigit = !cleaned.empty() && std::isdigit(static_cast<unsigned char>(cleaned.back()));
+        if (!cleaned.empty() && ((isUpper && prevLower) || (isDigit && !prevDigit) || (!isDigit && prevDigit))) {
+            appendSpaceIfNeeded();
+        }
+
+        if (ch >= 32 && ch <= 126) {
+            cleaned.push_back(ch);
+        }
+    }
+
+    std::string collapsed;
+    collapsed.reserve(cleaned.size());
+    bool inSpace = false;
+    for (char ch : cleaned) {
+        if (ch == ' ') {
+            if (!inSpace) collapsed.push_back(ch);
+            inSpace = true;
+        } else {
+            collapsed.push_back(ch);
+            inSpace = false;
+        }
+    }
+    if (!collapsed.empty() && collapsed.front() == ' ') collapsed.erase(collapsed.begin());
+    while (!collapsed.empty() && collapsed.back() == ' ') collapsed.pop_back();
+
+    if (collapsed.size() > maxTotal) {
+        collapsed = collapsed.substr(0, maxTotal - 3) + "...";
+    }
+
+    if (collapsed.size() <= wrapAt) return collapsed;
+
+    std::string wrapped;
+    wrapped.reserve(collapsed.size() + 8);
+    size_t lineStart = 0;
+    while (lineStart < collapsed.size()) {
+        size_t remaining = collapsed.size() - lineStart;
+        if (remaining <= wrapAt) {
+            wrapped.append(collapsed.substr(lineStart));
+            break;
+        }
+
+        size_t split = lineStart + wrapAt;
+        size_t bestSpace = collapsed.rfind(' ', split);
+        if (bestSpace == std::string::npos || bestSpace <= lineStart + (wrapAt / 2)) {
+            bestSpace = split;
+        }
+
+        wrapped.append(collapsed.substr(lineStart, bestSpace - lineStart));
+        wrapped.append("\\n");
+        lineStart = (bestSpace < collapsed.size() && collapsed[bestSpace] == ' ') ? (bestSpace + 1) : bestSpace;
+    }
+
+    return wrapped;
+}
+
 std::string quoteForDatafileString(const std::string& value) {
     std::string escaped;
     escaped.reserve(value.size() + 2);
@@ -475,7 +554,9 @@ std::string GnuplotEngine::styledHeader(const std::string& id, const std::string
     script << "set terminal " << terminalForFormat(cfg_.format, cfg_.width, cfg_.height) << " enhanced\n";
     script << "set output " << quoteForGnuplot(assetsDir_ + "/" + safeId + "." + cfg_.format) << "\n";
     script << "set object 999 rect from graph 0,0 to graph 1,1 behind fc rgb " << quoteForGnuplot(bgColor) << " fs solid 1.0 noborder\n";
-    script << "set title " << quoteForGnuplot(title) << " tc rgb " << quoteForGnuplot(titleColor) << "\n";
+        script << "set title " << quoteForGnuplot(normalizePlotTitle(title))
+            << " tc rgb " << quoteForGnuplot(titleColor)
+            << " font ',12'\n";
     script << "set tmargin 2.5\nset bmargin 3.5\nset lmargin 7\nset rmargin 3\n";
     script << "set border linewidth " << cfg_.lineWidth << " lc rgb " << quoteForGnuplot(borderColor) << "\n";
     script << "set tics textcolor rgb " << quoteForGnuplot(ticColor) << "\n";
