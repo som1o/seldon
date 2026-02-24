@@ -51,7 +51,7 @@ public:
     };
 
     static void setSignificanceAlpha(double alpha);
-    static double getSignificanceAlpha();
+    static double getSignificanceAlpha() noexcept;
     static void setNumericTuning(double numericEpsilon,
                                  size_t betaIntervalsStart,
                                  size_t betaIntervalsMax,
@@ -122,11 +122,11 @@ public:
             return data[r][c];
         }
 
-        void setInversionTolerance(double tolerance) {
+        void setInversionTolerance(double tolerance) noexcept {
             inversionTolerance = tolerance;
         }
 
-        double getInversionTolerance() const {
+        double getInversionTolerance() const noexcept {
             return inversionTolerance;
         }
 

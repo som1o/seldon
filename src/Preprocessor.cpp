@@ -270,15 +270,29 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
 
     std::vector<TypedColumn> engineered;
     engineered.reserve(maxBase * (1 + static_cast<size_t>(std::max(1, config.featureEngineeringDegree))));
+    const size_t maxGenerated = std::max<size_t>(16, config.featureEngineeringMaxGeneratedColumns);
+    bool capReached = false;
+
+    auto canAddMore = [&]() {
+        return engineered.size() < maxGenerated;
+    };
 
     const int maxDegree = std::clamp(config.featureEngineeringDegree, 1, 4);
 
     for (size_t idx : base) {
+        if (!canAddMore()) {
+            capReached = true;
+            break;
+        }
         const auto& col = data.columns()[idx];
         const auto& vals = std::get<NumVec>(col.values);
 
         if (config.featureEngineeringEnablePoly) {
             for (int p = 2; p <= maxDegree; ++p) {
+                if (!canAddMore()) {
+                    capReached = true;
+                    break;
+                }
                 std::vector<double> poly(vals.size(), 0.0);
                 for (size_t i = 0; i < vals.size(); ++i) {
                     poly[i] = std::pow(vals[i], static_cast<double>(p));
@@ -293,6 +307,10 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
         }
 
         if (config.featureEngineeringEnableLog) {
+            if (!canAddMore()) {
+                capReached = true;
+                break;
+            }
             std::vector<double> logSigned(vals.size(), 0.0);
             for (size_t i = 0; i < vals.size(); ++i) {
                 const double v = vals[i];
@@ -308,9 +326,17 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
         }
     }
 
-    if (config.featureEngineeringEnablePoly) {
+    if (config.featureEngineeringEnablePoly && !capReached) {
         for (size_t i = 0; i < base.size(); ++i) {
+            if (!canAddMore()) {
+                capReached = true;
+                break;
+            }
             for (size_t j = i + 1; j < base.size(); ++j) {
+                if (!canAddMore()) {
+                    capReached = true;
+                    break;
+                }
                 const auto& a = data.columns()[base[i]];
                 const auto& b = data.columns()[base[j]];
                 const auto& av = std::get<NumVec>(a.values);
@@ -333,6 +359,7 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
                 c.missing = std::move(miss);
                 engineered.push_back(std::move(c));
             }
+            if (capReached) break;
         }
     }
 
@@ -613,7 +640,9 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
         }
 
         detectedFlags[col.name] = flags;
-        report.outlierFlags[col.name] = flags;
+        if (config.storeOutlierFlagsInReport) {
+            report.outlierFlags[col.name] = flags;
+        }
         report.outlierCounts[col.name] = std::count(flags.begin(), flags.end(), true);
     }
 

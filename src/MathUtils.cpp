@@ -242,7 +242,7 @@ void MathUtils::setSignificanceAlpha(double alpha) {
     }
 }
 
-double MathUtils::getSignificanceAlpha() {
+double MathUtils::getSignificanceAlpha() noexcept {
     return runtimeConfig().significanceAlpha;
 }
 

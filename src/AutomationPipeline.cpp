@@ -1143,20 +1143,27 @@ EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
     out.X.assign(data.rowCount(), std::vector<double>{});
 
     const std::unordered_set<std::string> excluded(config.excludedColumns.begin(), config.excludedColumns.end());
+    const size_t maxOneHotPerColumn = std::max<size_t>(1, config.neuralMaxOneHotPerColumn);
 
+    struct CategoryPlan {
+        size_t columnIdx = 0;
+        std::vector<std::pair<std::string, size_t>> categories;
+        size_t keepCount = 0;
+        bool includeOther = false;
+    };
+
+    std::vector<CategoryPlan> categoryPlans;
+    const auto categoricalIdx = data.categoricalColumnIndices();
+    categoryPlans.reserve(categoricalIdx.size());
+
+    size_t reservedWidth = 0;
     for (size_t featurePos = 0; featurePos < numericFeatureIdx.size(); ++featurePos) {
         int idx = numericFeatureIdx[featurePos];
         if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
         if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
-        const auto& values = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
-        for (size_t r = 0; r < out.X.size() && r < values.size(); ++r) {
-            out.X[r].push_back(values[r]);
-        }
-        out.sourceNumericFeaturePos.push_back(static_cast<int>(featurePos));
+        reservedWidth++;
     }
 
-    constexpr size_t kMaxOneHotPerColumn = 24;
-    const auto categoricalIdx = data.categoricalColumnIndices();
     for (size_t idx : categoricalIdx) {
         if (static_cast<int>(idx) == targetIdx) continue;
         const std::string& columnName = data.columns()[idx].name;
@@ -1171,19 +1178,43 @@ EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
         }
         if (freq.empty()) continue;
 
-        std::vector<std::pair<std::string, size_t>> categories(freq.begin(), freq.end());
-        std::sort(categories.begin(), categories.end(), [](const auto& a, const auto& b) {
+        CategoryPlan plan;
+        plan.columnIdx = idx;
+        plan.categories.assign(freq.begin(), freq.end());
+        std::sort(plan.categories.begin(), plan.categories.end(), [](const auto& a, const auto& b) {
             if (a.second == b.second) return a.first < b.first;
             return a.second > b.second;
         });
+        plan.keepCount = std::min(maxOneHotPerColumn, plan.categories.size());
+        if (plan.keepCount == 0) continue;
+        plan.includeOther = plan.categories.size() > plan.keepCount;
+        reservedWidth += plan.keepCount + (plan.includeOther ? 1 : 0);
+        categoryPlans.push_back(std::move(plan));
+    }
 
-        const size_t keepCount = std::min(kMaxOneHotPerColumn, categories.size());
-        if (keepCount == 0) continue;
+    for (auto& row : out.X) {
+        row.reserve(reservedWidth);
+    }
 
+    for (size_t featurePos = 0; featurePos < numericFeatureIdx.size(); ++featurePos) {
+        int idx = numericFeatureIdx[featurePos];
+        if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
+        if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
+        const auto& values = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
+        for (size_t r = 0; r < out.X.size() && r < values.size(); ++r) {
+            out.X[r].push_back(values[r]);
+        }
+        out.sourceNumericFeaturePos.push_back(static_cast<int>(featurePos));
+    }
+
+    for (const auto& plan : categoryPlans) {
+        const size_t idx = plan.columnIdx;
+        const auto& values = std::get<std::vector<std::string>>(data.columns()[idx].values);
+        const size_t keepCount = plan.keepCount;
         std::unordered_set<std::string> kept;
         kept.reserve(keepCount);
         for (size_t i = 0; i < keepCount; ++i) {
-            const std::string& label = categories[i].first;
+            const std::string& label = plan.categories[i].first;
             kept.insert(label);
             for (size_t r = 0; r < out.X.size() && r < values.size(); ++r) {
                 out.X[r].push_back(values[r] == label ? 1.0 : 0.0);
@@ -1192,7 +1223,7 @@ EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
             out.categoricalEncodedNodes++;
         }
 
-        if (categories.size() > keepCount) {
+        if (plan.includeOther) {
             for (size_t r = 0; r < out.X.size() && r < values.size(); ++r) {
                 out.X[r].push_back(kept.find(values[r]) == kept.end() ? 1.0 : 0.0);
             }
@@ -2174,6 +2205,29 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     }
     topology.push_back(outputNodes);
 
+    auto estimateTrainableParams = [](const std::vector<size_t>& topo) {
+        size_t params = 0;
+        if (topo.size() < 2) return params;
+        for (size_t i = 1; i < topo.size(); ++i) {
+            params += topo[i - 1] * topo[i];
+            params += topo[i];
+        }
+        return params;
+    };
+
+    const size_t topologyNodes = std::accumulate(topology.begin(), topology.end(), static_cast<size_t>(0));
+    const size_t trainableParams = estimateTrainableParams(topology);
+    if (topologyNodes > config.neuralMaxTopologyNodes) {
+        throw Seldon::ConfigurationException(
+            "Neural topology exceeds neural_max_topology_nodes (" +
+            std::to_string(topologyNodes) + " > " + std::to_string(config.neuralMaxTopologyNodes) + ")");
+    }
+    if (trainableParams > config.neuralMaxTrainableParams) {
+        throw Seldon::ConfigurationException(
+            "Neural parameter count exceeds neural_max_trainable_params (" +
+            std::to_string(trainableParams) + " > " + std::to_string(config.neuralMaxTrainableParams) + ")");
+    }
+
     NeuralNet nn(topology);
     NeuralNet::Hyperparameters hp;
 
@@ -2281,7 +2335,14 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
 
         for (size_t c = 0; c < candidates.size(); ++c) {
             const auto& cand = candidates[c];
-            NeuralNet candidateNet(buildTopology(cand.layers, cand.hidden));
+            const std::vector<size_t> candTopology = buildTopology(cand.layers, cand.hidden);
+            const size_t candNodes = std::accumulate(candTopology.begin(), candTopology.end(), static_cast<size_t>(0));
+            const size_t candParams = estimateTrainableParams(candTopology);
+            if (candNodes > config.neuralMaxTopologyNodes || candParams > config.neuralMaxTrainableParams) {
+                continue;
+            }
+
+            NeuralNet candidateNet(candTopology);
             candidateNet.setInputL2Scales(inputL2Scales);
 
             NeuralNet::Hyperparameters chp = hp;
@@ -2356,32 +2417,39 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
 
     std::vector<double> rawImportance;
     const std::string explainability = CommonUtils::toLower(config.neuralExplainability);
+    const size_t explainabilitySteps = (explainability == "hybrid") ? 2 : 1;
+    size_t explainabilityStep = 0;
+    printProgressBar("feature-extraction", explainabilityStep, explainabilitySteps);
+
+    auto advanceExplainability = [&]() {
+        explainabilityStep = std::min(explainabilityStep + 1, explainabilitySteps);
+        printProgressBar("feature-extraction", explainabilityStep, explainabilitySteps);
+    };
+
     if (explainability == "integrated_gradients") {
         rawImportance = nn.calculateIntegratedGradients(Xnn,
                                                         config.neuralIntegratedGradSteps,
                                                         config.neuralImportanceMaxRows);
-    } else if (explainability == "shap") {
-        rawImportance = nn.calculateShapApprox(Xnn,
-                                               std::max<size_t>(8, config.neuralIntegratedGradSteps),
-                                               std::min<size_t>(config.neuralImportanceMaxRows, static_cast<size_t>(1200)));
+        advanceExplainability();
     } else if (explainability == "hybrid") {
         const std::vector<double> perm = nn.calculateFeatureImportance(Xnn,
                                                                         Ynn,
                                                                         importanceTrials,
                                                                         config.neuralImportanceMaxRows,
                                                                         config.neuralImportanceParallel);
+        advanceExplainability();
         const std::vector<double> ig = nn.calculateIntegratedGradients(Xnn,
                                                                         config.neuralIntegratedGradSteps,
                                                                         config.neuralImportanceMaxRows);
-        const std::vector<double> shap = nn.calculateShapApprox(Xnn,
-                                                                 std::max<size_t>(8, config.neuralIntegratedGradSteps),
-                                                                 std::min<size_t>(config.neuralImportanceMaxRows, static_cast<size_t>(1200)));
-        rawImportance.assign(std::max({perm.size(), ig.size(), shap.size()}), 0.0);
+        advanceExplainability();
+        const double wp = std::max(0.0, config.tuning.hybridExplainabilityWeightPermutation);
+        const double wi = std::max(0.0, config.tuning.hybridExplainabilityWeightIntegratedGradients);
+        const double wsum = std::max(config.tuning.numericEpsilon, wp + wi);
+        rawImportance.assign(std::max(perm.size(), ig.size()), 0.0);
         for (size_t i = 0; i < rawImportance.size(); ++i) {
             const double p = (i < perm.size()) ? perm[i] : 0.0;
             const double g = (i < ig.size()) ? ig[i] : 0.0;
-            const double s = (i < shap.size()) ? shap[i] : 0.0;
-            rawImportance[i] = 0.50 * p + 0.30 * g + 0.20 * s;
+            rawImportance[i] = (wp * p + wi * g) / wsum;
         }
     } else {
         rawImportance = nn.calculateFeatureImportance(Xnn,
@@ -2389,6 +2457,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
                                                       importanceTrials,
                                                       config.neuralImportanceMaxRows,
                                                       config.neuralImportanceParallel);
+        advanceExplainability();
     }
 
     if (!Xnn.empty()) {
@@ -2722,7 +2791,7 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         const int threadCount = std::max(1, omp_get_max_threads());
         std::vector<std::vector<PairInsight>> threadPairs(static_cast<size_t>(threadCount));
 
-        #pragma omp parallel
+        #pragma omp parallel default(none) shared(threadPairs, evalNumericIdx, appendPairsForRange)
         {
             const int tid = omp_get_thread_num();
             std::vector<PairInsight>& localPairs = threadPairs[static_cast<size_t>(tid)];
@@ -3774,7 +3843,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         runCfg.assetsDir = (fs::path(runCfg.outputDir) / "seldon_report_assets").string();
         runCfg.reportFile = (fs::path(runCfg.outputDir) / "neural_synthesis.md").string();
     }
-    CliProgressSpinner progress(true);
+    CliProgressSpinner progress(!runCfg.verboseAnalysis && ::isatty(STDOUT_FILENO));
     constexpr size_t totalSteps = 10;
     size_t currentStep = 0;
 
@@ -3806,6 +3875,23 @@ int AutomationPipeline::run(const AutoConfig& config) {
     } else {
         data.setDateLocaleHint(TypedDataset::DateLocaleHint::AUTO);
     }
+
+    if (!runCfg.columnTypeOverrides.empty()) {
+        std::unordered_map<std::string, ColumnType> typeOverrides;
+        typeOverrides.reserve(runCfg.columnTypeOverrides.size());
+        for (const auto& kv : runCfg.columnTypeOverrides) {
+            const std::string normalized = CommonUtils::toLower(CommonUtils::trim(kv.second));
+            ColumnType type = ColumnType::CATEGORICAL;
+            if (normalized == "numeric") {
+                type = ColumnType::NUMERIC;
+            } else if (normalized == "datetime") {
+                type = ColumnType::DATETIME;
+            }
+            typeOverrides[CommonUtils::toLower(CommonUtils::trim(kv.first))] = type;
+        }
+        data.setColumnTypeOverrides(std::move(typeOverrides));
+    }
+
     data.load();
     advance("Loaded dataset");
     if (data.rowCount() == 0 || data.colCount() == 0) {

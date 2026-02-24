@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
-#include <string>
 #include <unordered_map>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -34,6 +34,8 @@ public:
 
     void setNumericSeparatorPolicy(NumericSeparatorPolicy policy) noexcept { numericSeparatorPolicy_ = policy; }
     void setDateLocaleHint(DateLocaleHint hint) noexcept { dateLocaleHint_ = hint; }
+    void setColumnTypeOverride(std::string columnNameLower, ColumnType type) { columnTypeOverrides_[std::move(columnNameLower)] = type; }
+    void setColumnTypeOverrides(std::unordered_map<std::string, ColumnType> overrides) { columnTypeOverrides_ = std::move(overrides); }
 
     /**
      * @brief Loads CSV content and infers per-column types.
@@ -71,6 +73,7 @@ private:
     char delimiter_;
     NumericSeparatorPolicy numericSeparatorPolicy_ = NumericSeparatorPolicy::AUTO;
     DateLocaleHint dateLocaleHint_ = DateLocaleHint::AUTO;
+    std::unordered_map<std::string, ColumnType> columnTypeOverrides_;
     size_t rowCount_ = 0;
     std::vector<TypedColumn> columns_;
 

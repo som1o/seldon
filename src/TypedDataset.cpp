@@ -605,6 +605,16 @@ void TypedDataset::load() {
     if (malformed || header.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
     header = CSVUtils::normalizeHeader(header);
 
+    std::vector<uint8_t> forcedTypeMask(header.size(), static_cast<uint8_t>(0));
+    std::vector<ColumnType> forcedType(header.size(), ColumnType::CATEGORICAL);
+    for (size_t c = 0; c < header.size(); ++c) {
+        const std::string key = CommonUtils::toLower(CommonUtils::trim(header[c]));
+        const auto it = columnTypeOverrides_.find(key);
+        if (it == columnTypeOverrides_.end()) continue;
+        forcedTypeMask[c] = static_cast<uint8_t>(1);
+        forcedType[c] = it->second;
+    }
+
     std::vector<size_t> numericHits(header.size(), 0);
     std::vector<size_t> numericLikeHits(header.size(), 0);
     std::vector<size_t> datetimeHits(header.size(), 0);
@@ -826,6 +836,19 @@ void TypedDataset::load() {
         col.name = header[c];
         col.missing.assign(rowCount_, static_cast<uint8_t>(0));
 
+        if (forcedTypeMask[c]) {
+            col.type = forcedType[c];
+            if (col.type == ColumnType::NUMERIC) {
+                col.values = std::vector<double>(rowCount_, std::numeric_limits<double>::quiet_NaN());
+            } else if (col.type == ColumnType::DATETIME) {
+                col.values = std::vector<int64_t>(rowCount_, 0);
+            } else {
+                col.values = std::vector<std::string>(rowCount_);
+            }
+            columns_.push_back(std::move(col));
+            continue;
+        }
+
         const bool strongNumeric = nonMissing[c] > 0 && numericHits[c] >= std::max<size_t>(3, (nonMissing[c] * 8) / 10);
         const bool coercibleNumeric = nonMissing[c] > 0 &&
                                       numericLikeHits[c] >= std::max<size_t>(3, (nonMissing[c] * 9) / 10) &&
@@ -915,6 +938,7 @@ void TypedDataset::load() {
     constexpr double kDateHeaderFallbackFailureRatio = 0.40;
     std::vector<size_t> datetimeFallbackCols;
     for (size_t c = 0; c < columns_.size(); ++c) {
+        if (forcedTypeMask[c]) continue;
         if (columns_[c].type != ColumnType::DATETIME) continue;
         if (datetimeObserved[c] == 0 || datetimeParseFailures[c] == 0) continue;
 
@@ -977,6 +1001,7 @@ void TypedDataset::load() {
 
     std::vector<size_t> rescuedDatetimeCols;
     for (size_t c = 0; c < columns_.size(); ++c) {
+        if (forcedTypeMask[c]) continue;
         if (!dateLikeHeaderMask[c]) continue;
         if (columns_[c].type != ColumnType::CATEGORICAL) continue;
 

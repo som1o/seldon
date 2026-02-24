@@ -307,7 +307,7 @@ std::vector<BenchmarkResult> BenchmarkEngine::run(const TypedDataset& data, int 
     BenchmarkResult stump;
 
     #ifdef USE_OPENMP
-    #pragma omp parallel sections
+    #pragma omp parallel sections default(none) shared(linear, ridge, stump, X, target, kfold, seed)
     {
         #pragma omp section
         { linear = evalLinear("LinearRegression", X, target, kfold, seed, 1e-6); }

@@ -131,6 +131,10 @@ struct HeuristicTuningConfig {
     double scatterFitMinAbsCorr = 0.35;
     size_t scatterFitMinSampleSize = 12;
 
+    // Hybrid explainability blending (permutation / integrated gradients)
+    double hybridExplainabilityWeightPermutation = 0.50;
+    double hybridExplainabilityWeightIntegratedGradients = 0.50;
+
     // Project-timeline (Gantt) auto-detection tuning
     bool ganttAutoEnabled = true;
     size_t ganttMinTasks = 3;
@@ -175,6 +179,7 @@ struct AutoConfig {
 
     std::vector<std::string> excludedColumns;
     std::unordered_map<std::string, std::string> columnImputation;
+    std::unordered_map<std::string, std::string> columnTypeOverrides;
 
     std::string outlierMethod = "iqr";      // iqr|zscore|modified_zscore|adjusted_boxplot|lof
     std::string outlierAction = "flag";     // flag|remove|cap
@@ -230,18 +235,24 @@ struct AutoConfig {
     size_t neuralStreamingChunkRows = 2048;
     bool neuralMultiOutput = true;
     size_t neuralMaxAuxTargets = 2;
-    std::string neuralExplainability = "hybrid"; // permutation|integrated_gradients|shap|hybrid
-    size_t neuralIntegratedGradSteps = 16;
+    std::string neuralExplainability = "hybrid"; // permutation|integrated_gradients|hybrid
+    size_t neuralIntegratedGradSteps = 8;
     size_t neuralUncertaintySamples = 24;
     bool neuralImportanceParallel = true;
-    size_t neuralImportanceMaxRows = 5000;
+    size_t neuralImportanceMaxRows = 1000;
     size_t neuralImportanceTrials = 0; // 0 => auto
+    size_t neuralMaxOneHotPerColumn = 24;
+    size_t neuralMaxTopologyNodes = 4096;
+    size_t neuralMaxTrainableParams = 20000000;
 
     // Auto feature engineering controls
     bool featureEngineeringEnablePoly = true;
     bool featureEngineeringEnableLog = true;
     int featureEngineeringDegree = 2;
     size_t featureEngineeringMaxBase = 8;
+    size_t featureEngineeringMaxGeneratedColumns = 512;
+
+    bool storeOutlierFlagsInReport = false;
 
     PlotConfig plot;
     HeuristicTuningConfig tuning;

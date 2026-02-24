@@ -97,9 +97,6 @@ public:
     std::vector<double> calculateIntegratedGradients(const std::vector<std::vector<double>>& X,
                                                      size_t steps = 16,
                                                      size_t maxRows = 2000);
-    std::vector<double> calculateShapApprox(const std::vector<std::vector<double>>& X,
-                                            size_t coalitionSamples = 24,
-                                            size_t maxRows = 1000);
 
     /**
      * @brief Saves the current model state (weights, biases, and scale info) to a binary file.

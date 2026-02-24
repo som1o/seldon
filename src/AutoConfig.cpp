@@ -124,6 +124,13 @@ std::string normalizeConfigKey(std::string key) {
         }
         return "impute.";
     }
+    if (lowered.rfind("type.", 0) == 0) {
+        const size_t dotPos = key.find('.');
+        if (dotPos != std::string::npos && dotPos + 1 < key.size()) {
+            return "type." + key.substr(dotPos + 1);
+        }
+        return "type.";
+    }
 
     std::string out = lowered;
     std::replace(out.begin(), out.end(), '-', '_');
@@ -180,6 +187,13 @@ bool isValidImputationStrategy(const std::string& value) {
     return allowed.find(CommonUtils::toLower(CommonUtils::trim(value))) != allowed.end();
 }
 
+bool isValidColumnTypeOverride(const std::string& value) {
+    static const std::unordered_set<std::string> allowed = {
+        "numeric", "categorical", "datetime"
+    };
+    return allowed.find(CommonUtils::toLower(CommonUtils::trim(value))) != allowed.end();
+}
+
 void applyProfile(AutoConfig& config, const std::string& profileRaw) {
     const std::string p = CommonUtils::toLower(CommonUtils::trim(profileRaw));
     if (p.empty() || p == "auto") {
@@ -205,8 +219,8 @@ void applyProfile(AutoConfig& config, const std::string& profileRaw) {
         config.plotBivariateSignificant = true;
         config.plotModesExplicit = true;
         config.neuralStrategy = "expressive";
-        config.neuralImportanceMaxRows = std::max<size_t>(config.neuralImportanceMaxRows, 10000);
-        config.neuralIntegratedGradSteps = std::max<size_t>(config.neuralIntegratedGradSteps, 24);
+        config.neuralImportanceMaxRows = std::max<size_t>(config.neuralImportanceMaxRows, 1000);
+        config.neuralIntegratedGradSteps = std::max<size_t>(config.neuralIntegratedGradSteps, 8);
     } else if (p == "minimal") {
         config.fastMode = true;
         config.plotUnivariate = false;
@@ -378,7 +392,8 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_multi_output", &AutoConfig::neuralMultiOutput},
         {"neural_importance_parallel", &AutoConfig::neuralImportanceParallel},
         {"feature_engineering_enable_poly", &AutoConfig::featureEngineeringEnablePoly},
-        {"feature_engineering_enable_log", &AutoConfig::featureEngineeringEnableLog}
+        {"feature_engineering_enable_log", &AutoConfig::featureEngineeringEnableLog},
+        {"store_outlier_flags_in_report", &AutoConfig::storeOutlierFlagsInReport}
     };
     static const std::unordered_map<std::string, uint32_t AutoConfig::*> uintFields = {
         {"neural_seed", &AutoConfig::neuralSeed},
@@ -406,7 +421,11 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_uncertainty_samples", {&AutoConfig::neuralUncertaintySamples, 4}},
         {"neural_importance_max_rows", {&AutoConfig::neuralImportanceMaxRows, 128}},
         {"neural_importance_trials", {&AutoConfig::neuralImportanceTrials, 0}},
-        {"feature_engineering_max_base", {&AutoConfig::featureEngineeringMaxBase, 2}}
+        {"feature_engineering_max_base", {&AutoConfig::featureEngineeringMaxBase, 2}},
+        {"neural_max_one_hot_per_column", {&AutoConfig::neuralMaxOneHotPerColumn, 1}},
+        {"neural_max_topology_nodes", {&AutoConfig::neuralMaxTopologyNodes, 16}},
+        {"neural_max_trainable_params", {&AutoConfig::neuralMaxTrainableParams, 1024}},
+        {"feature_engineering_max_generated_columns", {&AutoConfig::featureEngineeringMaxGeneratedColumns, 16}}
     };
     static const std::unordered_map<std::string, DoubleRule> doubleFields = {
         {"gradient_clip_norm", {&AutoConfig::gradientClipNorm, 0.0}},
@@ -456,6 +475,8 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"box_plot_min_iqr", {&HeuristicTuningConfig::boxPlotMinIqr, 0.0}},
         {"pie_max_dominance_ratio", {&HeuristicTuningConfig::pieMaxDominanceRatio, 0.0}},
         {"scatter_fit_min_abs_corr", {&HeuristicTuningConfig::scatterFitMinAbsCorr, 0.0}},
+        {"hybrid_explainability_weight_permutation", {&HeuristicTuningConfig::hybridExplainabilityWeightPermutation, 0.0}},
+        {"hybrid_explainability_weight_integrated_gradients", {&HeuristicTuningConfig::hybridExplainabilityWeightIntegratedGradients, 0.0}},
         {"gantt_duration_hours_threshold", {&HeuristicTuningConfig::ganttDurationHoursThreshold, 0.0}}
     };
     static const std::unordered_map<std::string, TuningSizeRule> tuningSizeFields = {
@@ -668,6 +689,14 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.neuralImportanceMaxRows = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-importance-max-rows", 128));
         } else if (arg == "--neural-importance-trials" && i + 1 < argc) {
             config.neuralImportanceTrials = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-importance-trials", 0));
+        } else if (arg == "--neural-max-one-hot-per-column" && i + 1 < argc) {
+            config.neuralMaxOneHotPerColumn = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-max-one-hot-per-column", 1));
+        } else if (arg == "--neural-max-topology-nodes" && i + 1 < argc) {
+            config.neuralMaxTopologyNodes = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-max-topology-nodes", 16));
+        } else if (arg == "--neural-max-trainable-params" && i + 1 < argc) {
+            config.neuralMaxTrainableParams = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-max-trainable-params", 1024));
+        } else if (arg == "--store-outlier-flags-in-report" && i + 1 < argc) {
+            config.storeOutlierFlagsInReport = parseBoolStrict(argv[++i], "--store-outlier-flags-in-report");
         } else if (arg == "--feature-engineering-enable-poly" && i + 1 < argc) {
             config.featureEngineeringEnablePoly = parseBoolStrict(argv[++i], "--feature-engineering-enable-poly");
         } else if (arg == "--feature-engineering-enable-log" && i + 1 < argc) {
@@ -676,6 +705,20 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.featureEngineeringDegree = parseIntStrict(argv[++i], "--feature-engineering-degree", 1);
         } else if (arg == "--feature-engineering-max-base" && i + 1 < argc) {
             config.featureEngineeringMaxBase = static_cast<size_t>(parseIntStrict(argv[++i], "--feature-engineering-max-base", 2));
+        } else if (arg == "--feature-engineering-max-generated-columns" && i + 1 < argc) {
+            config.featureEngineeringMaxGeneratedColumns = static_cast<size_t>(parseIntStrict(argv[++i], "--feature-engineering-max-generated-columns", 16));
+        } else if (arg == "--type" && i + 1 < argc) {
+            const std::string raw = argv[++i];
+            const size_t sep = raw.find(':');
+            if (sep == std::string::npos || sep == 0 || sep + 1 >= raw.size()) {
+                throw Seldon::ConfigurationException("--type expects <column>:<numeric|categorical|datetime>");
+            }
+            const std::string columnName = CommonUtils::trim(raw.substr(0, sep));
+            const std::string typeName = CommonUtils::toLower(CommonUtils::trim(raw.substr(sep + 1)));
+            if (!isValidColumnTypeOverride(typeName)) {
+                throw Seldon::ConfigurationException("Invalid --type override for column '" + columnName + "': " + typeName);
+            }
+            config.columnTypeOverrides[CommonUtils::toLower(columnName)] = typeName;
         } else if (arg == "--max-feature-missing-ratio" && i + 1 < argc) {
             config.maxFeatureMissingRatio = parseDoubleStrict(argv[++i], "--max-feature-missing-ratio", -1.0);
             if (config.maxFeatureMissingRatio > 1.0 || config.maxFeatureMissingRatio < -1.0) {
@@ -791,6 +834,16 @@ AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig&
             }
             config.columnImputation[key.substr(7)] = normalized;
         }
+        if (key.rfind("type.", 0) == 0) {
+            const std::string normalized = CommonUtils::toLower(value);
+            if (!isValidColumnTypeOverride(normalized)) {
+                throw Seldon::ConfigurationException(
+                    "Config parse error at line " + std::to_string(lineNo) +
+                    ": invalid column type override '" + value +
+                    "' (allowed: numeric, categorical, datetime)");
+            }
+            config.columnTypeOverrides[CommonUtils::toLower(key.substr(5))] = normalized;
+        }
     }
     config.validate();
 
@@ -819,6 +872,11 @@ void HeuristicTuningConfig::validate() const {
     }
     if (coherenceWeightMin > coherenceWeightMax) {
         throw Seldon::ConfigurationException("coherence_weight_min must be <= coherence_weight_max");
+    }
+    const double hybridWeightSum = hybridExplainabilityWeightPermutation +
+                                   hybridExplainabilityWeightIntegratedGradients;
+    if (hybridWeightSum <= 0.0) {
+        throw Seldon::ConfigurationException("hybrid explainability weights must sum to > 0");
     }
     if (betaFallbackIntervalsStart > betaFallbackIntervalsMax) {
         throw Seldon::ConfigurationException("beta_fallback_intervals_start must be <= beta_fallback_intervals_max");
@@ -916,8 +974,8 @@ void AutoConfig::validate() const {
     if (!isIn(neuralLookaheadFastOptimizer, {"sgd", "adam"})) {
         throw Seldon::ConfigurationException("neural_lookahead_fast_optimizer must be one of: sgd, adam");
     }
-    if (!isIn(neuralExplainability, {"permutation", "integrated_gradients", "shap", "hybrid"})) {
-        throw Seldon::ConfigurationException("neural_explainability must be one of: permutation, integrated_gradients, shap, hybrid");
+    if (!isIn(neuralExplainability, {"permutation", "integrated_gradients", "hybrid"})) {
+        throw Seldon::ConfigurationException("neural_explainability must be one of: permutation, integrated_gradients, hybrid");
     }
 
     if (neuralLookaheadAlpha < 0.0 || neuralLookaheadAlpha > 1.0) {
@@ -965,6 +1023,18 @@ void AutoConfig::validate() const {
     if (featureEngineeringMaxBase < 2) {
         throw Seldon::ConfigurationException("feature_engineering_max_base must be >= 2");
     }
+    if (featureEngineeringMaxGeneratedColumns < 16) {
+        throw Seldon::ConfigurationException("feature_engineering_max_generated_columns must be >= 16");
+    }
+    if (neuralMaxOneHotPerColumn < 1) {
+        throw Seldon::ConfigurationException("neural_max_one_hot_per_column must be >= 1");
+    }
+    if (neuralMaxTopologyNodes < 16) {
+        throw Seldon::ConfigurationException("neural_max_topology_nodes must be >= 16");
+    }
+    if (neuralMaxTrainableParams < 1024) {
+        throw Seldon::ConfigurationException("neural_max_trainable_params must be >= 1024");
+    }
 
     tuning.validate();
 
@@ -977,6 +1047,14 @@ void AutoConfig::validate() const {
             throw Seldon::ConfigurationException(
                 "Invalid imputation strategy for column '" + kv.first +
                 "': '" + kv.second + "' (allowed: auto, mean, median, zero, mode, interpolate)");
+        }
+    }
+
+    for (const auto& kv : columnTypeOverrides) {
+        if (!isValidColumnTypeOverride(kv.second)) {
+            throw Seldon::ConfigurationException(
+                "Invalid type override for column '" + kv.first +
+                "': '" + kv.second + "' (allowed: numeric, categorical, datetime)");
         }
     }
 }
