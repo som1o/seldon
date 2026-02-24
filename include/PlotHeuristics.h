@@ -7,6 +7,9 @@
 
 namespace PlotHeuristics {
 size_t approximateUniqueCount(const std::vector<double>& values);
+size_t sturgesBinCount(size_t sampleSize);
+bool shouldUseSturgesGrouping(const std::vector<double>& values, double epsilon = 1e-12);
+bool shouldAvoidCategoryHeavyCharts(size_t categoryCount, size_t hardLimit = 18);
 bool shouldAddOgive(const std::vector<double>& values, const HeuristicTuningConfig& tuning);
 bool shouldAddBoxPlot(const std::vector<double>& values, const HeuristicTuningConfig& tuning, double eps);
 bool shouldAddPieChart(const std::vector<double>& counts, const HeuristicTuningConfig& tuning);

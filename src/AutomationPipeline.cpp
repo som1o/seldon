@@ -277,6 +277,47 @@ struct BivariateStackedBarData {
     bool valid = false;
 };
 
+struct CategoryFrequencyProfile {
+    std::vector<std::string> labels;
+    std::vector<double> counts;
+};
+
+CategoryFrequencyProfile buildCategoryFrequencyProfile(const std::vector<std::string>& values,
+                                                      const MissingMask& missing,
+                                                      size_t maxCategories = 12) {
+    CategoryFrequencyProfile out;
+    std::unordered_map<std::string, double> freq;
+    const size_t n = std::min(values.size(), missing.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (missing[i]) continue;
+        if (values[i].empty()) continue;
+        freq[values[i]] += 1.0;
+    }
+    if (freq.size() < 2) return out;
+
+    std::vector<std::pair<std::string, double>> rows(freq.begin(), freq.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        if (a.second == b.second) return a.first < b.first;
+        return a.second > b.second;
+    });
+
+    const size_t keep = rows.size() > maxCategories ? maxCategories - 1 : rows.size();
+    double other = 0.0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        if (i < keep) {
+            out.labels.push_back(rows[i].first);
+            out.counts.push_back(rows[i].second);
+        } else {
+            other += rows[i].second;
+        }
+    }
+    if (other > 0.0) {
+        out.labels.push_back("Other");
+        out.counts.push_back(other);
+    }
+    return out;
+}
+
 BivariateStackedBarData buildBivariateStackedBar(const std::vector<double>& x,
                                                  const std::vector<double>& y) {
     BivariateStackedBarData out;
@@ -3378,8 +3419,19 @@ void addOverallSections(ReportEngine& report,
             auto it = prep.missingCounts.find(col.name);
             missingCounts.push_back(it == prep.missingCounts.end() ? 0.0 : static_cast<double>(it->second));
         }
-        std::string missingImg = overallPlotter->bar("overall_missingness", labels, missingCounts, "Overall Missingness by Column");
-        if (!missingImg.empty()) report.addImage("Overall Missingness", missingImg);
+        const bool tooManyMissingBars = PlotHeuristics::shouldAvoidCategoryHeavyCharts(labels.size(), 18);
+        if (!tooManyMissingBars) {
+            std::string missingImg = overallPlotter->bar("overall_missingness", labels, missingCounts, "Overall Missingness by Column");
+            if (!missingImg.empty()) report.addImage("Overall Missingness", missingImg);
+        }
+
+        if (PlotHeuristics::shouldAddPieChart(missingCounts, config.tuning)) {
+            std::string missingPie = overallPlotter->pie("overall_missingness_pie",
+                                                         labels,
+                                                         missingCounts,
+                                                         "Missingness Share by Column");
+            if (!missingPie.empty()) report.addImage("Missingness Share (Pie)", missingPie);
+        }
 
         std::vector<std::vector<double>> missHeat(1, std::vector<double>(missingCounts.size(), 0.0));
         for (size_t i = 0; i < missingCounts.size(); ++i) missHeat[0][i] = missingCounts[i];
@@ -3619,6 +3671,43 @@ void addOverallSections(ReportEngine& report,
                         report.addParagraph("K-Means auto-selection chose k=" + std::to_string(km.bestK) + " with silhouette=" + toFixed(km.silhouette, 4) + " and gap=" + toFixed(km.gapStatistic, 4) + ".");
                     }
                 }
+            }
+        }
+
+        {
+            size_t categoricalPlotsAdded = 0;
+            for (size_t cidx : data.categoricalColumnIndices()) {
+                const auto& col = data.columns()[cidx];
+                const auto& vals = std::get<std::vector<std::string>>(col.values);
+                const CategoryFrequencyProfile profile = buildCategoryFrequencyProfile(vals, col.missing, 12);
+                if (profile.labels.size() < 2) continue;
+
+                const bool usePie = PlotHeuristics::shouldAddPieChart(profile.counts, config.tuning);
+                const bool avoidBar = PlotHeuristics::shouldAvoidCategoryHeavyCharts(profile.labels.size(), 12);
+
+                if (usePie) {
+                    std::string pie = overallPlotter->pie("overall_cat_pie_" + std::to_string(cidx),
+                                                          profile.labels,
+                                                          profile.counts,
+                                                          "Category Share: " + col.name);
+                    if (!pie.empty()) {
+                        report.addImage("Category Share (Pie): " + col.name, pie);
+                        ++categoricalPlotsAdded;
+                    }
+                }
+
+                if (!usePie && !avoidBar) {
+                    std::string bar = overallPlotter->bar("overall_cat_bar_" + std::to_string(cidx),
+                                                          profile.labels,
+                                                          profile.counts,
+                                                          "Category Frequency: " + col.name);
+                    if (!bar.empty()) {
+                        report.addImage("Category Frequency: " + col.name, bar);
+                        ++categoricalPlotsAdded;
+                    }
+                }
+
+                if (categoricalPlotsAdded >= 8) break;
             }
         }
 

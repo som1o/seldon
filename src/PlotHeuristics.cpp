@@ -18,6 +18,37 @@ size_t approximateUniqueCount(const std::vector<double>& values) {
     return uniq.size();
 }
 
+size_t sturgesBinCount(size_t sampleSize) {
+    if (sampleSize <= 1) return 1;
+    const double n = static_cast<double>(sampleSize);
+    const size_t bins = static_cast<size_t>(std::ceil(std::log2(std::max(2.0, n)) + 1.0));
+    return std::clamp<size_t>(bins, 5, 96);
+}
+
+bool shouldUseSturgesGrouping(const std::vector<double>& values, double epsilon) {
+    std::vector<double> finite;
+    finite.reserve(values.size());
+    for (double v : values) {
+        if (std::isfinite(v)) finite.push_back(v);
+    }
+    if (finite.size() < 8) return false;
+
+    std::sort(finite.begin(), finite.end());
+    const double minV = finite.front();
+    const double maxV = finite.back();
+    const double span = maxV - minV;
+    if (!std::isfinite(span) || span <= epsilon) return false;
+
+    const MathUtils::NumericSummary summary = MathUtils::summarizeNumeric(finite);
+    const double dispersion = std::max({std::abs(summary.stddev), std::abs(summary.iqr), epsilon});
+    const double ratio = span / dispersion;
+    return ratio >= 120.0;
+}
+
+bool shouldAvoidCategoryHeavyCharts(size_t categoryCount, size_t hardLimit) {
+    return categoryCount > std::max<size_t>(6, hardLimit);
+}
+
 bool shouldAddOgive(const std::vector<double>& values, const HeuristicTuningConfig& tuning) {
     if (values.size() < tuning.ogiveMinPoints) return false;
     return approximateUniqueCount(values) >= tuning.ogiveMinUnique;
@@ -54,7 +85,7 @@ bool shouldAddPieChart(const std::vector<double>& counts, const HeuristicTuningC
     const double maxEntropy = std::log(static_cast<double>(nonZero));
     const double normalizedEntropy = maxEntropy > tuning.numericEpsilon ? (entropy / maxEntropy) : 0.0;
 
-    return (top / total) <= tuning.pieMaxDominanceRatio && normalizedEntropy >= 0.55;
+    return (top / total) <= tuning.pieMaxDominanceRatio && normalizedEntropy >= 0.40;
 }
 
 bool shouldAddConfidenceBand(double r,

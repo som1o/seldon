@@ -94,8 +94,8 @@ struct HeuristicTuningConfig {
 
     // Categorical pie-chart suitability tuning
     size_t pieMinCategories = 2;
-    size_t pieMaxCategories = 7;
-    double pieMaxDominanceRatio = 0.82;
+    size_t pieMaxCategories = 10;
+    double pieMaxDominanceRatio = 0.90;
 
     // Categorical-vs-numeric split/facetting tuning
     size_t facetMinRows = 30;

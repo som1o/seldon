@@ -1,4 +1,5 @@
 #include "GnuplotEngine.h"
+#include "PlotHeuristics.h"
 #include "StatsUtils.h"
 
 #include <algorithm>
@@ -88,6 +89,99 @@ std::vector<double> finiteValues(const std::vector<double>& values) {
     out.reserve(values.size());
     for (double v : values) {
         if (std::isfinite(v)) out.push_back(v);
+    }
+    return out;
+}
+
+struct AxisRange {
+    double lo = 0.0;
+    double hi = 1.0;
+    bool valid = false;
+};
+
+AxisRange robustAxisRange(const std::vector<double>& values, double padFraction = 0.06) {
+    AxisRange out;
+    if (values.empty()) return out;
+
+    double minV = std::numeric_limits<double>::infinity();
+    double maxV = -std::numeric_limits<double>::infinity();
+    for (double v : values) {
+        if (!std::isfinite(v)) continue;
+        minV = std::min(minV, v);
+        maxV = std::max(maxV, v);
+    }
+    if (!std::isfinite(minV) || !std::isfinite(maxV)) return out;
+
+    if (std::abs(maxV - minV) <= 1e-12) {
+        const double pad = std::max(1.0, std::abs(minV) * 0.15);
+        out.lo = minV - pad;
+        out.hi = maxV + pad;
+    } else {
+        const double span = maxV - minV;
+        const double pad = std::max(1e-9, span * std::max(0.01, padFraction));
+        out.lo = minV - pad;
+        out.hi = maxV + pad;
+    }
+    out.valid = std::isfinite(out.lo) && std::isfinite(out.hi) && (out.hi > out.lo);
+    return out;
+}
+
+void applyAxisFormatting(std::ostringstream& script, const char axis, const AxisRange& range) {
+    if (!range.valid) return;
+    if (axis == 'x') {
+        script << "set xrange [" << range.lo << ":" << range.hi << "]\n";
+    } else if (axis == 'y') {
+        script << "set yrange [" << range.lo << ":" << range.hi << "]\n";
+    }
+
+    const double maxAbs = std::max(std::abs(range.lo), std::abs(range.hi));
+    const double span = std::max(1e-12, range.hi - range.lo);
+    if (maxAbs >= 1e6 || maxAbs <= 1e-5 || (maxAbs / span) >= 1e4) {
+        script << "set format " << axis << " '%.3e'\n";
+    } else {
+        script << "set format " << axis << " '%.6g'\n";
+    }
+}
+
+struct CategoricalSeries {
+    std::vector<std::string> labels;
+    std::vector<double> values;
+};
+
+CategoricalSeries aggregateTopCategories(const std::vector<std::string>& labels,
+                                         const std::vector<double>& values,
+                                         size_t maxCategories,
+                                         const std::string& otherLabel = "Other") {
+    CategoricalSeries out;
+    const size_t n = std::min(labels.size(), values.size());
+    if (n == 0) return out;
+
+    std::vector<std::pair<std::string, double>> rows;
+    rows.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(values[i]) || values[i] <= 0.0) continue;
+        rows.push_back({labels[i], values[i]});
+    }
+    if (rows.empty()) return out;
+
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        if (a.second == b.second) return a.first < b.first;
+        return a.second > b.second;
+    });
+
+    const size_t keep = (rows.size() > maxCategories) ? (maxCategories - 1) : rows.size();
+    double other = 0.0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        if (i < keep) {
+            out.labels.push_back(rows[i].first);
+            out.values.push_back(rows[i].second);
+        } else {
+            other += rows[i].second;
+        }
+    }
+    if (other > 0.0) {
+        out.labels.push_back(otherLabel);
+        out.values.push_back(other);
     }
     return out;
 }
@@ -382,14 +476,16 @@ std::string GnuplotEngine::styledHeader(const std::string& id, const std::string
     script << "set output " << quoteForGnuplot(assetsDir_ + "/" + safeId + "." + cfg_.format) << "\n";
     script << "set object 999 rect from graph 0,0 to graph 1,1 behind fc rgb " << quoteForGnuplot(bgColor) << " fs solid 1.0 noborder\n";
     script << "set title " << quoteForGnuplot(title) << " tc rgb " << quoteForGnuplot(titleColor) << "\n";
+    script << "set tmargin 2.5\nset bmargin 3.5\nset lmargin 7\nset rmargin 3\n";
     script << "set border linewidth " << cfg_.lineWidth << " lc rgb " << quoteForGnuplot(borderColor) << "\n";
     script << "set tics textcolor rgb " << quoteForGnuplot(ticColor) << "\n";
+    script << "set tics out nomirror\nset mxtics 2\nset mytics 2\n";
     if (cfg_.showGrid) {
-        script << "set grid back lc rgb " << quoteForGnuplot(gridColor) << " lw 1\n";
+        script << "set grid back lc rgb " << quoteForGnuplot(gridColor) << " lw 1 dt 2\n";
     } else {
         script << "unset grid\n";
     }
-    script << "set key top left\n";
+    script << "set key top left opaque box lc rgb " << quoteForGnuplot(borderColor) << "\n";
     script << "set style line 1 lc rgb '#2563eb' lw " << cfg_.lineWidth << " pt 7 ps " << cfg_.pointSize << "\n";
     script << "set style line 2 lc rgb '#dc2626' lw " << cfg_.lineWidth << "\n";
     script << "set style line 3 lc rgb '#059669' lw " << cfg_.lineWidth << "\n";
@@ -503,25 +599,33 @@ std::string GnuplotEngine::histogram(const std::string& id,
     const double range = maxV - minV;
 
     double binWidth = 1.0;
+    bool useSturges = false;
     if (range <= 1e-12) {
         binWidth = 1.0;
     } else if (options.adaptiveBinning) {
-        const double n = static_cast<double>(vals.size());
-        const double iqr = StatsUtils::percentileSorted(vals, 0.75) - StatsUtils::percentileSorted(vals, 0.25);
-        const double sigma = stddevSample(vals);
-        double fdWidth = (iqr > 1e-12) ? (2.0 * iqr * std::pow(n, -1.0 / 3.0)) : 0.0;
-        double scottWidth = (sigma > 1e-12) ? (3.5 * sigma * std::pow(n, -1.0 / 3.0)) : 0.0;
-        if (fdWidth > 1e-12) {
-            binWidth = fdWidth;
-        } else if (scottWidth > 1e-12) {
-            binWidth = scottWidth;
+        useSturges = PlotHeuristics::shouldUseSturgesGrouping(vals, 1e-12);
+        if (useSturges) {
+            const size_t sturgesBins = PlotHeuristics::sturgesBinCount(vals.size());
+            binWidth = range / static_cast<double>(std::max<size_t>(1, sturgesBins));
         } else {
-            binWidth = range / 20.0;
-        }
+            const double n = static_cast<double>(vals.size());
+            const double iqr = StatsUtils::percentileSorted(vals, 0.75) - StatsUtils::percentileSorted(vals, 0.25);
+            const double sigma = stddevSample(vals);
+            double fdWidth = (iqr > 1e-12) ? (2.0 * iqr * std::pow(n, -1.0 / 3.0)) : 0.0;
+            double scottWidth = (sigma > 1e-12) ? (3.5 * sigma * std::pow(n, -1.0 / 3.0)) : 0.0;
+            if (fdWidth > 1e-12) {
+                binWidth = fdWidth;
+            } else if (scottWidth > 1e-12) {
+                binWidth = scottWidth;
+            } else {
+                const size_t sturgesBins = PlotHeuristics::sturgesBinCount(vals.size());
+                binWidth = range / static_cast<double>(std::max<size_t>(1, sturgesBins));
+            }
 
-        const double binsRaw = std::max(1.0, range / std::max(binWidth, 1e-9));
-        const double binsClamped = std::clamp(binsRaw, 5.0, 120.0);
-        binWidth = range / binsClamped;
+            const double binsRaw = std::max(1.0, range / std::max(binWidth, 1e-9));
+            const double binsClamped = std::clamp(binsRaw, 5.0, 96.0);
+            binWidth = range / binsClamped;
+        }
         if (binWidth < 1e-6) binWidth = 1e-6;
     } else {
         binWidth = std::max(1e-6, range / 20.0);
@@ -549,18 +653,19 @@ std::string GnuplotEngine::histogram(const std::string& id,
     }
 
     const std::string safeId = sanitizeId(id);
+    const AxisRange xAxis = robustAxisRange(vals, 0.06);
     std::ostringstream script;
-    script << styledHeader(id, title);
+    script << styledHeader(id, title + (useSturges ? " (Sturges grouped)" : ""));
     script << "set xlabel 'Value' tc rgb '#374151'\n";
     script << "set ylabel 'Frequency' tc rgb '#374151'\n";
     script << "set yrange [0:*]\n";
-    if (range <= 1e-12) {
-        script << "set xrange [" << (minV - 1.0) << ":" << (maxV + 1.0) << "]\n";
-    }
+    if (xAxis.valid) applyAxisFormatting(script, 'x', xAxis);
     script << "set boxwidth 0.9 relative\nset style fill solid 0.85 border lc rgb '#1d4ed8'\n";
-    script << "binwidth=" << binWidth << "\nbin(x,width)=width*floor(x/width)\n";
+    script << "binwidth=" << binWidth << "\n";
+    script << "binstart=" << minV << "\n";
+    script << "bin(x,width,start)=start+width*floor((x-start)/width)\n";
     script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
-           << " index 0 using (bin($1,binwidth)):(1.0) smooth freq with boxes ls 1 title 'Histogram'";
+           << " index 0 using (bin($1,binwidth,binstart)):(1.0) smooth freq with boxes ls 1 title 'Histogram'";
     if (drawKde) {
         script << ", " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
                << " index 1 using 1:2 with lines ls 2 title 'KDE (scaled)'";
@@ -574,31 +679,34 @@ std::string GnuplotEngine::bar(const std::string& id,
                                const std::vector<std::string>& labels,
                                const std::vector<double>& values,
                                const std::string& title) {
+    const CategoricalSeries grouped = aggregateTopCategories(labels, values, 12);
+    if (grouped.labels.size() < 2 || grouped.values.size() < 2) return "";
+    if (PlotHeuristics::shouldAvoidCategoryHeavyCharts(labels.size(), 30)) return "";
+
     std::ostringstream data;
     double maxValue = 0.0;
-    for (size_t i = 0; i < labels.size() && i < values.size(); ++i) {
-        if (values[i] > maxValue) maxValue = values[i];
-        data << i << " " << values[i] << "\n";
+    for (size_t i = 0; i < grouped.labels.size() && i < grouped.values.size(); ++i) {
+        if (grouped.values[i] > maxValue) maxValue = grouped.values[i];
+        data << i << " " << grouped.values[i] << "\n";
     }
-    if (labels.empty() || values.empty()) return "";
     if (maxValue < 1.0) maxValue = 1.0;
 
     std::ostringstream xtics;
     xtics << "set xtics (";
-    for (size_t i = 0; i < labels.size() && i < values.size(); ++i) {
+    for (size_t i = 0; i < grouped.labels.size() && i < grouped.values.size(); ++i) {
         if (i > 0) xtics << ", ";
-        xtics << quoteForGnuplot(normalizePlotLabel(labels[i])) << " " << i;
+        xtics << quoteForGnuplot(normalizePlotLabel(grouped.labels[i])) << " " << i;
     }
     xtics << ") rotate by -25 font ',8'\n";
 
     std::ostringstream script;
     const std::string safeId = sanitizeId(id);
-    script << styledHeader(id, title);
+    script << styledHeader(id, title + ((grouped.labels.size() < labels.size()) ? " (top categories)" : ""));
     script << "set style fill solid 0.85 border lc rgb '#1d4ed8'\n";
     script << "set boxwidth 0.8\nset yrange [0:" << (maxValue * 1.12) << "]\n";
     script << "set xlabel ''\nset ylabel 'Count' tc rgb '#374151'\n";
     script << xtics.str();
-    script << "set xrange [-1:" << (labels.size()) << "]\n";
+    script << "set xrange [-1:" << (grouped.labels.size()) << "]\n";
     script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat") << " using 1:2 with boxes ls 1 notitle\n";
     return runScript(id, data.str(), script.str());
 }
@@ -723,6 +831,18 @@ std::string GnuplotEngine::scatter(const std::string& id,
     script << "set xlabel 'X' tc rgb '#374151'\n";
     script << "set ylabel 'Y' tc rgb '#374151'\n";
     script << "set key top left\n";
+    std::vector<double> xv;
+    std::vector<double> yv;
+    xv.reserve(drawPts.size());
+    yv.reserve(drawPts.size());
+    for (const auto& p : drawPts) {
+        xv.push_back(p.first);
+        yv.push_back(p.second);
+    }
+    const AxisRange xAxis = robustAxisRange(xv, 0.08);
+    const AxisRange yAxis = robustAxisRange(yv, 0.08);
+    if (xAxis.valid) applyAxisFormatting(script, 'x', xAxis);
+    if (yAxis.valid) applyAxisFormatting(script, 'y', yAxis);
 
     script << "plot ";
     if (withFitLine && canBand) {
@@ -779,6 +899,17 @@ std::string GnuplotEngine::line(const std::string& id,
     script << styledHeader(id, title);
     script << "set xlabel 'Epoch' tc rgb '#374151'\n";
     script << "set ylabel 'Value' tc rgb '#374151'\n";
+    std::vector<double> xv;
+    std::vector<double> yv;
+    for (size_t i = 0; i < x.size() && i < y.size(); ++i) {
+        if (!std::isfinite(x[i]) || !std::isfinite(y[i])) continue;
+        xv.push_back(x[i]);
+        yv.push_back(y[i]);
+    }
+    const AxisRange xAxis = robustAxisRange(xv, 0.04);
+    const AxisRange yAxis = robustAxisRange(yv, 0.08);
+    if (xAxis.valid) applyAxisFormatting(script, 'x', xAxis);
+    if (yAxis.valid) applyAxisFormatting(script, 'y', yAxis);
     script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat") << " using 1:2 with lines ls 1 title 'Series'\n";
     return runScript(id, data.str(), script.str());
 }
@@ -1174,12 +1305,13 @@ std::string GnuplotEngine::pie(const std::string& id,
                                const std::vector<std::string>& labels,
                                const std::vector<double>& values,
                                const std::string& title) {
-    const size_t n = std::min(labels.size(), values.size());
+    CategoricalSeries grouped = aggregateTopCategories(labels, values, 9);
+    const size_t n = std::min(grouped.labels.size(), grouped.values.size());
     if (n < 2) return "";
 
     double total = 0.0;
     for (size_t i = 0; i < n; ++i) {
-        if (values[i] > 0.0) total += values[i];
+        if (grouped.values[i] > 0.0) total += grouped.values[i];
     }
     if (total <= 0.0) return "";
 
@@ -1204,8 +1336,8 @@ std::string GnuplotEngine::pie(const std::string& id,
     int labelId = 1;
 
     for (size_t i = 0; i < n; ++i) {
-        if (values[i] <= 0.0) continue;
-        const double frac = values[i] / total;
+        if (grouped.values[i] <= 0.0) continue;
+        const double frac = grouped.values[i] / total;
         const double angleEnd = angleStart + frac * 2.0 * kPi;
 
         script << "set object " << objectId++ << " polygon from 0,0 ";
@@ -1224,7 +1356,7 @@ std::string GnuplotEngine::pie(const std::string& id,
         const double ly = 1.12 * std::sin(mid);
         const int pct = static_cast<int>(std::round(frac * 100.0));
         script << "set label " << labelId++ << " "
-               << quoteForGnuplot(normalizePlotLabel(labels[i], 20) + " (" + std::to_string(pct) + "%)")
+             << quoteForGnuplot(normalizePlotLabel(grouped.labels[i], 20) + " (" + std::to_string(pct) + "%)")
                << " at " << lx << "," << ly << " center tc rgb '#111827' font ',8'\n";
 
         angleStart = angleEnd;
