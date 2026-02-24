@@ -162,9 +162,16 @@ struct AutoConfig {
     std::string datasetPath;
     std::string reportFile = "neural_synthesis.md";
     std::string assetsDir = "seldon_report_assets";
+    std::string outputDir;
     std::string targetColumn;
     char delimiter = ',';
     bool exhaustiveScan = false;
+    bool interactiveMode = false;
+    std::string profile = "auto"; // auto|quick|thorough|minimal
+    std::string datetimeLocaleHint = "auto"; // auto|dmy|mdy
+    std::string numericLocaleHint = "auto"; // auto|us|eu
+    std::string exportPreprocessed = "none"; // none|csv|parquet
+    std::string exportPreprocessedPath;
 
     std::vector<std::string> excludedColumns;
     std::unordered_map<std::string, std::string> columnImputation;
@@ -211,6 +218,30 @@ struct AutoConfig {
     bool neuralUseValidationLossEma = true;
     double neuralValidationLossEmaBeta = 0.6;
     double neuralCategoricalInputL2Boost = 3.0;
+
+    // Advanced neural controls
+    double neuralLearningRate = 0.001;
+    int neuralMinLayers = 1;
+    int neuralMaxLayers = 3;
+    int neuralFixedLayers = 0; // 0 => auto
+    int neuralFixedHiddenNodes = 0; // 0 => auto
+    int neuralMaxHiddenNodes = 128;
+    bool neuralStreamingMode = false;
+    size_t neuralStreamingChunkRows = 2048;
+    bool neuralMultiOutput = true;
+    size_t neuralMaxAuxTargets = 2;
+    std::string neuralExplainability = "hybrid"; // permutation|integrated_gradients|shap|hybrid
+    size_t neuralIntegratedGradSteps = 16;
+    size_t neuralUncertaintySamples = 24;
+    bool neuralImportanceParallel = true;
+    size_t neuralImportanceMaxRows = 5000;
+    size_t neuralImportanceTrials = 0; // 0 => auto
+
+    // Auto feature engineering controls
+    bool featureEngineeringEnablePoly = true;
+    bool featureEngineeringEnableLog = true;
+    int featureEngineeringDegree = 2;
+    size_t featureEngineeringMaxBase = 8;
 
     PlotConfig plot;
     HeuristicTuningConfig tuning;

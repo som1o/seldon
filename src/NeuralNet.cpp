@@ -9,6 +9,9 @@
 #include <cstdint>
 #include <cstring>
 #include "SeldonExceptions.h"
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
 
 namespace {
     constexpr uint32_t kModelFormatVersion = 3;
@@ -67,7 +70,7 @@ namespace {
 
 }
 
-NeuralNet::NeuralNet(std::vector<size_t> topology) : topology(topology) {
+NeuralNet::NeuralNet(std::vector<size_t> topologyConfig) : topology(std::move(topologyConfig)) {
     if (topology.size() < 2) {
         throw Seldon::NeuralNetException("Topology must include at least input and output layers");
     }
@@ -259,10 +262,16 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X, const std::vect
     m_lookaheadInitialized = false;
     m_lookaheadSlowWeights.clear();
     m_lookaheadSlowBiases.clear();
-    setSeed(hp.seed);
-    forwardCounter = 0;
-    trainLossHistory.clear();
-    valLossHistory.clear();
+    if (!hp.incrementalMode) {
+        setSeed(hp.seed);
+        forwardCounter = 0;
+        trainLossHistory.clear();
+        valLossHistory.clear();
+        gradientNormHistory.clear();
+        weightStdHistory.clear();
+        weightMeanAbsHistory.clear();
+    }
+    lastTrainingDropoutRate = hp.dropoutRate;
 
     for (size_t l = 1; l < m_layers.size(); ++l) {
         m_layers[l].setActivation((l == m_layers.size() - 1) ? hp.outputActivation : hp.activation);
@@ -399,10 +408,21 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X, const std:
                             const std::vector<size_t>& indices, size_t batchStart, size_t batchEnd, 
                             const Hyperparameters& hp, size_t& t_step) {
     double batchLoss = 0.0;
+    double gradNormAccum = 0.0;
+    size_t gradNormCount = 0;
     t_step++;
     for (size_t b = batchStart; b < batchEnd; ++b) {
         feedForward(X[indices[b]], true, hp.dropoutRate);
         backpropagate(Y[indices[b]], hp, t_step);
+
+        double sqGrad = 0.0;
+        for (size_t l = 1; l < m_layers.size(); ++l) {
+            for (double g : m_layers[l].gradients()) {
+                sqGrad += g * g;
+            }
+        }
+        gradNormAccum += std::sqrt(std::max(0.0, sqGrad));
+        ++gradNormCount;
 
         size_t outputSize = std::min(Y[indices[b]].size(), m_layers.back().outputs().size());
         for (size_t j = 0; j < outputSize; ++j) {
@@ -416,7 +436,58 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X, const std:
             }
         }
     }
+
+    if (gradNormCount > 0) {
+        gradientNormHistory.push_back(gradNormAccum / static_cast<double>(gradNormCount));
+    }
+
+    double wAbs = 0.0;
+    double wSq = 0.0;
+    size_t wCount = 0;
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        for (double w : m_layers[l].weights()) {
+            wAbs += std::abs(w);
+            wSq += w * w;
+            ++wCount;
+        }
+    }
+    if (wCount > 0) {
+        weightMeanAbsHistory.push_back(wAbs / static_cast<double>(wCount));
+        weightStdHistory.push_back(std::sqrt(wSq / static_cast<double>(wCount)));
+    }
+
     return batchLoss;
+}
+
+void NeuralNet::trainIncremental(const std::vector<std::vector<double>>& X,
+                                 const std::vector<std::vector<double>>& Y,
+                                 const Hyperparameters& hp,
+                                 size_t chunkRows,
+                                 const std::vector<ScaleInfo>& inScales,
+                                 const std::vector<ScaleInfo>& outScales) {
+    if (chunkRows == 0) {
+        throw Seldon::NeuralNetException("chunkRows must be > 0 for incremental training");
+    }
+    if (X.size() != Y.size()) {
+        throw Seldon::NeuralNetException("Input and target sample counts must match");
+    }
+
+    Hyperparameters incrementalHp = hp;
+    incrementalHp.incrementalMode = true;
+
+    const size_t n = X.size();
+    for (size_t start = 0; start < n; start += chunkRows) {
+        const size_t end = std::min(start + chunkRows, n);
+        std::vector<std::vector<double>> chunkX;
+        std::vector<std::vector<double>> chunkY;
+        chunkX.reserve(end - start);
+        chunkY.reserve(end - start);
+        for (size_t i = start; i < end; ++i) {
+            chunkX.push_back(X[i]);
+            chunkY.push_back(Y[i]);
+        }
+        train(chunkX, chunkY, incrementalHp, inScales, outScales);
+    }
 }
 
 double NeuralNet::validate(const std::vector<std::vector<double>>& X, const std::vector<std::vector<double>>& Y, 
@@ -465,20 +536,65 @@ std::vector<double> NeuralNet::predict(const std::vector<double>& inputValues) {
     return result;
 }
 
+NeuralNet::UncertaintyEstimate NeuralNet::predictWithUncertainty(const std::vector<double>& inputValues,
+                                                                 size_t samples,
+                                                                 double dropoutRate) {
+    if (samples == 0) samples = 1;
+
+    UncertaintyEstimate out;
+    const size_t outDim = m_layers.back().size();
+    out.mean.assign(outDim, 0.0);
+    out.stddev.assign(outDim, 0.0);
+    out.ciLow.assign(outDim, 0.0);
+    out.ciHigh.assign(outDim, 0.0);
+
+    std::vector<std::vector<double>> draws(samples, std::vector<double>(outDim, 0.0));
+    for (size_t s = 0; s < samples; ++s) {
+        feedForward(inputValues, true, dropoutRate);
+        for (size_t j = 0; j < outDim; ++j) {
+            draws[s][j] = m_layers.back().outputs()[j];
+        }
+    }
+
+    for (size_t j = 0; j < outDim; ++j) {
+        double sum = 0.0;
+        for (size_t s = 0; s < samples; ++s) {
+            sum += draws[s][j];
+        }
+        const double mu = sum / static_cast<double>(samples);
+        double var = 0.0;
+        for (size_t s = 0; s < samples; ++s) {
+            const double d = draws[s][j] - mu;
+            var += d * d;
+        }
+        const double sd = std::sqrt(var / static_cast<double>(std::max<size_t>(1, samples - 1)));
+        out.mean[j] = mu;
+        out.stddev[j] = sd;
+        out.ciLow[j] = mu - 1.96 * sd;
+        out.ciHigh[j] = mu + 1.96 * sd;
+    }
+
+    return out;
+}
+
 std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std::vector<double>>& X, 
                                                const std::vector<std::vector<double>>& Y,
-                                               size_t trials) {
+                                               size_t trials,
+                                               size_t maxRows,
+                                               bool parallel) {
     if (X.empty() || Y.empty() || X.size() != Y.size()) return {};
     size_t numFeatures = X[0].size();
     size_t outDim = Y[0].size();
     if (numFeatures == 0 || outDim == 0) return {};
 
-    constexpr size_t kMaxImportanceRows = 5000;
     std::vector<size_t> sampledIndices(X.size());
     std::iota(sampledIndices.begin(), sampledIndices.end(), 0);
-    if (sampledIndices.size() > kMaxImportanceRows) {
+    size_t effectiveMaxRows = (maxRows > 0) ? maxRows : sampledIndices.size();
+    const size_t hardRowCap = 1200;
+    effectiveMaxRows = std::min(effectiveMaxRows, hardRowCap);
+    if (sampledIndices.size() > effectiveMaxRows) {
         std::shuffle(sampledIndices.begin(), sampledIndices.end(), rng);
-        sampledIndices.resize(kMaxImportanceRows);
+        sampledIndices.resize(effectiveMaxRows);
     }
 
     std::vector<std::vector<double>> Xeval;
@@ -493,18 +609,67 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
     if (Xeval.empty()) return {};
 
     if (trials == 0) trials = 1;
-    if (Xeval.size() > 3000 && trials > 3) trials = 3;
+    if (Xeval.size() > 900 && trials > 4) trials = 4;
+    if (Xeval.size() > 600 && trials > 3) trials = 3;
+    if (Xeval.size() > 350 && trials > 2) trials = 2;
+
+    // Clamp total permutation work to keep CLI responsive.
+    const size_t maxPermutationOps = 120000;
+    if (numFeatures > 0 && Xeval.size() > 0) {
+        size_t opBudgetPerTrial = numFeatures * Xeval.size();
+        if (opBudgetPerTrial > 0 && trials * opBudgetPerTrial > maxPermutationOps) {
+            size_t allowedTrials = std::max<size_t>(1, maxPermutationOps / opBudgetPerTrial);
+            trials = std::max<size_t>(1, std::min(trials, allowedTrials));
+            if (trials * opBudgetPerTrial > maxPermutationOps) {
+                size_t allowedRows = std::max<size_t>(120, maxPermutationOps / (trials * numFeatures));
+                if (Xeval.size() > allowedRows) {
+                    std::shuffle(Xeval.begin(), Xeval.end(), rng);
+                    Xeval.resize(allowedRows);
+                    Yeval.resize(allowedRows);
+                }
+            }
+        }
+    }
+
+    std::vector<size_t> activeFeatures(numFeatures);
+    std::iota(activeFeatures.begin(), activeFeatures.end(), 0);
+    const size_t featureCap = 64;
+    if (numFeatures > featureCap) {
+        std::vector<std::pair<double, size_t>> varianceOrder;
+        varianceOrder.reserve(numFeatures);
+        for (size_t f = 0; f < numFeatures; ++f) {
+            double mean = 0.0;
+            for (const auto& row : Xeval) mean += row[f];
+            mean /= static_cast<double>(std::max<size_t>(1, Xeval.size()));
+            double var = 0.0;
+            for (const auto& row : Xeval) {
+                const double d = row[f] - mean;
+                var += d * d;
+            }
+            varianceOrder.emplace_back(var, f);
+        }
+        std::nth_element(varianceOrder.begin(),
+                         varianceOrder.begin() + static_cast<long>(featureCap),
+                         varianceOrder.end(),
+                         [](const auto& a, const auto& b) { return a.first > b.first; });
+        activeFeatures.clear();
+        activeFeatures.reserve(featureCap);
+        for (size_t i = 0; i < featureCap; ++i) {
+            activeFeatures.push_back(varianceOrder[i].second);
+        }
+    }
 
     std::vector<double> importances(numFeatures, 0.0);
     std::vector<double> fallbackSensitivity(numFeatures, 0.0);
 
     // Calculate baseline error (MSE)
-    auto getError = [&](const std::vector<std::vector<double>>& dataX,
+    auto getError = [&](NeuralNet& net,
+                        const std::vector<std::vector<double>>& dataX,
                         std::vector<std::vector<double>>* predsOut = nullptr) {
         double totalError = 0.0;
         if (predsOut) predsOut->assign(dataX.size(), std::vector<double>(outDim, 0.0));
         for (size_t i = 0; i < dataX.size(); ++i) {
-            auto p = predict(dataX[i]);
+            auto p = net.predict(dataX[i]);
             for (size_t j = 0; j < outDim && j < p.size(); ++j) {
                 double diff = p[j] - Yeval[i][j];
                 totalError += diff * diff;
@@ -517,28 +682,36 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
     };
 
     std::vector<std::vector<double>> baselinePred;
-    double baselineError = getError(Xeval, &baselinePred);
+    double baselineError = getError(*this, Xeval, &baselinePred);
 
-    const size_t progressStep = std::max<size_t>(1, numFeatures / 10);
-    if (numFeatures >= 20) {
+    const size_t progressStep = std::max<size_t>(1, activeFeatures.size() / 10);
+    if (activeFeatures.size() >= 20) {
         std::cout << "[Seldon][Neural] Feature importance on "
                   << Xeval.size() << " sampled rows, "
-                  << trials << " trial(s)\n";
+                  << trials << " trial(s)";
+        if (activeFeatures.size() < numFeatures) {
+            std::cout << ", top " << activeFeatures.size()
+                      << "/" << numFeatures << " feature(s)";
+        }
+        std::cout << "\n";
     }
 
-    for (size_t f = 0; f < numFeatures; ++f) {
+    auto computeForFeature = [&](size_t f, double& outImportance, double& outSensitivity) {
         double featureErrorSum = 0.0;
         double sensitivitySum = 0.0;
+        NeuralNet localNet = *this;
+        std::mt19937 localRng(seedState + static_cast<uint32_t>(f * 2654435761ULL));
+
         for (size_t t = 0; t < trials; ++t) {
             std::vector<std::vector<double>> shuffledX = Xeval;
             std::vector<double> featureVals;
             featureVals.reserve(Xeval.size());
             for (const auto& row : Xeval) featureVals.push_back(row[f]);
-            std::shuffle(featureVals.begin(), featureVals.end(), rng);
+            std::shuffle(featureVals.begin(), featureVals.end(), localRng);
             for (size_t i = 0; i < Xeval.size(); ++i) shuffledX[i][f] = featureVals[i];
 
             std::vector<std::vector<double>> shuffledPred;
-            featureErrorSum += getError(shuffledX, &shuffledPred);
+            featureErrorSum += getError(localNet, shuffledX, &shuffledPred);
             for (size_t i = 0; i < shuffledPred.size(); ++i) {
                 for (size_t j = 0; j < outDim; ++j) {
                     sensitivitySum += std::abs(shuffledPred[i][j] - baselinePred[i][j]);
@@ -546,14 +719,47 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
             }
         }
 
-        // Importance = how much error increased when feature was destroyed
-        importances[f] = (featureErrorSum / (double)trials) - baselineError;
-        if (importances[f] < 0) importances[f] = 0; // Clip noise
-        fallbackSensitivity[f] = sensitivitySum / static_cast<double>(trials * Xeval.size() * outDim);
+        outImportance = std::max(0.0, (featureErrorSum / static_cast<double>(trials)) - baselineError);
+        outSensitivity = sensitivitySum / static_cast<double>(trials * Xeval.size() * outDim);
+    };
 
-        if (numFeatures >= 20 && (((f + 1) % progressStep) == 0 || (f + 1) == numFeatures)) {
-            const size_t pct = static_cast<size_t>((100.0 * static_cast<double>(f + 1)) / static_cast<double>(numFeatures));
-            std::cout << "[Seldon][Neural] Feature importance progress: " << pct << "%\n";
+#ifdef USE_OPENMP
+    if (parallel && activeFeatures.size() >= 8) {
+        #pragma omp parallel for
+        for (int i = 0; i < static_cast<int>(activeFeatures.size()); ++i) {
+            size_t f = activeFeatures[static_cast<size_t>(i)];
+            double imp = 0.0;
+            double sens = 0.0;
+            computeForFeature(f, imp, sens);
+            importances[f] = imp;
+            fallbackSensitivity[f] = sens;
+        }
+    } else
+#endif
+    {
+        for (size_t i = 0; i < activeFeatures.size(); ++i) {
+            size_t f = activeFeatures[i];
+            double imp = 0.0;
+            double sens = 0.0;
+            computeForFeature(f, imp, sens);
+            importances[f] = imp;
+            fallbackSensitivity[f] = sens;
+
+            if (activeFeatures.size() >= 20 && (((i + 1) % progressStep) == 0 || (i + 1) == activeFeatures.size())) {
+                const size_t pct = static_cast<size_t>((100.0 * static_cast<double>(i + 1)) / static_cast<double>(activeFeatures.size()));
+                const size_t barWidth = 24;
+                const size_t fill = std::min(barWidth, static_cast<size_t>((pct * barWidth) / 100));
+                std::cout << "\r[Seldon][Neural] importance [";
+                for (size_t barIdx = 0; barIdx < barWidth; ++barIdx) {
+                    if (barIdx < fill) std::cout << '=';
+                    else if (barIdx == fill && fill < barWidth) std::cout << '>';
+                    else std::cout << ' ';
+                }
+                std::cout << "] " << pct << "%" << std::flush;
+                if ((i + 1) == activeFeatures.size()) {
+                    std::cout << "\n";
+                }
+            }
         }
     }
 
@@ -594,6 +800,129 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
     }
 
     return importances;
+}
+
+std::vector<double> NeuralNet::calculateIntegratedGradients(const std::vector<std::vector<double>>& X,
+                                                            size_t steps,
+                                                            size_t maxRows) {
+    if (X.empty() || X[0].empty()) return {};
+    steps = std::max<size_t>(4, steps);
+
+    const size_t numFeatures = X[0].size();
+    std::vector<size_t> sampled(X.size());
+    std::iota(sampled.begin(), sampled.end(), 0);
+    if (maxRows > 0 && sampled.size() > maxRows) {
+        std::shuffle(sampled.begin(), sampled.end(), rng);
+        sampled.resize(maxRows);
+    }
+
+    std::vector<double> baseline(numFeatures, 0.0);
+    for (size_t f = 0; f < numFeatures; ++f) {
+        double s = 0.0;
+        for (size_t idx : sampled) s += X[idx][f];
+        baseline[f] = s / static_cast<double>(std::max<size_t>(1, sampled.size()));
+    }
+
+    std::vector<double> attribution(numFeatures, 0.0);
+    constexpr double eps = 1e-3;
+
+    for (size_t idx : sampled) {
+        const auto& row = X[idx];
+        std::vector<double> gradAccum(numFeatures, 0.0);
+        for (size_t s = 1; s <= steps; ++s) {
+            const double alpha = static_cast<double>(s) / static_cast<double>(steps);
+            std::vector<double> interp(numFeatures, 0.0);
+            for (size_t f = 0; f < numFeatures; ++f) {
+                interp[f] = baseline[f] + alpha * (row[f] - baseline[f]);
+            }
+
+            const std::vector<double> basePred = predict(interp);
+            const double outBase = basePred.empty() ? 0.0 : basePred[0];
+            for (size_t f = 0; f < numFeatures; ++f) {
+                std::vector<double> plus = interp;
+                plus[f] += eps;
+                const std::vector<double> plusPred = predict(plus);
+                const double outPlus = plusPred.empty() ? 0.0 : plusPred[0];
+                gradAccum[f] += (outPlus - outBase) / eps;
+            }
+        }
+
+        for (size_t f = 0; f < numFeatures; ++f) {
+            const double ig = (row[f] - baseline[f]) * (gradAccum[f] / static_cast<double>(steps));
+            attribution[f] += std::abs(ig);
+        }
+    }
+
+    const double count = static_cast<double>(std::max<size_t>(1, sampled.size()));
+    for (double& v : attribution) v /= count;
+    const double sum = std::accumulate(attribution.begin(), attribution.end(), 0.0);
+    if (sum > 1e-12) {
+        for (double& v : attribution) v /= sum;
+    }
+    return attribution;
+}
+
+std::vector<double> NeuralNet::calculateShapApprox(const std::vector<std::vector<double>>& X,
+                                                   size_t coalitionSamples,
+                                                   size_t maxRows) {
+    if (X.empty() || X[0].empty()) return {};
+    coalitionSamples = std::max<size_t>(4, coalitionSamples);
+
+    const size_t numFeatures = X[0].size();
+    std::vector<size_t> evalIdx(X.size());
+    std::iota(evalIdx.begin(), evalIdx.end(), 0);
+    if (maxRows > 0 && evalIdx.size() > maxRows) {
+        std::shuffle(evalIdx.begin(), evalIdx.end(), rng);
+        evalIdx.resize(maxRows);
+    }
+
+    std::vector<size_t> bgIdx(X.size());
+    std::iota(bgIdx.begin(), bgIdx.end(), 0);
+    if (bgIdx.size() > std::max<size_t>(64, evalIdx.size())) {
+        std::shuffle(bgIdx.begin(), bgIdx.end(), rng);
+        bgIdx.resize(std::max<size_t>(64, evalIdx.size()));
+    }
+
+    std::vector<double> attribution(numFeatures, 0.0);
+    std::bernoulli_distribution includeDist(0.5);
+
+    for (size_t samplePos = 0; samplePos < evalIdx.size(); ++samplePos) {
+        const auto& x = X[evalIdx[samplePos]];
+        for (size_t f = 0; f < numFeatures; ++f) {
+            double contrib = 0.0;
+            for (size_t c = 0; c < coalitionSamples; ++c) {
+                const size_t bgPos = (samplePos + c) % bgIdx.size();
+                const auto& b = X[bgIdx[bgPos]];
+
+                std::vector<double> zWithout(numFeatures, 0.0);
+                std::vector<double> zWith(numFeatures, 0.0);
+                for (size_t j = 0; j < numFeatures; ++j) {
+                    const bool include = (j == f) ? false : includeDist(rng);
+                    zWithout[j] = include ? x[j] : b[j];
+                    zWith[j] = zWithout[j];
+                }
+                zWith[f] = x[f];
+
+                const auto pWithout = predict(zWithout);
+                const auto pWith = predict(zWith);
+                const size_t outDim = std::min(pWithout.size(), pWith.size());
+                double delta = 0.0;
+                for (size_t k = 0; k < outDim; ++k) {
+                    delta += std::abs(pWith[k] - pWithout[k]);
+                }
+                contrib += (outDim > 0) ? (delta / static_cast<double>(outDim)) : 0.0;
+            }
+            attribution[f] += contrib / static_cast<double>(coalitionSamples);
+        }
+    }
+
+    const double count = static_cast<double>(std::max<size_t>(1, evalIdx.size()));
+    for (double& v : attribution) v /= count;
+    const double sum = std::accumulate(attribution.begin(), attribution.end(), 0.0);
+    if (sum > 1e-12) {
+        for (double& v : attribution) v /= sum;
+    }
+    return attribution;
 }
 
 void NeuralNet::saveModelBinary(const std::string& filename) const {

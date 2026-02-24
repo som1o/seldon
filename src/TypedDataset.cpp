@@ -3,9 +3,13 @@
 #include "CommonUtils.h"
 #include "SeldonExceptions.h"
 #include <algorithm>
+#include <cstdio>
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -72,7 +76,7 @@ bool parseTimePart(const std::string& timePart, int& hour, int& minute, int& sec
     return true;
 }
 
-bool parseDatePart(const std::string& datePart, int& year, int& month, int& day) {
+bool parseDatePart(const std::string& datePart, TypedDataset::DateLocaleHint localeHint, int& year, int& month, int& day) {
     // ISO: YYYY-MM-DD
     if (datePart.size() == 10 && datePart[4] == '-' && datePart[7] == '-') {
         return parseFixedInt(datePart, 0, 4, year) &&
@@ -80,11 +84,34 @@ bool parseDatePart(const std::string& datePart, int& year, int& month, int& day)
                parseFixedInt(datePart, 8, 2, day);
     }
 
-    // US: MM/DD/YYYY
+    // Slash format: dd/mm/yyyy or mm/dd/yyyy based on locale hint.
     if (datePart.size() == 10 && datePart[2] == '/' && datePart[5] == '/') {
-        return parseFixedInt(datePart, 0, 2, month) &&
-               parseFixedInt(datePart, 3, 2, day) &&
-               parseFixedInt(datePart, 6, 4, year);
+        int a = 0;
+        int b = 0;
+        int y = 0;
+        if (!parseFixedInt(datePart, 0, 2, a) ||
+            !parseFixedInt(datePart, 3, 2, b) ||
+            !parseFixedInt(datePart, 6, 4, y)) {
+            return false;
+        }
+
+        if (localeHint == TypedDataset::DateLocaleHint::DMY) {
+            day = a;
+            month = b;
+        } else if (localeHint == TypedDataset::DateLocaleHint::MDY) {
+            month = a;
+            day = b;
+        } else {
+            if (a > 12 && b <= 12) {
+                day = a;
+                month = b;
+            } else {
+                month = a;
+                day = b;
+            }
+        }
+        year = y;
+        return true;
     }
 
     // DMY: DD-MM-YYYY
@@ -94,7 +121,115 @@ bool parseDatePart(const std::string& datePart, int& year, int& month, int& day)
                parseFixedInt(datePart, 6, 4, year);
     }
 
+    // MDY two-digit year: MM-DD-YY
+    if (datePart.size() == 8 && datePart[2] == '-' && datePart[5] == '-') {
+        int yy = 0;
+        if (!parseFixedInt(datePart, 0, 2, month) ||
+            !parseFixedInt(datePart, 3, 2, day) ||
+            !parseFixedInt(datePart, 6, 2, yy)) {
+            return false;
+        }
+        year = (yy >= 70) ? (1900 + yy) : (2000 + yy);
+        return true;
+    }
+
+    // ISO week date: YYYY-Www-D (D:1..7)
+    if (datePart.size() == 10 && datePart[4] == '-' && datePart[5] == 'W' && datePart[8] == '-') {
+        int isoYear = 0;
+        int isoWeek = 0;
+        int isoDay = 0;
+        if (!parseFixedInt(datePart, 0, 4, isoYear) ||
+            !parseFixedInt(datePart, 6, 2, isoWeek) ||
+            !parseFixedInt(datePart, 9, 1, isoDay)) {
+            return false;
+        }
+        if (isoWeek < 1 || isoWeek > 53 || isoDay < 1 || isoDay > 7) return false;
+
+        const int64_t jan4 = daysFromCivil(isoYear, 1, 4);
+        const int jan4WeekdayMon1 = static_cast<int>(((jan4 + 3) % 7 + 7) % 7) + 1;
+        const int64_t isoWeek1Monday = jan4 - static_cast<int64_t>(jan4WeekdayMon1 - 1);
+        const int64_t targetDays = isoWeek1Monday + static_cast<int64_t>((isoWeek - 1) * 7 + (isoDay - 1));
+
+        int z = static_cast<int>(targetDays + 719468);
+        const int era = (z >= 0 ? z : z - 146096) / 146097;
+        const unsigned doe = static_cast<unsigned>(z - era * 146097);
+        const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        int y = static_cast<int>(yoe) + era * 400;
+        const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        const unsigned mp = (5 * doy + 2) / 153;
+        const unsigned d = doy - (153 * mp + 2) / 5 + 1;
+        const unsigned m = mp + (mp < 10 ? 3 : -9);
+        y += (m <= 2);
+        year = y;
+        month = static_cast<int>(m);
+        day = static_cast<int>(d);
+        return true;
+    }
+
     return false;
+}
+
+std::string shellEscape(const std::string& input) {
+    std::string out;
+    out.reserve(input.size() + 2);
+    out.push_back('\'');
+    for (char c : input) {
+        if (c == '\'') out += "'\\''";
+        else out.push_back(c);
+    }
+    out.push_back('\'');
+    return out;
+}
+
+bool commandAvailable(const std::string& command) {
+    const std::string cmd = "command -v " + command + " >/dev/null 2>&1";
+    return std::system(cmd.c_str()) == 0;
+}
+
+std::pair<std::string, bool> resolveDatasetInputPath(const std::string& sourcePath) {
+    namespace fs = std::filesystem;
+    const fs::path src(sourcePath);
+    std::string lowerExt = CommonUtils::toLower(src.extension().string());
+
+    if (lowerExt == ".csv") {
+        return {sourcePath, false};
+    }
+
+    const fs::path tmpBase = fs::temp_directory_path() / ("seldon_input_" + std::to_string(static_cast<unsigned long long>(std::hash<std::string>{}(sourcePath + std::to_string(std::time(nullptr))))) + ".csv");
+    const std::string tmpPath = tmpBase.string();
+
+    auto runToTmp = [&](const std::string& command) {
+        const int rc = std::system(command.c_str());
+        if (rc != 0) {
+            throw Seldon::DatasetException("Failed to convert input source: " + sourcePath);
+        }
+        return std::make_pair(tmpPath, true);
+    };
+
+    if (lowerExt == ".gz") {
+        const std::string cmd = "gzip -cd " + shellEscape(sourcePath) + " > " + shellEscape(tmpPath);
+        return runToTmp(cmd);
+    }
+    if (lowerExt == ".zip") {
+        const std::string cmd = "unzip -p " + shellEscape(sourcePath) + " > " + shellEscape(tmpPath);
+        return runToTmp(cmd);
+    }
+    if (lowerExt == ".xlsx") {
+        if (commandAvailable("xlsx2csv")) {
+            const std::string cmd = "xlsx2csv " + shellEscape(sourcePath) + " > " + shellEscape(tmpPath);
+            return runToTmp(cmd);
+        }
+        throw Seldon::DatasetException("XLSX import requires xlsx2csv. See docs/ENABLE_EXCEL_IMPORT.md");
+    }
+    if (lowerExt == ".xls") {
+        if (commandAvailable("xls2csv")) {
+            const std::string cmd = "xls2csv " + shellEscape(sourcePath) + " > " + shellEscape(tmpPath);
+            return runToTmp(cmd);
+        }
+        throw Seldon::DatasetException("XLS import requires xls2csv (libxls tools). See docs/ENABLE_EXCEL_IMPORT.md");
+    }
+
+    return {sourcePath, false};
 }
 
 std::string normalizeNumericToken(const std::string& input, TypedDataset::NumericSeparatorPolicy policy) {
@@ -150,15 +285,25 @@ std::string normalizeNumericToken(const std::string& input, TypedDataset::Numeri
     }
 
     if (commaPos != std::string::npos) {
-        if (cleaned.find(',', commaPos + 1) == std::string::npos) {
-            const size_t digitsAfter = cleaned.size() - commaPos - 1;
-            if (digitsAfter >= 1 && digitsAfter <= 6) {
+        const size_t commaCount = static_cast<size_t>(std::count(cleaned.begin(), cleaned.end(), ','));
+        const bool singleComma = (commaCount == 1);
+        const size_t digitsAfter = cleaned.size() - commaPos - 1;
+        if (singleComma && digitsAfter >= 1 && digitsAfter <= 4) {
+            const bool likelyThousands = (digitsAfter == 3 && commaPos > 0 && std::isdigit(static_cast<unsigned char>(cleaned[commaPos - 1])));
+            if (!likelyThousands) {
                 std::string out = cleaned;
                 out[commaPos] = '.';
                 return out;
             }
         }
         return toUS(cleaned);
+    }
+
+    if (dotPos != std::string::npos) {
+        const size_t dotCount = static_cast<size_t>(std::count(cleaned.begin(), cleaned.end(), '.'));
+        if (dotCount > 1) {
+            return toUS(cleaned);
+        }
     }
 
     return cleaned;
@@ -344,7 +489,7 @@ bool TypedDataset::parseDouble(const std::string& v, double& out) const {
     return ec2 == std::errc{} && p2 == e && std::isfinite(out);
 }
 
-bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) {
+bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) const {
     std::string s = CommonUtils::trim(v);
     if (s.empty() || isMissingToken(s)) return false;
 
@@ -367,7 +512,7 @@ bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) 
         timePart = s.substr(sep + 1);
     }
 
-    if (!parseDatePart(datePart, year, month, day)) {
+    if (!parseDatePart(datePart, dateLocaleHint_, year, month, day)) {
         return false;
     }
     if (!parseTimePart(timePart, hour, minute, second)) {
@@ -385,8 +530,9 @@ bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) 
 }
 
 void TypedDataset::load() {
-    std::ifstream in(filename_, std::ios::binary);
-    if (!in) throw Seldon::IOException("Could not open file: " + filename_);
+    auto [resolvedPath, isTemporary] = resolveDatasetInputPath(filename_);
+    std::ifstream in(resolvedPath, std::ios::binary);
+    if (!in) throw Seldon::IOException("Could not open file: " + resolvedPath);
 
     CSVUtils::skipBOM(in);
 
@@ -723,6 +869,10 @@ void TypedDataset::load() {
     }
 
     if (datetimeFallbackCols.empty()) {
+        if (isTemporary) {
+            std::error_code ec;
+            std::filesystem::remove(resolvedPath, ec);
+        }
         return;
     }
 
@@ -806,6 +956,11 @@ void TypedDataset::load() {
             }
         }
         rescuedDatetimeCols.push_back(c);
+    }
+
+    if (isTemporary) {
+        std::error_code ec;
+        std::filesystem::remove(resolvedPath, ec);
     }
 }
 

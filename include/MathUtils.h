@@ -110,7 +110,7 @@ public:
         size_t rows;
         size_t cols;
 
-        Matrix(size_t r, size_t c) : rows(r), cols(c), data(r, std::vector<double>(c, 0.0)) {}
+        Matrix(size_t r, size_t c) : data(r, std::vector<double>(c, 0.0)), rows(r), cols(c) {}
 
         double& at(size_t r, size_t c) {
             assert(r < rows && c < cols);

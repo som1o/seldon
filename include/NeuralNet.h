@@ -47,8 +47,18 @@ public:
         int earlyStoppingPatience = 10;
         double minDelta = 1e-4;       // Minimum improvement for early stopping
         double gradientClipNorm = 5.0;
+        bool incrementalMode = false;
+        size_t importanceMaxRows = 5000;
+        bool importanceParallel = true;
         uint32_t seed = 1337;
         bool verbose = true;
+    };
+
+    struct UncertaintyEstimate {
+        std::vector<double> mean;
+        std::vector<double> stddev;
+        std::vector<double> ciLow;
+        std::vector<double> ciHigh;
     };
 
     NeuralNet(std::vector<size_t> topology);
@@ -60,16 +70,36 @@ public:
                const Hyperparameters& hp,
                const std::vector<ScaleInfo>& inputScales = {},
                const std::vector<ScaleInfo>& outputScales = {});
+    void trainIncremental(const std::vector<std::vector<double>>& X,
+                          const std::vector<std::vector<double>>& Y,
+                          const Hyperparameters& hp,
+                          size_t chunkRows,
+                          const std::vector<ScaleInfo>& inputScales = {},
+                          const std::vector<ScaleInfo>& outputScales = {});
 
     // Forward pass prediction (handles internal scaling if scales are loaded)
     std::vector<double> predict(const std::vector<double>& inputValues);
+    UncertaintyEstimate predictWithUncertainty(const std::vector<double>& inputValues,
+                                               size_t samples,
+                                               double dropoutRate);
     const std::vector<double>& getTrainLossHistory() const { return trainLossHistory; }
     const std::vector<double>& getValLossHistory() const { return valLossHistory; }
+    const std::vector<double>& getGradientNormHistory() const { return gradientNormHistory; }
+    const std::vector<double>& getWeightStdHistory() const { return weightStdHistory; }
+    const std::vector<double>& getWeightMeanAbsHistory() const { return weightMeanAbsHistory; }
 
     // Explainability
     std::vector<double> calculateFeatureImportance(const std::vector<std::vector<double>>& X, 
                                                    const std::vector<std::vector<double>>& Y,
-                                                   size_t trials = 5);
+                                                   size_t trials = 5,
+                                                   size_t maxRows = 5000,
+                                                   bool parallel = true);
+    std::vector<double> calculateIntegratedGradients(const std::vector<std::vector<double>>& X,
+                                                     size_t steps = 16,
+                                                     size_t maxRows = 2000);
+    std::vector<double> calculateShapApprox(const std::vector<std::vector<double>>& X,
+                                            size_t coalitionSamples = 24,
+                                            size_t maxRows = 1000);
 
     /**
      * @brief Saves the current model state (weights, biases, and scale info) to a binary file.
@@ -106,8 +136,12 @@ private:
     std::vector<ScaleInfo> outputScales;
     std::vector<double> trainLossHistory;
     std::vector<double> valLossHistory;
+    std::vector<double> gradientNormHistory;
+    std::vector<double> weightStdHistory;
+    std::vector<double> weightMeanAbsHistory;
     uint32_t seedState = 1337;
     uint64_t forwardCounter = 0;
+    double lastTrainingDropoutRate = 0.0;
     std::vector<double> m_inputL2Scales;
     bool m_useBatchNorm = true;
     double m_batchNormMomentum = 0.95;

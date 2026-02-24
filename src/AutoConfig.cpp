@@ -5,6 +5,8 @@
 #include <sstream>
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <iostream>
 #include <limits>
 #include <unordered_set>
 
@@ -162,6 +164,86 @@ bool isValidImputationStrategy(const std::string& value) {
     return allowed.find(CommonUtils::toLower(CommonUtils::trim(value))) != allowed.end();
 }
 
+void applyProfile(AutoConfig& config, const std::string& profileRaw) {
+    const std::string p = CommonUtils::toLower(CommonUtils::trim(profileRaw));
+    if (p.empty() || p == "auto") {
+        config.profile = "auto";
+        return;
+    }
+
+    config.profile = p;
+    if (p == "quick") {
+        config.fastMode = true;
+        config.plotUnivariate = false;
+        config.plotOverall = false;
+        config.plotBivariateSignificant = true;
+        config.plotModesExplicit = true;
+        config.generateHtml = false;
+        config.fastMaxBivariatePairs = std::min<size_t>(config.fastMaxBivariatePairs, 1200);
+        config.fastNeuralSampleRows = std::min<size_t>(config.fastNeuralSampleRows, 12000);
+        config.neuralStrategy = "fast";
+    } else if (p == "thorough") {
+        config.fastMode = false;
+        config.plotUnivariate = true;
+        config.plotOverall = true;
+        config.plotBivariateSignificant = true;
+        config.plotModesExplicit = true;
+        config.neuralStrategy = "expressive";
+        config.neuralImportanceMaxRows = std::max<size_t>(config.neuralImportanceMaxRows, 10000);
+        config.neuralIntegratedGradSteps = std::max<size_t>(config.neuralIntegratedGradSteps, 24);
+    } else if (p == "minimal") {
+        config.fastMode = true;
+        config.plotUnivariate = false;
+        config.plotOverall = false;
+        config.plotBivariateSignificant = false;
+        config.plotModesExplicit = true;
+        config.generateHtml = false;
+        config.neuralStrategy = "fast";
+        config.fastMaxBivariatePairs = std::min<size_t>(config.fastMaxBivariatePairs, 500);
+    }
+}
+
+AutoConfig runInteractiveWizard() {
+    AutoConfig cfg;
+    cfg.interactiveMode = true;
+
+    auto ask = [](const std::string& prompt, const std::string& fallback = "") {
+        std::cout << prompt;
+        std::string value;
+        std::getline(std::cin, value);
+        value = CommonUtils::trim(value);
+        return value.empty() ? fallback : value;
+    };
+
+    cfg.datasetPath = ask("Dataset path (.csv/.csv.gz/.csv.zip/.xlsx/.xls): ");
+    cfg.targetColumn = ask("Target column (optional): ");
+    applyProfile(cfg, ask("Profile [quick/thorough/minimal/auto] (auto): ", "auto"));
+    cfg.plotUnivariate = parseBoolStrict(ask("Enable univariate plots? [true/false] (false): ", "false"), "interactive.plot_univariate");
+    cfg.plotOverall = parseBoolStrict(ask("Enable overall plots? [true/false] (false): ", "false"), "interactive.plot_overall");
+    cfg.plotBivariateSignificant = parseBoolStrict(ask("Enable significant bivariate plots? [true/false] (true): ", "true"), "interactive.plot_bivariate");
+    cfg.plotModesExplicit = true;
+    cfg.neuralStrategy = CommonUtils::toLower(ask("Neural strategy [auto/fast/balanced/expressive] (auto): ", "auto"));
+    cfg.bivariateStrategy = CommonUtils::toLower(ask("Bivariate strategy [auto/balanced/corr_heavy/importance_heavy] (auto): ", "auto"));
+    cfg.exportPreprocessed = CommonUtils::toLower(ask("Export preprocessed dataset [none/csv/parquet] (none): ", "none"));
+
+    const std::string outputCfgPath = ask("Write config file path (seldon_interactive.yaml): ", "seldon_interactive.yaml");
+    std::ofstream out(outputCfgPath);
+    if (out) {
+        out << "dataset: " << cfg.datasetPath << "\n";
+        if (!cfg.targetColumn.empty()) out << "target: " << cfg.targetColumn << "\n";
+        out << "profile: " << cfg.profile << "\n";
+        out << "plot_univariate: " << (cfg.plotUnivariate ? "true" : "false") << "\n";
+        out << "plot_overall: " << (cfg.plotOverall ? "true" : "false") << "\n";
+        out << "plot_bivariate_significant: " << (cfg.plotBivariateSignificant ? "true" : "false") << "\n";
+        out << "neural_strategy: " << cfg.neuralStrategy << "\n";
+        out << "bivariate_strategy: " << cfg.bivariateStrategy << "\n";
+        out << "export_preprocessed: " << cfg.exportPreprocessed << "\n";
+        std::cout << "[Seldon] Interactive config saved to " << outputCfgPath << "\n";
+    }
+
+    return cfg;
+}
+
 void applyPlotModes(AutoConfig& config, const std::string& value) {
     config.plotModesExplicit = true;
     config.plotUnivariate = false;
@@ -246,14 +328,21 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"target", &AutoConfig::targetColumn},
         {"dataset", &AutoConfig::datasetPath},
         {"report", &AutoConfig::reportFile},
-        {"assets_dir", &AutoConfig::assetsDir}
+        {"assets_dir", &AutoConfig::assetsDir},
+        {"output_dir", &AutoConfig::outputDir},
+        {"export_preprocessed_path", &AutoConfig::exportPreprocessedPath}
     };
     static const std::unordered_map<std::string, std::string AutoConfig::*> lowerStringFields = {
         {"outlier_method", &AutoConfig::outlierMethod},
         {"outlier_action", &AutoConfig::outlierAction},
         {"scaling", &AutoConfig::scalingMethod},
+        {"profile", &AutoConfig::profile},
+        {"datetime_locale_hint", &AutoConfig::datetimeLocaleHint},
+        {"numeric_locale_hint", &AutoConfig::numericLocaleHint},
+        {"export_preprocessed", &AutoConfig::exportPreprocessed},
         {"neural_optimizer", &AutoConfig::neuralOptimizer},
         {"neural_lookahead_fast_optimizer", &AutoConfig::neuralLookaheadFastOptimizer},
+        {"neural_explainability", &AutoConfig::neuralExplainability},
         {"target_strategy", &AutoConfig::targetStrategy},
         {"feature_strategy", &AutoConfig::featureStrategy},
         {"neural_strategy", &AutoConfig::neuralStrategy},
@@ -268,7 +357,12 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_use_batch_norm", &AutoConfig::neuralUseBatchNorm},
         {"neural_use_layer_norm", &AutoConfig::neuralUseLayerNorm},
         {"neural_use_validation_loss_ema", &AutoConfig::neuralUseValidationLossEma},
-        {"fast_mode", &AutoConfig::fastMode}
+        {"fast_mode", &AutoConfig::fastMode},
+        {"neural_streaming_mode", &AutoConfig::neuralStreamingMode},
+        {"neural_multi_output", &AutoConfig::neuralMultiOutput},
+        {"neural_importance_parallel", &AutoConfig::neuralImportanceParallel},
+        {"feature_engineering_enable_poly", &AutoConfig::featureEngineeringEnablePoly},
+        {"feature_engineering_enable_log", &AutoConfig::featureEngineeringEnableLog}
     };
     static const std::unordered_map<std::string, uint32_t AutoConfig::*> uintFields = {
         {"neural_seed", &AutoConfig::neuralSeed},
@@ -279,14 +373,28 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_lookahead_sync_period", {&AutoConfig::neuralLookaheadSyncPeriod, 1}},
         {"neural_lr_plateau_patience", {&AutoConfig::neuralLrPlateauPatience, 1}},
         {"neural_lr_cooldown_epochs", {&AutoConfig::neuralLrCooldownEpochs, 0}},
-        {"neural_max_lr_reductions", {&AutoConfig::neuralMaxLrReductions, 0}}
+        {"neural_max_lr_reductions", {&AutoConfig::neuralMaxLrReductions, 0}},
+        {"neural_min_layers", {&AutoConfig::neuralMinLayers, 1}},
+        {"neural_max_layers", {&AutoConfig::neuralMaxLayers, 1}},
+        {"neural_fixed_layers", {&AutoConfig::neuralFixedLayers, 0}},
+        {"neural_fixed_hidden_nodes", {&AutoConfig::neuralFixedHiddenNodes, 0}},
+        {"neural_max_hidden_nodes", {&AutoConfig::neuralMaxHiddenNodes, 4}},
+        {"feature_engineering_degree", {&AutoConfig::featureEngineeringDegree, 1}}
     };
     static const std::unordered_map<std::string, SizeRule> sizeFields = {
         {"fast_max_bivariate_pairs", {&AutoConfig::fastMaxBivariatePairs, 1}},
-        {"fast_neural_sample_rows", {&AutoConfig::fastNeuralSampleRows, 1}}
+        {"fast_neural_sample_rows", {&AutoConfig::fastNeuralSampleRows, 1}},
+        {"neural_streaming_chunk_rows", {&AutoConfig::neuralStreamingChunkRows, 16}},
+        {"neural_max_aux_targets", {&AutoConfig::neuralMaxAuxTargets, 0}},
+        {"neural_integrated_grad_steps", {&AutoConfig::neuralIntegratedGradSteps, 4}},
+        {"neural_uncertainty_samples", {&AutoConfig::neuralUncertaintySamples, 4}},
+        {"neural_importance_max_rows", {&AutoConfig::neuralImportanceMaxRows, 128}},
+        {"neural_importance_trials", {&AutoConfig::neuralImportanceTrials, 0}},
+        {"feature_engineering_max_base", {&AutoConfig::featureEngineeringMaxBase, 2}}
     };
     static const std::unordered_map<std::string, DoubleRule> doubleFields = {
         {"gradient_clip_norm", {&AutoConfig::gradientClipNorm, 0.0}},
+        {"neural_learning_rate", {&AutoConfig::neuralLearningRate, 1e-8}},
         {"neural_lookahead_alpha", {&AutoConfig::neuralLookaheadAlpha, 0.0}},
         {"neural_batch_norm_momentum", {&AutoConfig::neuralBatchNormMomentum, 0.0}},
         {"neural_batch_norm_epsilon", {&AutoConfig::neuralBatchNormEpsilon, 1e-12}},
@@ -413,6 +521,12 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
 }
 
 AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
+    if (argc >= 2 && std::string(argv[1]) == "--interactive") {
+        AutoConfig cfg = runInteractiveWizard();
+        cfg.validate();
+        return cfg;
+    }
+
     if (argc < 2) {
         throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--plot-theme auto|light|dark] [--plot-grid true|false] [--plot-point-size >0] [--plot-line-width >0] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--neural-optimizer sgd|adam|lookahead] [--neural-lookahead-fast-optimizer sgd|adam] [--neural-lookahead-sync-period N] [--neural-lookahead-alpha 0..1] [--neural-use-batch-norm true|false] [--neural-batch-norm-momentum 0..1) [--neural-batch-norm-epsilon >0] [--neural-use-layer-norm true|false] [--neural-layer-norm-epsilon >0] [--neural-lr-decay 0..1] [--neural-lr-plateau-patience N] [--neural-lr-cooldown-epochs N] [--neural-max-lr-reductions N] [--neural-min-learning-rate >=0] [--neural-use-validation-loss-ema true|false] [--neural-validation-loss-ema-beta 0..1] [--neural-categorical-input-l2-boost >=0] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1] [--ogive-min-points N] [--ogive-min-unique N] [--box-min-points N] [--box-min-iqr >=0] [--pie-min-categories N] [--pie-max-categories N] [--pie-max-dominance 0..1] [--fit-min-corr 0..1] [--fit-min-samples N] [--gantt-auto true|false] [--gantt-min-tasks N] [--gantt-max-tasks N] [--gantt-duration-hours-threshold >0]");
     }
@@ -427,6 +541,18 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             configPath = argv[++i];
         } else if (arg == "--target" && i + 1 < argc) {
             config.targetColumn = argv[++i];
+        } else if (arg == "--profile" && i + 1 < argc) {
+            applyProfile(config, argv[++i]);
+        } else if (arg == "--datetime-locale-hint" && i + 1 < argc) {
+            config.datetimeLocaleHint = CommonUtils::toLower(argv[++i]);
+        } else if (arg == "--numeric-locale-hint" && i + 1 < argc) {
+            config.numericLocaleHint = CommonUtils::toLower(argv[++i]);
+        } else if (arg == "--output-dir" && i + 1 < argc) {
+            config.outputDir = argv[++i];
+        } else if (arg == "--export-preprocessed" && i + 1 < argc) {
+            config.exportPreprocessed = CommonUtils::toLower(argv[++i]);
+        } else if (arg == "--export-preprocessed-path" && i + 1 < argc) {
+            config.exportPreprocessedPath = argv[++i];
         } else if (arg == "--delimiter" && i + 1 < argc) {
             std::string v = argv[++i];
             if (v.size() != 1) throw Seldon::ConfigurationException("--delimiter expects a single character");
@@ -494,6 +620,46 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.neuralValidationLossEmaBeta = parseDoubleStrict(argv[++i], "--neural-validation-loss-ema-beta", 0.0);
         } else if (arg == "--neural-categorical-input-l2-boost" && i + 1 < argc) {
             config.neuralCategoricalInputL2Boost = parseDoubleStrict(argv[++i], "--neural-categorical-input-l2-boost", 0.0);
+        } else if (arg == "--neural-learning-rate" && i + 1 < argc) {
+            config.neuralLearningRate = parseDoubleStrict(argv[++i], "--neural-learning-rate", 1e-8);
+        } else if (arg == "--neural-min-layers" && i + 1 < argc) {
+            config.neuralMinLayers = parseIntStrict(argv[++i], "--neural-min-layers", 1);
+        } else if (arg == "--neural-max-layers" && i + 1 < argc) {
+            config.neuralMaxLayers = parseIntStrict(argv[++i], "--neural-max-layers", 1);
+        } else if (arg == "--neural-fixed-layers" && i + 1 < argc) {
+            config.neuralFixedLayers = parseIntStrict(argv[++i], "--neural-fixed-layers", 0);
+        } else if (arg == "--neural-fixed-hidden-nodes" && i + 1 < argc) {
+            config.neuralFixedHiddenNodes = parseIntStrict(argv[++i], "--neural-fixed-hidden-nodes", 0);
+        } else if (arg == "--neural-max-hidden-nodes" && i + 1 < argc) {
+            config.neuralMaxHiddenNodes = parseIntStrict(argv[++i], "--neural-max-hidden-nodes", 4);
+        } else if (arg == "--neural-streaming-mode" && i + 1 < argc) {
+            config.neuralStreamingMode = parseBoolStrict(argv[++i], "--neural-streaming-mode");
+        } else if (arg == "--neural-streaming-chunk-rows" && i + 1 < argc) {
+            config.neuralStreamingChunkRows = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-streaming-chunk-rows", 16));
+        } else if (arg == "--neural-multi-output" && i + 1 < argc) {
+            config.neuralMultiOutput = parseBoolStrict(argv[++i], "--neural-multi-output");
+        } else if (arg == "--neural-max-aux-targets" && i + 1 < argc) {
+            config.neuralMaxAuxTargets = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-max-aux-targets", 0));
+        } else if (arg == "--neural-explainability" && i + 1 < argc) {
+            config.neuralExplainability = CommonUtils::toLower(argv[++i]);
+        } else if (arg == "--neural-integrated-grad-steps" && i + 1 < argc) {
+            config.neuralIntegratedGradSteps = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-integrated-grad-steps", 4));
+        } else if (arg == "--neural-uncertainty-samples" && i + 1 < argc) {
+            config.neuralUncertaintySamples = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-uncertainty-samples", 4));
+        } else if (arg == "--neural-importance-parallel" && i + 1 < argc) {
+            config.neuralImportanceParallel = parseBoolStrict(argv[++i], "--neural-importance-parallel");
+        } else if (arg == "--neural-importance-max-rows" && i + 1 < argc) {
+            config.neuralImportanceMaxRows = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-importance-max-rows", 128));
+        } else if (arg == "--neural-importance-trials" && i + 1 < argc) {
+            config.neuralImportanceTrials = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-importance-trials", 0));
+        } else if (arg == "--feature-engineering-enable-poly" && i + 1 < argc) {
+            config.featureEngineeringEnablePoly = parseBoolStrict(argv[++i], "--feature-engineering-enable-poly");
+        } else if (arg == "--feature-engineering-enable-log" && i + 1 < argc) {
+            config.featureEngineeringEnableLog = parseBoolStrict(argv[++i], "--feature-engineering-enable-log");
+        } else if (arg == "--feature-engineering-degree" && i + 1 < argc) {
+            config.featureEngineeringDegree = parseIntStrict(argv[++i], "--feature-engineering-degree", 1);
+        } else if (arg == "--feature-engineering-max-base" && i + 1 < argc) {
+            config.featureEngineeringMaxBase = static_cast<size_t>(parseIntStrict(argv[++i], "--feature-engineering-max-base", 2));
         } else if (arg == "--max-feature-missing-ratio" && i + 1 < argc) {
             config.maxFeatureMissingRatio = parseDoubleStrict(argv[++i], "--max-feature-missing-ratio", -1.0);
             if (config.maxFeatureMissingRatio > 1.0 || config.maxFeatureMissingRatio < -1.0) {
@@ -560,6 +726,8 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
         config = fromFile(configPath, config);
         if (config.datasetPath.empty()) config.datasetPath = argv[1];
     }
+
+    applyProfile(config, config.profile);
 
     config.validate();
 
@@ -686,6 +854,18 @@ void AutoConfig::validate() const {
     if (!isIn(plot.format, {"png", "svg", "pdf"})) {
         throw Seldon::ConfigurationException("plot_format must be one of: png, svg, pdf");
     }
+    if (!isIn(profile, {"auto", "quick", "thorough", "minimal"})) {
+        throw Seldon::ConfigurationException("profile must be one of: auto, quick, thorough, minimal");
+    }
+    if (!isIn(datetimeLocaleHint, {"auto", "dmy", "mdy"})) {
+        throw Seldon::ConfigurationException("datetime_locale_hint must be one of: auto, dmy, mdy");
+    }
+    if (!isIn(numericLocaleHint, {"auto", "us", "eu"})) {
+        throw Seldon::ConfigurationException("numeric_locale_hint must be one of: auto, us, eu");
+    }
+    if (!isIn(exportPreprocessed, {"none", "csv", "parquet"})) {
+        throw Seldon::ConfigurationException("export_preprocessed must be one of: none, csv, parquet");
+    }
     if (!isIn(plot.theme, {"auto", "light", "dark"})) {
         throw Seldon::ConfigurationException("plot_theme must be one of: auto, light, dark");
     }
@@ -720,6 +900,9 @@ void AutoConfig::validate() const {
     if (!isIn(neuralLookaheadFastOptimizer, {"sgd", "adam"})) {
         throw Seldon::ConfigurationException("neural_lookahead_fast_optimizer must be one of: sgd, adam");
     }
+    if (!isIn(neuralExplainability, {"permutation", "integrated_gradients", "shap", "hybrid"})) {
+        throw Seldon::ConfigurationException("neural_explainability must be one of: permutation, integrated_gradients, shap, hybrid");
+    }
 
     if (neuralLookaheadAlpha < 0.0 || neuralLookaheadAlpha > 1.0) {
         throw Seldon::ConfigurationException("neural_lookahead_alpha must be within [0,1]");
@@ -732,6 +915,39 @@ void AutoConfig::validate() const {
     }
     if (neuralValidationLossEmaBeta < 0.0 || neuralValidationLossEmaBeta >= 1.0) {
         throw Seldon::ConfigurationException("neural_validation_loss_ema_beta must be within [0,1)");
+    }
+    if (neuralLearningRate <= 0.0) {
+        throw Seldon::ConfigurationException("neural_learning_rate must be > 0");
+    }
+    if (neuralMinLayers > neuralMaxLayers) {
+        throw Seldon::ConfigurationException("neural_min_layers must be <= neural_max_layers");
+    }
+    if (neuralFixedLayers < 0 || (neuralFixedLayers > 0 && (neuralFixedLayers < neuralMinLayers || neuralFixedLayers > neuralMaxLayers))) {
+        throw Seldon::ConfigurationException("neural_fixed_layers must be 0 or within [neural_min_layers, neural_max_layers]");
+    }
+    if (neuralFixedHiddenNodes < 0) {
+        throw Seldon::ConfigurationException("neural_fixed_hidden_nodes must be >= 0");
+    }
+    if (neuralMaxHiddenNodes < 4) {
+        throw Seldon::ConfigurationException("neural_max_hidden_nodes must be >= 4");
+    }
+    if (neuralStreamingChunkRows < 16) {
+        throw Seldon::ConfigurationException("neural_streaming_chunk_rows must be >= 16");
+    }
+    if (neuralIntegratedGradSteps < 4) {
+        throw Seldon::ConfigurationException("neural_integrated_grad_steps must be >= 4");
+    }
+    if (neuralUncertaintySamples < 4) {
+        throw Seldon::ConfigurationException("neural_uncertainty_samples must be >= 4");
+    }
+    if (neuralImportanceMaxRows < 128) {
+        throw Seldon::ConfigurationException("neural_importance_max_rows must be >= 128");
+    }
+    if (featureEngineeringDegree < 1) {
+        throw Seldon::ConfigurationException("feature_engineering_degree must be >= 1");
+    }
+    if (featureEngineeringMaxBase < 2) {
+        throw Seldon::ConfigurationException("feature_engineering_max_base must be >= 2");
     }
 
     tuning.validate();

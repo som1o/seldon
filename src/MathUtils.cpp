@@ -338,7 +338,7 @@ std::optional<double> MathUtils::calculateKendallTau(const std::vector<double>& 
     return static_cast<double>(concordant - discordant) / denom;
 }
 
-std::pair<double, double> MathUtils::simpleLinearRegression(const std::vector<double>& x, const std::vector<double>& y,
+std::pair<double, double> MathUtils::simpleLinearRegression(const std::vector<double>& /*x*/, const std::vector<double>& /*y*/,
                                                             const ColumnStats& statsX, const ColumnStats& statsY, double pearsonR) {
     if (statsX.stddev == 0) return {0.0, 0.0};
     // m = r * (Sy / Sx)

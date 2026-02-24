@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -42,6 +43,22 @@ std::string toFixed(double v, int prec = 4) {
     return os.str();
 }
 
+void printProgressBar(const std::string& label, size_t current, size_t total) {
+    const size_t width = 24;
+    const double ratio = (total == 0) ? 0.0 : std::clamp(static_cast<double>(current) / static_cast<double>(total), 0.0, 1.0);
+    const size_t fill = static_cast<size_t>(std::floor(ratio * static_cast<double>(width)));
+    std::cout << "\r[Seldon] " << label << " [";
+    for (size_t i = 0; i < width; ++i) {
+        if (i < fill) std::cout << '=';
+        else if (i == fill && fill < width) std::cout << '>';
+        else std::cout << ' ';
+    }
+    std::cout << "] " << static_cast<int>(ratio * 100.0) << "%" << std::flush;
+    if (current >= total) {
+        std::cout << "\n";
+    }
+}
+
 bool containsToken(const std::string& text, const std::vector<std::string>& tokens) {
     const std::string lower = CommonUtils::toLower(text);
     for (const auto& token : tokens) {
@@ -56,10 +73,6 @@ bool shouldAddOgive(const std::vector<double>& values, const HeuristicTuningConf
 
 bool shouldAddBoxPlot(const std::vector<double>& values, const HeuristicTuningConfig& tuning, double eps) {
     return PlotHeuristics::shouldAddBoxPlot(values, tuning, eps);
-}
-
-bool shouldAddPieChart(const std::vector<double>& counts, const HeuristicTuningConfig& tuning) {
-    return PlotHeuristics::shouldAddPieChart(counts, tuning);
 }
 
 bool shouldAddConfidenceBand(double r,
@@ -909,12 +922,20 @@ struct NeuralAnalysis {
     double dropoutRate = 0.0;
     int earlyStoppingPatience = 0;
     std::string policyUsed;
+    std::string explainabilityMethod;
+    std::string topology;
     size_t trainingRowsUsed = 0;
     size_t trainingRowsTotal = 0;
+    size_t outputAuxTargets = 0;
     std::vector<double> trainLoss;
     std::vector<double> valLoss;
+    std::vector<double> gradientNorm;
+    std::vector<double> weightStd;
+    std::vector<double> weightMeanAbs;
     std::vector<double> featureImportance;
     double categoricalImportanceShare = 0.0;
+    std::vector<double> uncertaintyStd;
+    std::vector<double> uncertaintyCiWidth;
 };
 
 struct DataHealthSummary {
@@ -1201,24 +1222,11 @@ std::string plotSubdir(const AutoConfig& cfg, const std::string& name) {
 
 void cleanupOutputs(const AutoConfig& config) {
     namespace fs = std::filesystem;
-
-    const std::vector<std::string> rootFiles = {
-        "seldon_report.html",
-        "univariate.html",
-        "bivariate.html",
-        "seldon_model.seldon",
-        "univariate.md",
-        "bivariate.md",
-        "neural_synthesis.md",
-        "final_analysis.md"
-    };
-
     std::error_code ec;
-    for (const auto& f : rootFiles) {
-        fs::remove(f, ec);
+    if (!config.outputDir.empty()) {
+        fs::remove_all(config.outputDir, ec);
+        fs::create_directories(config.outputDir, ec);
     }
-    fs::remove(config.reportFile, ec);
-
     fs::remove_all(config.assetsDir, ec);
     fs::create_directories(config.assetsDir, ec);
 }
@@ -1401,17 +1409,21 @@ void saveGeneratedReports(const AutoConfig& runCfg,
                           const ReportEngine& bivariate,
                           const ReportEngine& neuralReport,
                           const ReportEngine& finalAnalysis) {
-    univariate.save("univariate.md");
-    bivariate.save("bivariate.md");
+    const std::string uniMd = runCfg.outputDir + "/univariate.md";
+    const std::string biMd = runCfg.outputDir + "/bivariate.md";
+    const std::string finalMd = runCfg.outputDir + "/final_analysis.md";
+
+    univariate.save(uniMd);
+    bivariate.save(biMd);
     neuralReport.save(runCfg.reportFile);
-    finalAnalysis.save("final_analysis.md");
+    finalAnalysis.save(finalMd);
 
     if (runCfg.generateHtml) {
         const std::vector<std::pair<std::string, std::string>> conversions = {
-            {"univariate.md", "univariate.html"},
-            {"bivariate.md", "bivariate.html"},
-            {runCfg.reportFile, "neural_synthesis.html"},
-            {"final_analysis.md", "final_analysis.html"}
+            {uniMd, runCfg.outputDir + "/univariate.html"},
+            {biMd, runCfg.outputDir + "/bivariate.html"},
+            {runCfg.reportFile, runCfg.outputDir + "/neural_synthesis.html"},
+            {finalMd, runCfg.outputDir + "/final_analysis.html"}
         };
         for (const auto& [src, dst] : conversions) {
             const std::string cmd = "pandoc \"" + src + "\" -o \"" + dst + "\" --standalone --self-contained > /dev/null 2>&1";
@@ -1422,14 +1434,71 @@ void saveGeneratedReports(const AutoConfig& runCfg,
 
 void printPipelineCompletion(const AutoConfig& runCfg) {
     std::cout << "[Seldon] Automated pipeline complete.\n";
-    std::cout << "[Seldon] Reports: univariate.md, bivariate.md, " << runCfg.reportFile << ", final_analysis.md\n";
+    std::cout << "[Seldon] Report directory: " << runCfg.outputDir << "\n";
+    std::cout << "[Seldon] Reports: "
+              << runCfg.outputDir << "/univariate.md, "
+              << runCfg.outputDir << "/bivariate.md, "
+              << runCfg.reportFile << ", "
+              << runCfg.outputDir << "/final_analysis.md\n";
     if (runCfg.generateHtml) {
-        std::cout << "[Seldon] HTML reports (self-contained): univariate.html, bivariate.html, neural_synthesis.html, final_analysis.html\n";
+        std::cout << "[Seldon] HTML reports (self-contained): "
+                  << runCfg.outputDir << "/univariate.html, "
+                  << runCfg.outputDir << "/bivariate.html, "
+                  << runCfg.outputDir << "/neural_synthesis.html, "
+                  << runCfg.outputDir << "/final_analysis.html\n";
     }
     std::cout << "[Seldon] Plot folders: "
               << plotSubdir(runCfg, "univariate") << ", "
               << plotSubdir(runCfg, "bivariate") << ", "
               << plotSubdir(runCfg, "overall") << "\n";
+}
+
+void exportPreprocessedDatasetIfRequested(const TypedDataset& data, const AutoConfig& runCfg) {
+    if (runCfg.exportPreprocessed == "none") return;
+
+    const std::string basePath = runCfg.exportPreprocessedPath.empty()
+        ? (runCfg.outputDir + "/preprocessed")
+        : runCfg.exportPreprocessedPath;
+    const std::string csvPath = basePath + ".csv";
+
+    std::ofstream out(csvPath);
+    if (!out) {
+        throw Seldon::IOException("Unable to write preprocessed export: " + csvPath);
+    }
+
+    for (size_t c = 0; c < data.columns().size(); ++c) {
+        if (c) out << ',';
+        out << '"' << data.columns()[c].name << '"';
+    }
+    out << '\n';
+
+    for (size_t r = 0; r < data.rowCount(); ++r) {
+        for (size_t c = 0; c < data.columns().size(); ++c) {
+            if (c) out << ',';
+            if (data.columns()[c].missing[r]) {
+                out << "";
+                continue;
+            }
+            if (data.columns()[c].type == ColumnType::NUMERIC) {
+                const auto& vals = std::get<std::vector<double>>(data.columns()[c].values);
+                out << vals[r];
+            } else if (data.columns()[c].type == ColumnType::DATETIME) {
+                const auto& vals = std::get<std::vector<int64_t>>(data.columns()[c].values);
+                out << vals[r];
+            } else {
+                std::string s = std::get<std::vector<std::string>>(data.columns()[c].values)[r];
+                std::replace(s.begin(), s.end(), '"', '\'');
+                out << '"' << s << '"';
+            }
+        }
+        out << '\n';
+    }
+
+    if (runCfg.exportPreprocessed == "parquet") {
+        const std::string parquetPath = basePath + ".parquet";
+        const std::string cmd = "python3 -c \"import pandas as pd; df=pd.read_csv('" + csvPath + "'); df.to_parquet('" + parquetPath + "', index=False)\" > /dev/null 2>&1";
+        std::system(cmd.c_str());
+    }
 }
 
 void addUnivariateDetailedSection(ReportEngine& report,
@@ -1709,13 +1778,45 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
 
     const auto& y = std::get<std::vector<double>>(data.columns()[targetIdx].values);
 
+    std::vector<int> targetIndices;
+    targetIndices.push_back(targetIdx);
+    if (config.neuralMultiOutput && config.neuralMaxAuxTargets > 0) {
+        const auto numericIdx = data.numericColumnIndices();
+        std::vector<std::pair<int, double>> candidates;
+        candidates.reserve(numericIdx.size());
+        const ColumnStats yStats = Statistics::calculateStats(y);
+        for (size_t idx : numericIdx) {
+            if (static_cast<int>(idx) == targetIdx) continue;
+            const auto& cand = std::get<std::vector<double>>(data.columns()[idx].values);
+            const ColumnStats cStats = Statistics::calculateStats(cand);
+            const double corr = std::abs(MathUtils::calculatePearson(cand, y, cStats, yStats).value_or(0.0));
+            if (std::isfinite(corr)) {
+                candidates.push_back({static_cast<int>(idx), corr});
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+            if (a.second == b.second) return a.first < b.first;
+            return a.second > b.second;
+        });
+        const size_t keep = std::min(config.neuralMaxAuxTargets, candidates.size());
+        for (size_t i = 0; i < keep; ++i) {
+            targetIndices.push_back(candidates[i].first);
+        }
+    }
+
     EncodedNeuralMatrix encoded = buildEncodedNeuralInputs(data, targetIdx, featureIdx, config);
     std::vector<std::vector<double>> Xnn = std::move(encoded.X);
-    std::vector<std::vector<double>> Ynn(data.rowCount(), std::vector<double>(1, 0.0));
+    std::vector<std::vector<double>> Ynn(data.rowCount(), std::vector<double>(targetIndices.size(), 0.0));
 
     for (size_t r = 0; r < data.rowCount(); ++r) {
-        Ynn[r][0] = y[r];
+        for (size_t t = 0; t < targetIndices.size(); ++t) {
+            const int idx = targetIndices[t];
+            const auto& targetVals = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
+            Ynn[r][t] = (r < targetVals.size()) ? targetVals[r] : 0.0;
+        }
     }
+
+    analysis.outputAuxTargets = (targetIndices.size() > 1) ? (targetIndices.size() - 1) : 0;
 
     size_t inputNodes = Xnn.empty() ? 0 : Xnn.front().size();
     analysis.inputNodes = inputNodes;
@@ -1820,7 +1921,87 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         return analysis;
     }
 
-    size_t outputNodes = 1;
+    size_t outputNodes = std::max<size_t>(1, Ynn.empty() ? 1 : Ynn.front().size());
+
+    if (inputNodes >= 48 && Xnn.size() >= 64) {
+        const size_t probeRows = std::min<size_t>(Xnn.size(), std::max<size_t>(256, std::min<size_t>(config.neuralImportanceMaxRows, static_cast<size_t>(2000))));
+        std::vector<size_t> probeOrder(Xnn.size());
+        std::iota(probeOrder.begin(), probeOrder.end(), 0);
+        std::mt19937 probeRng(config.neuralSeed ^ 0x85ebca6bU);
+        std::shuffle(probeOrder.begin(), probeOrder.end(), probeRng);
+
+        std::vector<std::vector<double>> probeX;
+        std::vector<std::vector<double>> probeY;
+        probeX.reserve(probeRows);
+        probeY.reserve(probeRows);
+        for (size_t i = 0; i < probeRows; ++i) {
+            probeX.push_back(Xnn[probeOrder[i]]);
+            probeY.push_back(Ynn[probeOrder[i]]);
+        }
+
+        const size_t probeHidden = std::clamp<size_t>(static_cast<size_t>(std::sqrt(static_cast<double>(std::max<size_t>(1, inputNodes)))), 8, 48);
+        NeuralNet probeNet({inputNodes, probeHidden, outputNodes});
+        NeuralNet::Hyperparameters probeHp;
+        probeHp.epochs = std::min<size_t>(60, std::max<size_t>(24, 8 + probeRows / 20));
+        probeHp.batchSize = std::clamp<size_t>(probeRows / 16, 8, 64);
+        probeHp.learningRate = config.neuralLearningRate;
+        probeHp.dropoutRate = 0.05;
+        probeHp.valSplit = 0.2;
+        probeHp.earlyStoppingPatience = 6;
+        probeHp.activation = NeuralNet::Activation::RELU;
+        probeHp.outputActivation = (outputNodes == 1 && binaryTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
+        probeHp.loss = (outputNodes == 1 && binaryTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
+        probeHp.verbose = false;
+        probeHp.seed = config.neuralSeed + 17;
+        probeHp.importanceMaxRows = std::min<size_t>(config.neuralImportanceMaxRows, 2000);
+        probeHp.importanceParallel = config.neuralImportanceParallel;
+        probeNet.train(probeX, probeY, probeHp);
+
+        const std::vector<double> probeImportance = probeNet.calculateFeatureImportance(
+            probeX,
+            probeY,
+            3,
+            std::min<size_t>(config.neuralImportanceMaxRows, 2000),
+            config.neuralImportanceParallel);
+
+        const size_t retainCap = std::clamp<size_t>(std::max<size_t>(24, data.rowCount() / 3), 24, inputNodes);
+        if (retainCap < inputNodes && probeImportance.size() == inputNodes) {
+            std::vector<std::pair<size_t, double>> ranked;
+            ranked.reserve(inputNodes);
+            for (size_t i = 0; i < inputNodes; ++i) ranked.push_back({i, probeImportance[i]});
+            std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                if (a.second == b.second) return a.first < b.first;
+                return a.second > b.second;
+            });
+            ranked.resize(retainCap);
+            std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+            std::vector<std::vector<double>> prunedX(Xnn.size(), std::vector<double>{});
+            for (size_t r = 0; r < Xnn.size(); ++r) {
+                prunedX[r].reserve(retainCap);
+                for (const auto& kv : ranked) prunedX[r].push_back(Xnn[r][kv.first]);
+            }
+
+            std::vector<int> prunedSource;
+            prunedSource.reserve(retainCap);
+            for (const auto& kv : ranked) {
+                const size_t idx = kv.first;
+                prunedSource.push_back((idx < encoded.sourceNumericFeaturePos.size()) ? encoded.sourceNumericFeaturePos[idx] : -1);
+            }
+
+            Xnn = std::move(prunedX);
+            encoded.sourceNumericFeaturePos = std::move(prunedSource);
+            inputNodes = Xnn.empty() ? 0 : Xnn.front().size();
+            analysis.inputNodes = inputNodes;
+        }
+    }
+
+    if (inputNodes == 0) {
+        analysis.policyUsed = "none_after_pruning";
+        analysis.featureImportance.assign(featureIdx.size(), 0.0);
+        analysis.trainingRowsUsed = data.rowCount();
+        return analysis;
+    }
     size_t baseHidden = std::clamp<size_t>(
         static_cast<size_t>(std::llround(std::sqrt(static_cast<double>(std::max<size_t>(1, inputNodes) * std::max<size_t>(8, data.rowCount() / 6))))),
         4,
@@ -1888,7 +2069,9 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         Ynn = std::move(sampledY);
     }
 
-    size_t hidden = std::clamp<size_t>(static_cast<size_t>(std::llround(static_cast<double>(baseHidden) * policy.hiddenMultiplier)), 4, 96);
+    size_t hidden = std::clamp<size_t>(static_cast<size_t>(std::llround(static_cast<double>(baseHidden) * policy.hiddenMultiplier)),
+                                       4,
+                                       static_cast<size_t>(std::max(4, config.neuralMaxHiddenNodes)));
     size_t dynamicEpochs = std::clamp<size_t>(static_cast<size_t>(std::llround(static_cast<double>(baseEpochs) * policy.epochMultiplier)), 80, 420);
     size_t dynamicBatch = std::clamp<size_t>(static_cast<size_t>(std::llround(static_cast<double>(baseBatch) * policy.batchMultiplier)), 8, 128);
     int dynamicPatience = std::clamp(basePatience + policy.patienceDelta, 6, 40);
@@ -1909,7 +2092,31 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         dynamicDropout = std::max(dynamicDropout, 0.12);
     }
 
-    NeuralNet nn({inputNodes, hidden, outputNodes});
+    size_t hiddenLayers = 1;
+    if (config.neuralFixedLayers > 0) {
+        hiddenLayers = static_cast<size_t>(config.neuralFixedLayers);
+    } else {
+        hiddenLayers = static_cast<size_t>(std::clamp<int>(
+            1 + ((inputNodes > 24) ? 1 : 0) + ((outputNodes > 1) ? 1 : 0) + ((policyName == "expressive") ? 1 : 0),
+            config.neuralMinLayers,
+            config.neuralMaxLayers));
+    }
+
+    if (config.neuralFixedHiddenNodes > 0) {
+        hidden = static_cast<size_t>(config.neuralFixedHiddenNodes);
+    }
+
+    std::vector<size_t> topology;
+    topology.reserve(hiddenLayers + 2);
+    topology.push_back(inputNodes);
+    for (size_t l = 0; l < hiddenLayers; ++l) {
+        const double decay = std::pow(0.75, static_cast<double>(l));
+        const size_t width = std::clamp<size_t>(static_cast<size_t>(std::llround(static_cast<double>(hidden) * decay)), 4, static_cast<size_t>(std::max(4, config.neuralMaxHiddenNodes)));
+        topology.push_back(width);
+    }
+    topology.push_back(outputNodes);
+
+    NeuralNet nn(topology);
     NeuralNet::Hyperparameters hp;
 
     auto toOptimizer = [](const std::string& name) {
@@ -1921,6 +2128,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
 
     hp.epochs = dynamicEpochs;
     hp.batchSize = dynamicBatch;
+    hp.learningRate = config.neuralLearningRate;
     hp.earlyStoppingPatience = dynamicPatience;
     hp.lrDecay = config.neuralLrDecay;
     hp.lrPlateauPatience = config.neuralLrPlateauPatience;
@@ -1938,8 +2146,10 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     hp.valSplit = std::clamp(desiredValSplit, 0.10, 0.40);
     hp.l2Lambda = (Xnn.size() < 80) ? 0.010 : 0.001;
     hp.categoricalInputL2Boost = config.neuralCategoricalInputL2Boost;
-    hp.activation = NeuralNet::Activation::GELU;
-    hp.outputActivation = binaryTarget ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
+    if (policyName == "fast") hp.activation = NeuralNet::Activation::RELU;
+    else if (policyName == "expressive") hp.activation = NeuralNet::Activation::GELU;
+    else hp.activation = (inputNodes < 10) ? NeuralNet::Activation::TANH : NeuralNet::Activation::GELU;
+    hp.outputActivation = (outputNodes == 1 && binaryTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
     hp.useBatchNorm = config.neuralUseBatchNorm;
     hp.batchNormMomentum = config.neuralBatchNormMomentum;
     hp.batchNormEpsilon = config.neuralBatchNormEpsilon;
@@ -1949,7 +2159,9 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     hp.lookaheadFastOptimizer = toOptimizer(config.neuralLookaheadFastOptimizer);
     hp.lookaheadSyncPeriod = static_cast<size_t>(std::max(1, config.neuralLookaheadSyncPeriod));
     hp.lookaheadAlpha = config.neuralLookaheadAlpha;
-    hp.loss = binaryTarget ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
+    hp.loss = (outputNodes == 1 && binaryTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
+    hp.importanceMaxRows = config.neuralImportanceMaxRows;
+    hp.importanceParallel = config.neuralImportanceParallel;
     hp.verbose = verbose;
     hp.seed = config.neuralSeed;
     hp.gradientClipNorm = config.gradientClipNorm;
@@ -1960,14 +2172,101 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
             inputL2Scales[i] = hp.categoricalInputL2Boost;
         }
     }
+
+    auto buildTopology = [&](size_t layers, size_t firstHidden) {
+        std::vector<size_t> topo;
+        topo.reserve(layers + 2);
+        topo.push_back(inputNodes);
+        for (size_t l = 0; l < layers; ++l) {
+            const double decay = std::pow(0.75, static_cast<double>(l));
+            const size_t width = std::clamp<size_t>(
+                static_cast<size_t>(std::llround(static_cast<double>(firstHidden) * decay)),
+                4,
+                static_cast<size_t>(std::max(4, config.neuralMaxHiddenNodes)));
+            topo.push_back(width);
+        }
+        topo.push_back(outputNodes);
+        return topo;
+    };
+
+    if (requested == "auto" && config.neuralFixedLayers == 0 && config.neuralFixedHiddenNodes == 0 && Xnn.size() >= 64) {
+        struct ArchCandidate {
+            size_t layers;
+            size_t hidden;
+            NeuralNet::Activation activation;
+            double dropout;
+        };
+
+        std::vector<ArchCandidate> candidates = {
+            {hiddenLayers, hidden, hp.activation, hp.dropoutRate},
+            {std::clamp<size_t>(hiddenLayers + 1, static_cast<size_t>(config.neuralMinLayers), static_cast<size_t>(config.neuralMaxLayers)), std::min<size_t>(hidden + hidden / 4, static_cast<size_t>(std::max(4, config.neuralMaxHiddenNodes))), NeuralNet::Activation::GELU, std::clamp(hp.dropoutRate + 0.04, 0.0, 0.40)},
+            {std::max<size_t>(1, hiddenLayers), std::max<size_t>(4, hidden - hidden / 5), NeuralNet::Activation::RELU, std::max(0.0, hp.dropoutRate - 0.03)}
+        };
+
+        const size_t searchRows = std::min<size_t>(Xnn.size(), 2000);
+        std::vector<size_t> order(Xnn.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::mt19937 searchRng(config.neuralSeed ^ 0xc2b2ae35U);
+        std::shuffle(order.begin(), order.end(), searchRng);
+
+        std::vector<std::vector<double>> searchX;
+        std::vector<std::vector<double>> searchY;
+        searchX.reserve(searchRows);
+        searchY.reserve(searchRows);
+        for (size_t i = 0; i < searchRows; ++i) {
+            searchX.push_back(Xnn[order[i]]);
+            searchY.push_back(Ynn[order[i]]);
+        }
+
+        double bestScore = std::numeric_limits<double>::infinity();
+        ArchCandidate best = candidates.front();
+
+        for (size_t c = 0; c < candidates.size(); ++c) {
+            const auto& cand = candidates[c];
+            NeuralNet candidateNet(buildTopology(cand.layers, cand.hidden));
+            candidateNet.setInputL2Scales(inputL2Scales);
+
+            NeuralNet::Hyperparameters chp = hp;
+            chp.epochs = std::min<size_t>(60, std::max<size_t>(24, hp.epochs / 4));
+            chp.earlyStoppingPatience = std::min(10, hp.earlyStoppingPatience);
+            chp.batchSize = std::min<size_t>(hp.batchSize, 64);
+            chp.activation = cand.activation;
+            chp.dropoutRate = cand.dropout;
+            chp.verbose = false;
+            chp.seed = config.neuralSeed + static_cast<uint32_t>(31 + c * 13);
+            candidateNet.train(searchX, searchY, chp);
+
+            const auto& vloss = candidateNet.getValLossHistory();
+            const auto& tloss = candidateNet.getTrainLossHistory();
+            const double score = !vloss.empty()
+                ? vloss.back()
+                : (!tloss.empty() ? tloss.back() : std::numeric_limits<double>::infinity());
+            if (score < bestScore) {
+                bestScore = score;
+                best = cand;
+            }
+        }
+
+        hiddenLayers = best.layers;
+        hidden = best.hidden;
+        hp.activation = best.activation;
+        hp.dropoutRate = best.dropout;
+        topology = buildTopology(hiddenLayers, hidden);
+        nn = NeuralNet(topology);
+    }
+
     nn.setInputL2Scales(inputL2Scales);
 
-    nn.train(Xnn, Ynn, hp);
+    if (config.neuralStreamingMode) {
+        nn.trainIncremental(Xnn, Ynn, hp, std::max<size_t>(16, config.neuralStreamingChunkRows));
+    } else {
+        nn.train(Xnn, Ynn, hp);
+    }
 
     analysis.inputNodes = inputNodes;
     analysis.hiddenNodes = hidden;
     analysis.outputNodes = outputNodes;
-    analysis.binaryTarget = binaryTarget;
+    analysis.binaryTarget = (outputNodes == 1 && binaryTarget);
     analysis.hiddenActivation = activationToString(hp.activation);
     analysis.outputActivation = activationToString(hp.outputActivation);
     analysis.epochs = hp.epochs;
@@ -1977,10 +2276,85 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     analysis.dropoutRate = hp.dropoutRate;
     analysis.earlyStoppingPatience = hp.earlyStoppingPatience;
     analysis.policyUsed = policy.name;
+    analysis.explainabilityMethod = config.neuralExplainability;
     analysis.trainingRowsUsed = Xnn.size();
+    {
+        std::ostringstream topo;
+        for (size_t i = 0; i < topology.size(); ++i) {
+            if (i > 0) topo << " -> ";
+            topo << topology[i];
+        }
+        analysis.topology = topo.str();
+    }
     analysis.trainLoss = nn.getTrainLossHistory();
     analysis.valLoss = nn.getValLossHistory();
-    const std::vector<double> rawImportance = nn.calculateFeatureImportance(Xnn, Ynn, inputNodes > 10 ? 7 : 5);
+    analysis.gradientNorm = nn.getGradientNormHistory();
+    analysis.weightStd = nn.getWeightStdHistory();
+    analysis.weightMeanAbs = nn.getWeightMeanAbsHistory();
+
+    const size_t importanceTrials = (config.neuralImportanceTrials > 0)
+        ? config.neuralImportanceTrials
+        : static_cast<size_t>(inputNodes > 10 ? 7 : 5);
+
+    std::vector<double> rawImportance;
+    const std::string explainability = CommonUtils::toLower(config.neuralExplainability);
+    if (explainability == "integrated_gradients") {
+        rawImportance = nn.calculateIntegratedGradients(Xnn,
+                                                        config.neuralIntegratedGradSteps,
+                                                        config.neuralImportanceMaxRows);
+    } else if (explainability == "shap") {
+        rawImportance = nn.calculateShapApprox(Xnn,
+                                               std::max<size_t>(8, config.neuralIntegratedGradSteps),
+                                               std::min<size_t>(config.neuralImportanceMaxRows, static_cast<size_t>(1200)));
+    } else if (explainability == "hybrid") {
+        const std::vector<double> perm = nn.calculateFeatureImportance(Xnn,
+                                                                        Ynn,
+                                                                        importanceTrials,
+                                                                        config.neuralImportanceMaxRows,
+                                                                        config.neuralImportanceParallel);
+        const std::vector<double> ig = nn.calculateIntegratedGradients(Xnn,
+                                                                        config.neuralIntegratedGradSteps,
+                                                                        config.neuralImportanceMaxRows);
+        const std::vector<double> shap = nn.calculateShapApprox(Xnn,
+                                                                 std::max<size_t>(8, config.neuralIntegratedGradSteps),
+                                                                 std::min<size_t>(config.neuralImportanceMaxRows, static_cast<size_t>(1200)));
+        rawImportance.assign(std::max({perm.size(), ig.size(), shap.size()}), 0.0);
+        for (size_t i = 0; i < rawImportance.size(); ++i) {
+            const double p = (i < perm.size()) ? perm[i] : 0.0;
+            const double g = (i < ig.size()) ? ig[i] : 0.0;
+            const double s = (i < shap.size()) ? shap[i] : 0.0;
+            rawImportance[i] = 0.50 * p + 0.30 * g + 0.20 * s;
+        }
+    } else {
+        rawImportance = nn.calculateFeatureImportance(Xnn,
+                                                      Ynn,
+                                                      importanceTrials,
+                                                      config.neuralImportanceMaxRows,
+                                                      config.neuralImportanceParallel);
+    }
+
+    if (!Xnn.empty()) {
+        const size_t uncertaintyRows = std::min<size_t>(std::min<size_t>(Xnn.size(), 128), static_cast<size_t>(512));
+        std::vector<double> outStd(outputNodes, 0.0);
+        std::vector<double> outCiWidth(outputNodes, 0.0);
+        for (size_t r = 0; r < uncertaintyRows; ++r) {
+            const auto unc = nn.predictWithUncertainty(Xnn[r], config.neuralUncertaintySamples, hp.dropoutRate);
+            for (size_t j = 0; j < outputNodes && j < unc.stddev.size(); ++j) {
+                outStd[j] += unc.stddev[j];
+                const double width = (j < unc.ciLow.size() && j < unc.ciHigh.size()) ? (unc.ciHigh[j] - unc.ciLow[j]) : 0.0;
+                outCiWidth[j] += width;
+            }
+        }
+        if (uncertaintyRows > 0) {
+            for (size_t j = 0; j < outputNodes; ++j) {
+                outStd[j] /= static_cast<double>(uncertaintyRows);
+                outCiWidth[j] /= static_cast<double>(uncertaintyRows);
+            }
+        }
+        analysis.uncertaintyStd = std::move(outStd);
+        analysis.uncertaintyCiWidth = std::move(outCiWidth);
+    }
+
     analysis.featureImportance.assign(featureIdx.size(), 0.0);
 
     double totalImportance = 0.0;
@@ -2281,7 +2655,10 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     };
 
     if (verbose) {
-        appendPairsForRange(0, evalNumericIdx.size(), pairs, true);
+        for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
+            appendPairsForRange(aPos, aPos + 1, pairs, true);
+            printProgressBar("pair-generation", aPos + 1, evalNumericIdx.size());
+        }
     } else {
         #ifdef USE_OPENMP
         const int threadCount = std::max(1, omp_get_max_threads());
@@ -2301,8 +2678,14 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         for (auto& local : threadPairs) {
             pairs.insert(pairs.end(), local.begin(), local.end());
         }
+        printProgressBar("pair-generation", evalNumericIdx.size(), evalNumericIdx.size());
         #else
-        appendPairsForRange(0, evalNumericIdx.size(), pairs, false);
+        for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
+            appendPairsForRange(aPos, aPos + 1, pairs, false);
+            if (((aPos + 1) % std::max<size_t>(1, evalNumericIdx.size() / 20)) == 0 || (aPos + 1) == evalNumericIdx.size()) {
+                printProgressBar("pair-generation", aPos + 1, evalNumericIdx.size());
+            }
+        }
         #endif
     }
 
@@ -2485,7 +2868,6 @@ std::vector<ContingencyInsight> analyzeContingencyPairs(const TypedDataset& data
                     chi2 += (d * d) / expected;
                 }
             }
-            const size_t df = (R - 1) * (C - 1);
             const double p = std::exp(-0.5 * chi2); // simple approximation
             const double v = std::sqrt(std::max(0.0, chi2 / (total * static_cast<double>(std::min(R - 1, C - 1)))));
 
@@ -2581,7 +2963,9 @@ std::vector<AnovaInsight> analyzeAnovaPairs(const TypedDataset& data) {
 std::pair<double, double> bootstrapCI(const std::vector<double>& values,
                                       size_t rounds = 300,
                                       double alpha = 0.05,
-                                      uint32_t seed = 1337) {
+                                      uint32_t seed = 1337,
+                                      bool showProgress = false,
+                                      const std::string& label = "bootstrap") {
     if (values.empty()) return {0.0, 0.0};
     std::mt19937 rng(seed);
     std::uniform_int_distribution<size_t> pick(0, values.size() - 1);
@@ -2591,6 +2975,9 @@ std::pair<double, double> bootstrapCI(const std::vector<double>& values,
         double sum = 0.0;
         for (size_t i = 0; i < values.size(); ++i) sum += values[pick(rng)];
         stats.push_back(sum / static_cast<double>(values.size()));
+        if (showProgress && (((b + 1) % std::max<size_t>(1, rounds / 25)) == 0 || (b + 1) == rounds)) {
+            printProgressBar(label, b + 1, rounds);
+        }
     }
     std::sort(stats.begin(), stats.end());
     const double lo = CommonUtils::quantileByNth(stats, alpha / 2.0);
@@ -2828,6 +3215,31 @@ void addOverallSections(ReportEngine& report,
     report.addParagraph("Data Health summarizes how much usable signal the engine found after preprocessing, feature selection, statistical filtering, and neural convergence checks.");
     addDatasetHealthTable(report, data, prep, health);
 
+    {
+        std::vector<std::vector<std::string>> typeSummary = {
+            {"numeric", std::to_string(data.numericColumnIndices().size())},
+            {"categorical", std::to_string(data.categoricalColumnIndices().size())},
+            {"datetime", std::to_string(data.datetimeColumnIndices().size())}
+        };
+        report.addTable("Data Type Summary", {"Type", "Columns"}, typeSummary);
+
+        std::vector<std::vector<std::string>> qualityRows;
+        qualityRows.reserve(data.columns().size());
+        for (const auto& col : data.columns()) {
+            const size_t miss = prep.missingCounts.count(col.name) ? prep.missingCounts.at(col.name) : 0;
+            const size_t outliers = prep.outlierCounts.count(col.name) ? prep.outlierCounts.at(col.name) : 0;
+            const double missPct = data.rowCount() == 0 ? 0.0 : (100.0 * static_cast<double>(miss) / static_cast<double>(data.rowCount()));
+            qualityRows.push_back({
+                col.name,
+                col.type == ColumnType::NUMERIC ? "numeric" : (col.type == ColumnType::DATETIME ? "datetime" : "categorical"),
+                std::to_string(miss),
+                toFixed(missPct, 2) + "%",
+                std::to_string(outliers)
+            });
+        }
+        report.addTable("Column Quality Matrix", {"Column", "Type", "Missing", "Missing %", "Outliers"}, qualityRows);
+    }
+
     addBenchmarkSection(report, benchmarks);
     addNeuralLossSummaryTable(report, neural);
 
@@ -2841,6 +3253,11 @@ void addOverallSections(ReportEngine& report,
         }
         std::string missingImg = overallPlotter->bar("overall_missingness", labels, missingCounts, "Overall Missingness by Column");
         if (!missingImg.empty()) report.addImage("Overall Missingness", missingImg);
+
+        std::vector<std::vector<double>> missHeat(1, std::vector<double>(missingCounts.size(), 0.0));
+        for (size_t i = 0; i < missingCounts.size(); ++i) missHeat[0][i] = missingCounts[i];
+        std::string missHeatImg = overallPlotter->heatmap("overall_missingness_heatmap", missHeat, "Missingness Heatmap", labels);
+        if (!missHeatImg.empty()) report.addImage("Missingness Heatmap", missHeatImg);
 
         if (auto timeline = detectProjectTimeline(data, config.tuning); timeline.has_value()) {
             std::string gantt = overallPlotter->gantt("overall_project_timeline",
@@ -2920,6 +3337,32 @@ void addOverallSections(ReportEngine& report,
                 std::string trainImg = overallPlotter->line("overall_nn_train_loss", epochs, neural.trainLoss, "NN Train Loss");
                 if (!trainImg.empty()) report.addImage("Overall NN Train Loss", trainImg);
             }
+        }
+
+        if (!neural.gradientNorm.empty()) {
+            std::vector<double> x(neural.gradientNorm.size(), 0.0);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = static_cast<double>(i + 1);
+            std::string gradImg = overallPlotter->line("overall_nn_gradient_norm", x, neural.gradientNorm, "NN Gradient Norm");
+            if (!gradImg.empty()) report.addImage("Overall NN Gradient Norm", gradImg);
+        }
+
+        if (!neural.weightStd.empty() || !neural.weightMeanAbs.empty()) {
+            const size_t n = std::max(neural.weightStd.size(), neural.weightMeanAbs.size());
+            std::vector<double> x(n, 0.0);
+            for (size_t i = 0; i < n; ++i) x[i] = static_cast<double>(i + 1);
+            std::vector<double> weightStdSeries(n, 0.0);
+            std::vector<double> weightAbsSeries(n, 0.0);
+            for (size_t i = 0; i < n; ++i) {
+                if (i < neural.weightStd.size()) weightStdSeries[i] = neural.weightStd[i];
+                if (i < neural.weightMeanAbs.size()) weightAbsSeries[i] = neural.weightMeanAbs[i];
+            }
+            std::string weightDyn = overallPlotter->multiLine("overall_nn_weight_dynamics",
+                                                               x,
+                                                               {weightStdSeries, weightAbsSeries},
+                                                               {"Weight RMS", "Weight Mean Abs"},
+                                                               "NN Weight Dynamics",
+                                                               "Value");
+            if (!weightDyn.empty()) report.addImage("Overall NN Weight Dynamics", weightDyn);
         }
 
         auto numericIdxForParallel = data.numericColumnIndices();
@@ -3057,7 +3500,12 @@ void addOverallSections(ReportEngine& report,
             for (size_t idx : data.numericColumnIndices()) {
                 const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
                 if (vals.size() < 20) continue;
-                auto [lo, hi] = bootstrapCI(vals, 250, 0.05, config.neuralSeed ^ static_cast<uint32_t>(idx));
+                auto [lo, hi] = bootstrapCI(vals,
+                                            250,
+                                            0.05,
+                                            config.neuralSeed ^ static_cast<uint32_t>(idx),
+                                            verbose,
+                                            "bootstrap-mean");
                 const double mu = std::accumulate(vals.begin(), vals.end(), 0.0) / static_cast<double>(vals.size());
                 bootRows.push_back({"mean(" + data.columns()[idx].name + ")", toFixed(mu, 6), toFixed(lo, 6), toFixed(hi, 6)});
                 if (bootRows.size() >= 6) break;
@@ -3065,7 +3513,12 @@ void addOverallSections(ReportEngine& report,
             if (!benchmarks.empty()) {
                 std::vector<double> rmseVals;
                 for (const auto& b : benchmarks) rmseVals.push_back(b.rmse);
-                auto [lo, hi] = bootstrapCI(rmseVals, 250, 0.05, config.benchmarkSeed);
+                auto [lo, hi] = bootstrapCI(rmseVals,
+                                            250,
+                                            0.05,
+                                            config.benchmarkSeed,
+                                            verbose,
+                                            "bootstrap-rmse");
                 const double mu = std::accumulate(rmseVals.begin(), rmseVals.end(), 0.0) / static_cast<double>(std::max<size_t>(1, rmseVals.size()));
                 bootRows.push_back({"benchmark_rmse", toFixed(mu, 6), toFixed(lo, 6), toFixed(hi, 6)});
             }
@@ -3098,6 +3551,9 @@ void addOverallSections(ReportEngine& report,
                         const auto fit = MathUtils::simpleLinearRegression(xs, ys, sx, sy, r);
                         corrBoot.push_back(r);
                         slopeBoot.push_back(fit.first);
+                        if (verbose && (((b + 1) % 11) == 0 || (b + 1) == 220)) {
+                            printProgressBar("bootstrap-corr", b + 1, 220);
+                        }
                     }
                     std::sort(corrBoot.begin(), corrBoot.end());
                     std::sort(slopeBoot.begin(), slopeBoot.end());
@@ -3248,6 +3704,18 @@ void addOverallSections(ReportEngine& report,
 int AutomationPipeline::run(const AutoConfig& config) {
     AutoConfig runCfg = config;
     runCfg.plot.format = "png";
+    {
+        namespace fs = std::filesystem;
+        const fs::path datasetPath(runCfg.datasetPath);
+        fs::path baseDir = datasetPath.parent_path();
+        if (baseDir.empty()) baseDir = fs::current_path();
+        const std::string stem = datasetPath.stem().string().empty() ? "dataset" : datasetPath.stem().string();
+        if (runCfg.outputDir.empty()) {
+            runCfg.outputDir = (baseDir / (stem + "_seldon_outputs")).string();
+        }
+        runCfg.assetsDir = (fs::path(runCfg.outputDir) / "seldon_report_assets").string();
+        runCfg.reportFile = (fs::path(runCfg.outputDir) / "neural_synthesis.md").string();
+    }
     CliProgressSpinner progress(true);
     constexpr size_t totalSteps = 10;
     size_t currentStep = 0;
@@ -3265,6 +3733,21 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                 runCfg.tuning.betaFallbackTolerance);
 
     TypedDataset data(config.datasetPath, config.delimiter);
+    if (runCfg.numericLocaleHint == "us") {
+        data.setNumericSeparatorPolicy(TypedDataset::NumericSeparatorPolicy::US_THOUSANDS);
+    } else if (runCfg.numericLocaleHint == "eu") {
+        data.setNumericSeparatorPolicy(TypedDataset::NumericSeparatorPolicy::EUROPEAN);
+    } else {
+        data.setNumericSeparatorPolicy(TypedDataset::NumericSeparatorPolicy::AUTO);
+    }
+
+    if (runCfg.datetimeLocaleHint == "dmy") {
+        data.setDateLocaleHint(TypedDataset::DateLocaleHint::DMY);
+    } else if (runCfg.datetimeLocaleHint == "mdy") {
+        data.setDateLocaleHint(TypedDataset::DateLocaleHint::MDY);
+    } else {
+        data.setDateLocaleHint(TypedDataset::DateLocaleHint::AUTO);
+    }
     data.load();
     advance("Loaded dataset");
     if (data.rowCount() == 0 || data.colCount() == 0) {
@@ -3284,6 +3767,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     PreprocessReport prep = Preprocessor::run(data, runCfg);
     advance("Preprocessed dataset");
+    exportPreprocessedDatasetIfRequested(data, runCfg);
     normalizeBinaryTarget(data, targetIdx, targetContext.semantics);
     const NumericStatsCache statsCache = buildNumericStatsCache(data);
     advance("Prepared stats cache");
@@ -3511,16 +3995,19 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
     neuralReport.addTable("Neural Network Auto-Defaults", {"Setting", "Value"}, {
         {"Neural Policy", neural.policyUsed},
+        {"Topology", neural.topology},
         {"Input Nodes", std::to_string(neural.inputNodes)},
         {"Numeric Input Nodes", std::to_string(neural.numericInputNodes)},
         {"Categorical Encoded Nodes", std::to_string(neural.categoricalEncodedNodes)},
         {"Hidden Nodes", std::to_string(neural.hiddenNodes)},
         {"Output Nodes", std::to_string(neural.outputNodes)},
+        {"Auxiliary Output Targets", std::to_string(neural.outputAuxTargets)},
         {"Epochs", std::to_string(neural.epochs)},
         {"Batch Size", std::to_string(neural.batchSize)},
         {"Validation Split", toFixed(neural.valSplit, 2)},
         {"L2 Lambda", toFixed(neural.l2Lambda, 4)},
         {"Dropout", toFixed(neural.dropoutRate, 4)},
+        {"Explainability", neural.explainabilityMethod},
         {"Categorical Importance Share", toFixed(neural.categoricalImportanceShare, 4)},
         {"Early Stop Patience", std::to_string(neural.earlyStoppingPatience)},
         {"Loss", neural.binaryTarget ? "cross_entropy" : "mse"},
@@ -3528,13 +4015,26 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Output Activation", neural.outputActivation}
     });
 
+    if (!neural.uncertaintyStd.empty()) {
+        std::vector<std::vector<std::string>> uncertaintyRows;
+        for (size_t i = 0; i < neural.uncertaintyStd.size(); ++i) {
+            const double ciw = (i < neural.uncertaintyCiWidth.size()) ? neural.uncertaintyCiWidth[i] : 0.0;
+            uncertaintyRows.push_back({
+                "output_" + std::to_string(i + 1),
+                toFixed(neural.uncertaintyStd[i], 6),
+                toFixed(ciw, 6)
+            });
+        }
+        neuralReport.addTable("Predictive Uncertainty (MC Dropout)", {"Output", "Avg StdDev", "Avg 95% CI Width"}, uncertaintyRows);
+    }
+
     std::vector<std::vector<std::string>> fiRows;
     for (size_t i = 0; i < featureIdx.size(); ++i) {
         const std::string name = data.columns()[featureIdx[i]].name;
         double imp = (i < neural.featureImportance.size()) ? neural.featureImportance[i] : 0.0;
         fiRows.push_back({name, toFixed(imp, 6)});
     }
-    neuralReport.addTable("Feature Importance (Permutation, Neural)", {"Feature", "Importance"}, fiRows);
+    neuralReport.addTable("Feature Importance (Neural Explainability)", {"Feature", "Importance"}, fiRows);
 
     std::vector<std::vector<std::string>> lossRows;
     for (size_t e = 0; e < neural.trainLoss.size(); ++e) {
@@ -3546,6 +4046,18 @@ int AutomationPipeline::run(const AutoConfig& config) {
         });
     }
     neuralReport.addTable("Neural Lattice Training Trace", {"Epoch", "Train Loss", "Validation Loss"}, lossRows);
+
+    if (!neural.gradientNorm.empty() || !neural.weightStd.empty() || !neural.weightMeanAbs.empty()) {
+        std::vector<std::vector<std::string>> dynRows;
+        const size_t n = std::max({neural.gradientNorm.size(), neural.weightStd.size(), neural.weightMeanAbs.size()});
+        for (size_t i = 0; i < n; ++i) {
+            const double g = (i < neural.gradientNorm.size()) ? neural.gradientNorm[i] : 0.0;
+            const double wstd = (i < neural.weightStd.size()) ? neural.weightStd[i] : 0.0;
+            const double wabs = (i < neural.weightMeanAbs.size()) ? neural.weightMeanAbs[i] : 0.0;
+            dynRows.push_back({std::to_string(i + 1), toFixed(g, 6), toFixed(wstd, 6), toFixed(wabs, 6)});
+        }
+        neuralReport.addTable("Neural Training Dynamics", {"Step", "Gradient Norm", "Weight RMS", "Weight Mean Abs"}, dynRows);
+    }
 
     addOverallSections(neuralReport,
                        data,

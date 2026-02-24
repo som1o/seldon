@@ -24,9 +24,16 @@ public:
         EUROPEAN
     };
 
+    enum class DateLocaleHint {
+        AUTO,
+        DMY,
+        MDY
+    };
+
     explicit TypedDataset(std::string filename, char delimiter = ',');
 
     void setNumericSeparatorPolicy(NumericSeparatorPolicy policy) { numericSeparatorPolicy_ = policy; }
+    void setDateLocaleHint(DateLocaleHint hint) { dateLocaleHint_ = hint; }
 
     /**
      * @brief Loads CSV content and infers per-column types.
@@ -63,9 +70,10 @@ private:
     std::string filename_;
     char delimiter_;
     NumericSeparatorPolicy numericSeparatorPolicy_ = NumericSeparatorPolicy::AUTO;
+    DateLocaleHint dateLocaleHint_ = DateLocaleHint::AUTO;
     size_t rowCount_ = 0;
     std::vector<TypedColumn> columns_;
 
     bool parseDouble(const std::string& v, double& out) const;
-    static bool parseDateTime(const std::string& v, int64_t& outUnixSeconds);
+    bool parseDateTime(const std::string& v, int64_t& outUnixSeconds) const;
 };

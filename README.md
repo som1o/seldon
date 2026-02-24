@@ -1,31 +1,43 @@
 # Seldon
 
-Seldon is a C analytical pipeline for structured CSV data. It performs typed ingestion, preprocessing, statistical analysis, baseline predictive benchmarking, neural relevance analysis, and report synthesis in a single execution flow.
+Seldon is a C++17 tabular analysis pipeline that runs ingestion, preprocessing, statistics, neural analysis, and reporting in one command.
 
-The system is designed for reproducible exploratory and diagnostic analysis on tabular datasets with mixed variable types (`numeric`, `categorical`, and `datetime`).
+It supports mixed-type datasets (`numeric`, `categorical`, `datetime`) and now handles compressed and Excel sources directly.
 
-## Scope
+## Key Capabilities
 
-Seldon executes the following stages:
+- Typed ingestion with robust parsing for mixed schemas.
+- Input formats: `.csv`, `.csv.gz`, `.csv.zip`, `.xlsx`, `.xls`.
+- Preprocessing with missing-data handling, outlier treatment, scaling, and feature engineering.
+- Univariate + bivariate statistical analysis with optional plotting.
+- Neural relevance analysis with adaptive architecture, multi-output support, uncertainty, and explainability.
+- Markdown report synthesis with optional HTML export.
+- Profile presets and interactive setup mode for faster configuration.
 
-1. CSV ingestion with per-column type inference and row-aligned storage.
-2. Data preprocessing (missingness treatment, outlier handling, scaling, and derived-feature construction).
-3. Univariate and bivariate statistical analysis.
-4. Baseline model benchmarking with fold-based evaluation.
-5. Feed-forward neural analysis for feature relevance estimation.
-6. Report generation in Markdown, with optional plots and HTML conversion.
+## Requirements
 
-## System Requirements
+Core:
 
-- C++17-compatible compiler (`g++` or `clang++`)
-- CMake 3.16 or newer
-- Optional: OpenMP runtime for parallel execution
-- Optional: `gnuplot` for figure generation
-- Optional: `pandoc` for HTML report export
+- C++17 compiler (`g++`/`clang++`)
+- CMake 3.16+
 
-## Build Procedure
+Optional:
 
-From the project root:
+- OpenMP runtime (parallel execution)
+- `gnuplot` (plot generation)
+- `pandoc` (HTML reports)
+- `xlsx2csv` for `.xlsx`
+- `xls2csv` for `.xls`
+- `gzip` / `unzip` for compressed CSV inputs
+
+Ubuntu/Debian example for Excel converters:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y xlsx2csv catdoc
+```
+
+## Build
 
 ```bash
 mkdir -p build
@@ -34,128 +46,121 @@ cmake -DSELDON_ENABLE_OPENMP=ON ..
 cmake --build . -j
 ```
 
-Build without OpenMP:
+OpenMP-disabled build:
 
 ```bash
 cmake -DSELDON_ENABLE_OPENMP=OFF ..
 cmake --build . -j
 ```
 
-## Execution
+## Quick Start
 
-Basic execution:
+From `build/`:
 
 ```bash
 ./seldon /path/to/data.csv
 ```
 
-Execution with explicit configuration:
+Using compressed or Excel input:
+
+```bash
+./seldon /path/to/data.csv.gz
+./seldon /path/to/data.xlsx
+```
+
+Using a config file:
 
 ```bash
 ./seldon /path/to/data.csv --config /path/to/config.yaml
 ```
 
-Representative command forms:
+Interactive setup:
 
 ```bash
-./seldon /path/to/data.csv --target sales --delimiter ';'
-./seldon /path/to/data.csv --plots bivariate
-./seldon /path/to/data.csv --fast true --fast-max-bivariate-pairs 2500 --fast-neural-sample-rows 25000
-./seldon /path/to/data.csv --target-strategy auto --feature-strategy auto --neural-strategy auto --bivariate-strategy auto
+./seldon --interactive
 ```
 
-## Output Artifacts
+## Profiles and Runtime Modes
 
-Default report files:
+Profiles quickly tune behavior:
+
+```bash
+./seldon /path/to/data.csv --profile quick
+./seldon /path/to/data.csv --profile thorough
+./seldon /path/to/data.csv --profile minimal
+```
+
+Supported profile values: `auto`, `quick`, `thorough`, `minimal`.
+
+## Neural Analysis Features
+
+- Streaming / incremental training (`neural_streaming_mode`).
+- Adaptive depth/width search (`neural_min_layers`, `neural_max_layers`, `neural_max_hidden_nodes`).
+- Multi-output with auxiliary targets (`neural_multi_output`, `neural_max_aux_targets`).
+- Explainability modes: `permutation`, `integrated_gradients`, `shap_approx`, `hybrid`.
+- Monte Carlo uncertainty (`neural_uncertainty_samples`).
+- Feature-importance controls (`neural_importance_max_rows`, `neural_importance_trials`, `neural_importance_parallel`).
+
+Example:
+
+```bash
+./seldon /path/to/data.csv \
+	--neural-explainability hybrid \
+	--neural-integrated-grad-steps 24 \
+	--neural-uncertainty-samples 32 \
+	--neural-importance-max-rows 600 \
+	--neural-importance-trials 1
+```
+
+## Output Structure
+
+If `--output-dir` is not provided, Seldon writes output near the dataset as:
+
+`<dataset_stem>_seldon_outputs/`
+
+Inside the output folder:
 
 - `univariate.md`
 - `bivariate.md`
 - `neural_synthesis.md`
 - `final_analysis.md`
+- `seldon_report_assets/`
 
-Plot asset directories (generated when plotting is enabled and `gnuplot` is available):
+Optional HTML reports are generated when `generate_html=true` and `pandoc` is available.
 
-- `seldon_report_assets/univariate/`
-- `seldon_report_assets/bivariate/`
-- `seldon_report_assets/overall/`
+## Preprocessed Dataset Export
 
-HTML report files (generated when `generate_html=true` and `pandoc` is available):
+Export cleaned/transformed data:
 
-- `univariate.html`
-- `bivariate.html`
-- `neural_synthesis.html`
-- `final_analysis.html`
+```bash
+./seldon /path/to/data.csv --export-preprocessed csv
+./seldon /path/to/data.csv --export-preprocessed parquet
+./seldon /path/to/data.csv --export-preprocessed csv --export-preprocessed-path /tmp/my_preprocessed
+```
 
-## Configuration Interface
+Config keys:
 
-Seldon accepts runtime parameters from command-line options and from a lightweight `key: value` configuration file. Command-line values override file-defined values.
+- `export_preprocessed: none|csv|parquet`
+- `export_preprocessed_path: /path/base_name`
 
-Minimal configuration example:
+## Minimal Config Example
 
 ```yaml
-dataset: /path/to/data.csv
+dataset: /path/to/data.xlsx
 target: sales
-outlier_method: iqr
-outlier_action: flag
-scaling: auto
-kfold: 5
+profile: quick
 plots: bivariate
+datetime_locale_hint: auto
+numeric_locale_hint: auto
+export_preprocessed: none
 ```
 
-Extended configuration example:
-
-```yaml
-report: neural_synthesis.md
-assets_dir: seldon_report_assets
-delimiter: ,
-
-plot_format: png
-plot_width: 1280
-plot_height: 720
-plot_univariate: false
-plot_overall: false
-plot_bivariate_significant: true
-plots: bivariate
-
-generate_html: false
-verbose_analysis: true
-
-neural_seed: 1337
-benchmark_seed: 1337
-gradient_clip_norm: 5.0
-
-target_strategy: auto
-feature_strategy: auto
-neural_strategy: auto
-bivariate_strategy: auto
-
-fast_mode: false
-fast_max_bivariate_pairs: 2500
-fast_neural_sample_rows: 25000
-
-significance_alpha: 0.05
-outlier_iqr_multiplier: 1.5
-outlier_z_threshold: 3.0
-feature_min_variance: 1e-10
-feature_leakage_corr_threshold: 0.995
-max_feature_missing_ratio: -1
-
-numeric_epsilon: 1e-12
-beta_fallback_intervals_start: 4096
-beta_fallback_intervals_max: 65536
-beta_fallback_tolerance: 1e-8
-overall_corr_heatmap_max_columns: 50
-
-exclude: id,notes
-impute.sales: median
-impute.region: mode
-```
-
-## Documentation Index
+## Documentation
 
 - [Usage Reference](docs/USAGE.md)
 - [Architecture Reference](docs/ARCHITECTURE.md)
+- [Excel Import Enablement](docs/ENABLE_EXCEL_IMPORT.md)
 
 ## License
 
-Distributed under the MIT License. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).

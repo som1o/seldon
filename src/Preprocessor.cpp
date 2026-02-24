@@ -261,52 +261,78 @@ void addTemporalDateFeatures(TypedDataset& data, const AutoConfig& config) {
     columns.insert(columns.end(), std::make_move_iterator(engineered.begin()), std::make_move_iterator(engineered.end()));
 }
 
-void addAutoNumericFeatureEngineering(TypedDataset& data) {
+void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& config) {
     auto numericIdx = data.numericColumnIndices();
     if (numericIdx.empty()) return;
 
-    const size_t maxBase = std::min<size_t>(numericIdx.size(), 6);
+    const size_t maxBase = std::min<size_t>(numericIdx.size(), std::max<size_t>(2, config.featureEngineeringMaxBase));
     std::vector<size_t> base(numericIdx.begin(), numericIdx.begin() + maxBase);
 
     std::vector<TypedColumn> engineered;
-    engineered.reserve(maxBase + (maxBase * (maxBase - 1)) / 2);
+    engineered.reserve(maxBase * (1 + static_cast<size_t>(std::max(1, config.featureEngineeringDegree))));
+
+    const int maxDegree = std::clamp(config.featureEngineeringDegree, 1, 4);
 
     for (size_t idx : base) {
         const auto& col = data.columns()[idx];
         const auto& vals = std::get<NumVec>(col.values);
-        std::vector<double> sq(vals.size(), 0.0);
-        for (size_t i = 0; i < vals.size(); ++i) sq[i] = vals[i] * vals[i];
-        TypedColumn c;
-        c.name = uniqueColumnName(data, col.name + "_sq");
-        c.type = ColumnType::NUMERIC;
-        c.values = std::move(sq);
-        c.missing = col.missing;
-        engineered.push_back(std::move(c));
+
+        if (config.featureEngineeringEnablePoly) {
+            for (int p = 2; p <= maxDegree; ++p) {
+                std::vector<double> poly(vals.size(), 0.0);
+                for (size_t i = 0; i < vals.size(); ++i) {
+                    poly[i] = std::pow(vals[i], static_cast<double>(p));
+                }
+                TypedColumn c;
+                c.name = uniqueColumnName(data, col.name + "_pow" + std::to_string(p));
+                c.type = ColumnType::NUMERIC;
+                c.values = std::move(poly);
+                c.missing = col.missing;
+                engineered.push_back(std::move(c));
+            }
+        }
+
+        if (config.featureEngineeringEnableLog) {
+            std::vector<double> logSigned(vals.size(), 0.0);
+            for (size_t i = 0; i < vals.size(); ++i) {
+                const double v = vals[i];
+                const double mag = std::log1p(std::abs(v));
+                logSigned[i] = (v < 0.0) ? -mag : mag;
+            }
+            TypedColumn c;
+            c.name = uniqueColumnName(data, col.name + "_log1p_abs");
+            c.type = ColumnType::NUMERIC;
+            c.values = std::move(logSigned);
+            c.missing = col.missing;
+            engineered.push_back(std::move(c));
+        }
     }
 
-    for (size_t i = 0; i < base.size(); ++i) {
-        for (size_t j = i + 1; j < base.size(); ++j) {
-            const auto& a = data.columns()[base[i]];
-            const auto& b = data.columns()[base[j]];
-            const auto& av = std::get<NumVec>(a.values);
-            const auto& bv = std::get<NumVec>(b.values);
-            const size_t n = std::min(av.size(), bv.size());
-            std::vector<double> inter(n, 0.0);
-            MissingMask miss(n, static_cast<uint8_t>(0));
-            for (size_t r = 0; r < n; ++r) {
-                if (a.missing[r] || b.missing[r]) {
-                    miss[r] = static_cast<uint8_t>(1);
-                    continue;
+    if (config.featureEngineeringEnablePoly) {
+        for (size_t i = 0; i < base.size(); ++i) {
+            for (size_t j = i + 1; j < base.size(); ++j) {
+                const auto& a = data.columns()[base[i]];
+                const auto& b = data.columns()[base[j]];
+                const auto& av = std::get<NumVec>(a.values);
+                const auto& bv = std::get<NumVec>(b.values);
+                const size_t n = std::min(av.size(), bv.size());
+                std::vector<double> inter(n, 0.0);
+                MissingMask miss(n, static_cast<uint8_t>(0));
+                for (size_t r = 0; r < n; ++r) {
+                    if (a.missing[r] || b.missing[r]) {
+                        miss[r] = static_cast<uint8_t>(1);
+                        continue;
+                    }
+                    inter[r] = av[r] * bv[r];
                 }
-                inter[r] = av[r] * bv[r];
-            }
 
-            TypedColumn c;
-            c.name = uniqueColumnName(data, a.name + "_x_" + b.name);
-            c.type = ColumnType::NUMERIC;
-            c.values = std::move(inter);
-            c.missing = std::move(miss);
-            engineered.push_back(std::move(c));
+                TypedColumn c;
+                c.name = uniqueColumnName(data, a.name + "_x_" + b.name);
+                c.type = ColumnType::NUMERIC;
+                c.values = std::move(inter);
+                c.missing = std::move(miss);
+                engineered.push_back(std::move(c));
+            }
         }
     }
 
@@ -526,7 +552,7 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
     report.originalRowCount = data.rowCount();
 
     addTemporalDateFeatures(data, config);
-    addAutoNumericFeatureEngineering(data);
+    addAutoNumericFeatureEngineering(data, config);
 
     // Outlier flags are computed from observed raw numeric values before imputation.
     std::unordered_map<std::string, std::vector<bool>> detectedFlags;
