@@ -16,6 +16,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -27,9 +28,11 @@
 #include <random>
 #include <sstream>
 #include <set>
+#include <sys/wait.h>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <unistd.h>
 #include <utility>
 #include <cstdlib>
 #ifdef USE_OPENMP
@@ -37,6 +40,51 @@
 #endif
 
 namespace {
+std::string findExecutableInPath(const std::string& command) {
+    if (command.empty()) return "";
+    const char* pathEnv = std::getenv("PATH");
+    if (!pathEnv) return "";
+
+    std::stringstream ss{std::string(pathEnv)};
+    std::string token;
+    while (std::getline(ss, token, ':')) {
+        if (token.empty()) token = ".";
+        std::filesystem::path candidate = std::filesystem::path(token) / command;
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec) && !ec && ::access(candidate.c_str(), X_OK) == 0) {
+            return candidate.string();
+        }
+    }
+    return "";
+}
+
+int spawnProcessSilenced(const std::string& executable, const std::vector<std::string>& args) {
+    pid_t pid = ::fork();
+    if (pid < 0) return -1;
+
+    if (pid == 0) {
+        const int devNull = ::open("/dev/null", O_WRONLY);
+        if (devNull >= 0) {
+            ::dup2(devNull, STDOUT_FILENO);
+            ::dup2(devNull, STDERR_FILENO);
+            ::close(devNull);
+        }
+
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 2);
+        argv.push_back(const_cast<char*>(executable.c_str()));
+        for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+        argv.push_back(nullptr);
+        ::execv(executable.c_str(), argv.data());
+        _exit(127);
+    }
+
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return -1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
+
 std::string toFixed(double v, int prec = 4) {
     std::ostringstream os;
     os << std::fixed << std::setprecision(prec) << v;
@@ -1419,6 +1467,10 @@ void saveGeneratedReports(const AutoConfig& runCfg,
     finalAnalysis.save(finalMd);
 
     if (runCfg.generateHtml) {
+        const std::string pandocExe = findExecutableInPath("pandoc");
+        if (pandocExe.empty()) {
+            return;
+        }
         const std::vector<std::pair<std::string, std::string>> conversions = {
             {uniMd, runCfg.outputDir + "/univariate.html"},
             {biMd, runCfg.outputDir + "/bivariate.html"},
@@ -1426,8 +1478,7 @@ void saveGeneratedReports(const AutoConfig& runCfg,
             {finalMd, runCfg.outputDir + "/final_analysis.html"}
         };
         for (const auto& [src, dst] : conversions) {
-            const std::string cmd = "pandoc \"" + src + "\" -o \"" + dst + "\" --standalone --self-contained > /dev/null 2>&1";
-            std::system(cmd.c_str());
+            spawnProcessSilenced(pandocExe, {src, "-o", dst, "--standalone", "--self-contained"});
         }
     }
 }
@@ -1496,8 +1547,15 @@ void exportPreprocessedDatasetIfRequested(const TypedDataset& data, const AutoCo
 
     if (runCfg.exportPreprocessed == "parquet") {
         const std::string parquetPath = basePath + ".parquet";
-        const std::string cmd = "python3 -c \"import pandas as pd; df=pd.read_csv('" + csvPath + "'); df.to_parquet('" + parquetPath + "', index=False)\" > /dev/null 2>&1";
-        std::system(cmd.c_str());
+        const std::string pythonExe = findExecutableInPath("python3");
+        if (!pythonExe.empty()) {
+            const std::string code =
+                "import pandas as pd\n"
+                "import sys\n"
+                "df = pd.read_csv(sys.argv[1])\n"
+                "df.to_parquet(sys.argv[2], index=False)\n";
+            spawnProcessSilenced(pythonExe, {"-c", code, csvPath, parquetPath});
+        }
     }
 }
 

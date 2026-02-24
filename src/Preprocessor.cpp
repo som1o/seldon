@@ -482,34 +482,72 @@ std::vector<bool> detectOutliersLOFObserved(const NumVec& values, const MissingM
     if (observed.size() < 12) return flags;
 
     const size_t n = observed.size();
+    constexpr size_t kLofMaxRows = 200000;
+    if (n > kLofMaxRows) {
+        return detectOutliersModifiedZObserved(values, missing, 3.5);
+    }
+
     const size_t k = std::min<size_t>(10, std::max<size_t>(3, n / 12));
 
-    std::vector<std::vector<double>> dist(n, std::vector<double>(n, 0.0));
+    std::vector<std::pair<double, size_t>> sorted;
+    sorted.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-        for (size_t j = i + 1; j < n; ++j) {
-            const double d = std::abs(observed[i] - observed[j]);
-            dist[i][j] = d;
-            dist[j][i] = d;
-        }
+        sorted.push_back({observed[i], i});
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        if (a.first == b.first) return a.second < b.second;
+        return a.first < b.first;
+    });
+
+    std::vector<size_t> rankByIndex(n, 0);
+    for (size_t rank = 0; rank < n; ++rank) {
+        rankByIndex[sorted[rank].second] = rank;
     }
 
     std::vector<std::vector<size_t>> nbr(n);
     std::vector<double> kdist(n, 0.0);
     for (size_t i = 0; i < n; ++i) {
-        std::vector<std::pair<double, size_t>> ds;
-        ds.reserve(n - 1);
-        for (size_t j = 0; j < n; ++j) if (i != j) ds.push_back({dist[i][j], j});
-        std::nth_element(ds.begin(), ds.begin() + (k - 1), ds.end());
-        std::sort(ds.begin(), ds.begin() + k);
+        const size_t rank = rankByIndex[i];
+        size_t left = rank;
+        size_t right = rank + 1;
         nbr[i].reserve(k);
-        for (size_t t = 0; t < k; ++t) nbr[i].push_back(ds[t].second);
-        kdist[i] = ds[k - 1].first;
+
+        while (nbr[i].size() < k && (left > 0 || right < n)) {
+            const bool hasLeft = left > 0;
+            const bool hasRight = right < n;
+
+            if (hasLeft && hasRight) {
+                const double dl = std::abs(observed[i] - sorted[left - 1].first);
+                const double dr = std::abs(observed[i] - sorted[right].first);
+                if (dl <= dr) {
+                    --left;
+                    nbr[i].push_back(sorted[left].second);
+                } else {
+                    nbr[i].push_back(sorted[right].second);
+                    ++right;
+                }
+            } else if (hasLeft) {
+                --left;
+                nbr[i].push_back(sorted[left].second);
+            } else {
+                nbr[i].push_back(sorted[right].second);
+                ++right;
+            }
+        }
+
+        double kd = 0.0;
+        for (size_t nb : nbr[i]) {
+            kd = std::max(kd, std::abs(observed[i] - observed[nb]));
+        }
+        kdist[i] = kd;
     }
 
     std::vector<double> lrd(n, 0.0);
     for (size_t i = 0; i < n; ++i) {
         double reach = 0.0;
-        for (size_t nb : nbr[i]) reach += std::max(kdist[nb], dist[i][nb]);
+        for (size_t nb : nbr[i]) {
+            reach += std::max(kdist[nb], std::abs(observed[i] - observed[nb]));
+        }
         lrd[i] = (reach <= 1e-12) ? 0.0 : (static_cast<double>(k) / reach);
     }
 

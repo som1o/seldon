@@ -3,6 +3,7 @@
 #include <random>
 #include <iostream>
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <fstream>
 #include <sstream>
@@ -616,16 +617,40 @@ std::vector<double> NeuralNet::calculateFeatureImportance(const std::vector<std:
     // Clamp total permutation work to keep CLI responsive.
     const size_t maxPermutationOps = 120000;
     if (numFeatures > 0 && Xeval.size() > 0) {
-        size_t opBudgetPerTrial = numFeatures * Xeval.size();
-        if (opBudgetPerTrial > 0 && trials * opBudgetPerTrial > maxPermutationOps) {
+        const bool opBudgetOverflow = (numFeatures > (std::numeric_limits<size_t>::max() / Xeval.size()));
+        const size_t opBudgetPerTrial = opBudgetOverflow ? std::numeric_limits<size_t>::max() : (numFeatures * Xeval.size());
+
+        const bool totalOverflow = (opBudgetPerTrial > 0) && (trials > (std::numeric_limits<size_t>::max() / opBudgetPerTrial));
+        const bool exceedsBudget = totalOverflow ||
+            (opBudgetPerTrial > 0 && trials > (maxPermutationOps / opBudgetPerTrial));
+
+        if (opBudgetPerTrial > 0 && exceedsBudget) {
             size_t allowedTrials = std::max<size_t>(1, maxPermutationOps / opBudgetPerTrial);
             trials = std::max<size_t>(1, std::min(trials, allowedTrials));
-            if (trials * opBudgetPerTrial > maxPermutationOps) {
-                size_t allowedRows = std::max<size_t>(120, maxPermutationOps / (trials * numFeatures));
+
+            const bool postTotalOverflow = (opBudgetPerTrial > 0) && (trials > (std::numeric_limits<size_t>::max() / opBudgetPerTrial));
+            const bool stillExceedsBudget = postTotalOverflow ||
+                (opBudgetPerTrial > 0 && trials > (maxPermutationOps / opBudgetPerTrial));
+
+            if (stillExceedsBudget) {
+                const size_t denom = std::max<size_t>(1, trials * numFeatures);
+                size_t allowedRows = std::max<size_t>(120, maxPermutationOps / denom);
                 if (Xeval.size() > allowedRows) {
-                    std::shuffle(Xeval.begin(), Xeval.end(), rng);
-                    Xeval.resize(allowedRows);
-                    Yeval.resize(allowedRows);
+                    std::vector<size_t> keep(Xeval.size());
+                    std::iota(keep.begin(), keep.end(), 0);
+                    std::shuffle(keep.begin(), keep.end(), rng);
+                    keep.resize(allowedRows);
+
+                    std::vector<std::vector<double>> sampledX;
+                    std::vector<std::vector<double>> sampledY;
+                    sampledX.reserve(keep.size());
+                    sampledY.reserve(keep.size());
+                    for (size_t idx : keep) {
+                        sampledX.push_back(Xeval[idx]);
+                        sampledY.push_back(Yeval[idx]);
+                    }
+                    Xeval = std::move(sampledX);
+                    Yeval = std::move(sampledY);
                 }
             }
         }

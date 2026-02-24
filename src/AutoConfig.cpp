@@ -114,6 +114,22 @@ std::string maybeUnquote(std::string value) {
     return value;
 }
 
+std::string normalizeConfigKey(std::string key) {
+    key = CommonUtils::trim(key);
+    const std::string lowered = CommonUtils::toLower(key);
+    if (lowered.rfind("impute.", 0) == 0) {
+        const size_t dotPos = key.find('.');
+        if (dotPos != std::string::npos && dotPos + 1 < key.size()) {
+            return "impute." + key.substr(dotPos + 1);
+        }
+        return "impute.";
+    }
+
+    std::string out = lowered;
+    std::replace(out.begin(), out.end(), '-', '_');
+    return out;
+}
+
 int parseIntStrict(const std::string& value, const std::string& key, int minValue) {
     int parsed = parseNumericStrict<int>(
         value,
@@ -753,7 +769,7 @@ AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig&
         size_t sep = findSeparatorOutsideQuotes(line, ':');
         if (sep == std::string::npos) continue;
 
-        std::string key = maybeUnquote(line.substr(0, sep));
+        std::string key = normalizeConfigKey(maybeUnquote(line.substr(0, sep)));
         std::string value = maybeUnquote(line.substr(sep + 1));
 
         try {

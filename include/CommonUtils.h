@@ -31,7 +31,9 @@ inline double medianByNth(std::vector<double> values) {
     const double upper = values[mid];
     if (values.size() % 2 == 0) {
         std::nth_element(values.begin(), values.begin() + (mid - 1), values.begin() + mid);
-        return (values[mid - 1] + upper) / 2.0;
+        const long double lo = static_cast<long double>(values[mid - 1]);
+        const long double hi = static_cast<long double>(upper);
+        return static_cast<double>((lo + hi) / 2.0L);
     }
     return upper;
 }
@@ -41,7 +43,7 @@ inline double quantileByNth(std::vector<double> values, double q) {
     if (q <= 0.0) return *std::min_element(values.begin(), values.end());
     if (q >= 1.0) return *std::max_element(values.begin(), values.end());
 
-    const double pos = q * static_cast<double>(values.size() - 1);
+    const long double pos = static_cast<long double>(q) * static_cast<long double>(values.size() - 1);
     const size_t lo = static_cast<size_t>(std::floor(pos));
     const size_t hi = static_cast<size_t>(std::ceil(pos));
 
@@ -51,8 +53,9 @@ inline double quantileByNth(std::vector<double> values, double q) {
 
     std::nth_element(values.begin(), values.begin() + hi, values.end());
     const double hiVal = values[hi];
-    const double frac = pos - static_cast<double>(lo);
-    return loVal * (1.0 - frac) + hiVal * frac;
+    const long double frac = pos - static_cast<long double>(lo);
+    const long double out = static_cast<long double>(loVal) * (1.0L - frac) + static_cast<long double>(hiVal) * frac;
+    return static_cast<double>(out);
 }
 
 } // namespace CommonUtils

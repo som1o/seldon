@@ -10,10 +10,13 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <unordered_map>
 
 TypedDataset::TypedDataset(std::string filename, char delimiter)
@@ -169,21 +172,68 @@ bool parseDatePart(const std::string& datePart, TypedDataset::DateLocaleHint loc
     return false;
 }
 
-std::string shellEscape(const std::string& input) {
-    std::string out;
-    out.reserve(input.size() + 2);
-    out.push_back('\'');
-    for (char c : input) {
-        if (c == '\'') out += "'\\''";
-        else out.push_back(c);
+std::string findExecutableInPath(const std::string& command) {
+    if (command.empty()) return "";
+    const char* pathEnv = std::getenv("PATH");
+    if (!pathEnv) return "";
+
+    std::string pathValue(pathEnv);
+    std::stringstream ss(pathValue);
+    std::string token;
+    while (std::getline(ss, token, ':')) {
+        if (token.empty()) token = ".";
+        std::filesystem::path candidate = std::filesystem::path(token) / command;
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec) && !ec && ::access(candidate.c_str(), X_OK) == 0) {
+            return candidate.string();
+        }
     }
-    out.push_back('\'');
-    return out;
+    return "";
 }
 
 bool commandAvailable(const std::string& command) {
-    const std::string cmd = "command -v " + command + " >/dev/null 2>&1";
-    return std::system(cmd.c_str()) == 0;
+    return !findExecutableInPath(command).empty();
+}
+
+int spawnToFile(const std::string& executable,
+                const std::vector<std::string>& args,
+                const std::string& outputPath) {
+    const int outFd = ::open(outputPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (outFd < 0) return -1;
+
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(outFd);
+        return -1;
+    }
+
+    if (pid == 0) {
+        const int devNull = ::open("/dev/null", O_WRONLY);
+        if (devNull >= 0) {
+            ::dup2(devNull, STDERR_FILENO);
+            ::close(devNull);
+        }
+
+        if (::dup2(outFd, STDOUT_FILENO) < 0) {
+            _exit(127);
+        }
+        ::close(outFd);
+
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 2);
+        argv.push_back(const_cast<char*>(executable.c_str()));
+        for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+        argv.push_back(nullptr);
+
+        ::execv(executable.c_str(), argv.data());
+        _exit(127);
+    }
+
+    ::close(outFd);
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return -1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
 }
 
 std::pair<std::string, bool> resolveDatasetInputPath(const std::string& sourcePath) {
@@ -198,33 +248,37 @@ std::pair<std::string, bool> resolveDatasetInputPath(const std::string& sourcePa
     const fs::path tmpBase = fs::temp_directory_path() / ("seldon_input_" + std::to_string(static_cast<unsigned long long>(std::hash<std::string>{}(sourcePath + std::to_string(std::time(nullptr))))) + ".csv");
     const std::string tmpPath = tmpBase.string();
 
-    auto runToTmp = [&](const std::string& command) {
-        const int rc = std::system(command.c_str());
+    auto runToTmp = [&](const std::string& executable, const std::vector<std::string>& args) {
+        const int rc = spawnToFile(executable, args, tmpPath);
         if (rc != 0) {
+            std::error_code ec;
+            std::filesystem::remove(tmpPath, ec);
             throw Seldon::DatasetException("Failed to convert input source: " + sourcePath);
         }
         return std::make_pair(tmpPath, true);
     };
 
     if (lowerExt == ".gz") {
-        const std::string cmd = "gzip -cd " + shellEscape(sourcePath) + " > " + shellEscape(tmpPath);
-        return runToTmp(cmd);
+        const std::string exe = findExecutableInPath("gzip");
+        if (exe.empty()) throw Seldon::DatasetException("gzip is required to read .gz files");
+        return runToTmp(exe, {"-cd", sourcePath});
     }
     if (lowerExt == ".zip") {
-        const std::string cmd = "unzip -p " + shellEscape(sourcePath) + " > " + shellEscape(tmpPath);
-        return runToTmp(cmd);
+        const std::string exe = findExecutableInPath("unzip");
+        if (exe.empty()) throw Seldon::DatasetException("unzip is required to read .zip files");
+        return runToTmp(exe, {"-p", sourcePath});
     }
     if (lowerExt == ".xlsx") {
-        if (commandAvailable("xlsx2csv")) {
-            const std::string cmd = "xlsx2csv " + shellEscape(sourcePath) + " > " + shellEscape(tmpPath);
-            return runToTmp(cmd);
+        const std::string exe = findExecutableInPath("xlsx2csv");
+        if (!exe.empty()) {
+            return runToTmp(exe, {sourcePath});
         }
         throw Seldon::DatasetException("XLSX import requires xlsx2csv. See docs/ENABLE_EXCEL_IMPORT.md");
     }
     if (lowerExt == ".xls") {
-        if (commandAvailable("xls2csv")) {
-            const std::string cmd = "xls2csv " + shellEscape(sourcePath) + " > " + shellEscape(tmpPath);
-            return runToTmp(cmd);
+        const std::string exe = findExecutableInPath("xls2csv");
+        if (!exe.empty()) {
+            return runToTmp(exe, {sourcePath});
         }
         throw Seldon::DatasetException("XLS import requires xls2csv (libxls tools). See docs/ENABLE_EXCEL_IMPORT.md");
     }
@@ -531,6 +585,16 @@ bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) 
 
 void TypedDataset::load() {
     auto [resolvedPath, isTemporary] = resolveDatasetInputPath(filename_);
+    struct TempFileGuard {
+        std::string path;
+        bool enabled = false;
+        ~TempFileGuard() {
+            if (!enabled) return;
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    } tempGuard{resolvedPath, isTemporary};
+
     std::ifstream in(resolvedPath, std::ios::binary);
     if (!in) throw Seldon::IOException("Could not open file: " + resolvedPath);
 
@@ -869,10 +933,6 @@ void TypedDataset::load() {
     }
 
     if (datetimeFallbackCols.empty()) {
-        if (isTemporary) {
-            std::error_code ec;
-            std::filesystem::remove(resolvedPath, ec);
-        }
         return;
     }
 
@@ -958,10 +1018,6 @@ void TypedDataset::load() {
         rescuedDatetimeCols.push_back(c);
     }
 
-    if (isTemporary) {
-        std::error_code ec;
-        std::filesystem::remove(resolvedPath, ec);
-    }
 }
 
 std::vector<size_t> TypedDataset::numericColumnIndices() const {

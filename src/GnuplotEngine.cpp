@@ -6,12 +6,15 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <numeric>
 #include <sstream>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <unordered_map>
 
 namespace {
@@ -286,6 +289,53 @@ std::string ganttColorForSemantic(const std::string& semantic, const std::string
     if (s.find("low") != std::string::npos || s.find("backlog") != std::string::npos || s.find("todo") != std::string::npos) return "#7c3aed";
     return fallback;
 }
+
+std::string findExecutableInPath(const std::string& command) {
+    if (command.empty()) return "";
+    const char* pathEnv = std::getenv("PATH");
+    if (!pathEnv) return "";
+
+    std::stringstream ss{std::string(pathEnv)};
+    std::string token;
+    while (std::getline(ss, token, ':')) {
+        if (token.empty()) token = ".";
+        std::filesystem::path candidate = std::filesystem::path(token) / command;
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec) && !ec && ::access(candidate.c_str(), X_OK) == 0) {
+            return candidate.string();
+        }
+    }
+    return "";
+}
+
+int spawnGnuplot(const std::string& executable,
+                 const std::string& scriptPath,
+                 const std::string& stderrPath) {
+    const int errFd = ::open(stderrPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (errFd < 0) return -1;
+
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(errFd);
+        return -1;
+    }
+
+    if (pid == 0) {
+        if (::dup2(errFd, STDERR_FILENO) < 0) {
+            _exit(127);
+        }
+        ::close(errFd);
+        const char* argv[] = {executable.c_str(), scriptPath.c_str(), nullptr};
+        ::execv(executable.c_str(), const_cast<char* const*>(argv));
+        _exit(127);
+    }
+
+    ::close(errFd);
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return -1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
 } // namespace
 
 std::string GnuplotEngine::sanitizeId(const std::string& id) {
@@ -356,8 +406,7 @@ GnuplotEngine::GnuplotEngine(std::string assetsDir, PlotConfig cfg)
 }
 
 bool GnuplotEngine::isAvailable() const {
-    const int code = std::system("command -v gnuplot > /dev/null 2>&1");
-    return code == 0;
+    return !findExecutableInPath("gnuplot").empty();
 }
 
 std::string GnuplotEngine::runScript(const std::string& id, const std::string& dataContent, const std::string& scriptContent) {
@@ -368,7 +417,13 @@ std::string GnuplotEngine::runScript(const std::string& id, const std::string& d
     const std::string errFile = assetsDir_ + "/" + safeId + ".err.log";
     const std::string cacheHashFile = assetsDir_ + "/.plot_cache/" + safeId + ".hash";
 
-    const std::string cacheKey = toHex(fnv1a64(dataContent + "\n@@\n" + scriptContent + "\nfmt=" + cfg_.format));
+    const std::string cacheKey = toHex(fnv1a64(
+        dataContent + "\n@@\n" + scriptContent +
+        "\nfmt=" + cfg_.format +
+        "\ntheme=" + cfg_.theme +
+        "\ngrid=" + std::string(cfg_.showGrid ? "1" : "0") +
+        "\nlineWidth=" + std::to_string(cfg_.lineWidth) +
+        "\npointSize=" + std::to_string(cfg_.pointSize)));
 
     {
         std::ifstream in(cacheHashFile);
@@ -392,8 +447,11 @@ std::string GnuplotEngine::runScript(const std::string& id, const std::string& d
     if (!sout.good()) return "";
     sout.close();
 
-    std::string cmd = "gnuplot \"" + scriptFile + "\" 2> \"" + errFile + "\"";
-    const int rc = std::system(cmd.c_str());
+    const std::string gnuplotExe = findExecutableInPath("gnuplot");
+    if (gnuplotExe.empty()) {
+        return "";
+    }
+    const int rc = spawnGnuplot(gnuplotExe, scriptFile, errFile);
 
     std::error_code ec;
     std::filesystem::remove(dataFile, ec);

@@ -82,11 +82,11 @@ public:
     UncertaintyEstimate predictWithUncertainty(const std::vector<double>& inputValues,
                                                size_t samples,
                                                double dropoutRate);
-    const std::vector<double>& getTrainLossHistory() const { return trainLossHistory; }
-    const std::vector<double>& getValLossHistory() const { return valLossHistory; }
-    const std::vector<double>& getGradientNormHistory() const { return gradientNormHistory; }
-    const std::vector<double>& getWeightStdHistory() const { return weightStdHistory; }
-    const std::vector<double>& getWeightMeanAbsHistory() const { return weightMeanAbsHistory; }
+    const std::vector<double>& getTrainLossHistory() const noexcept { return trainLossHistory; }
+    const std::vector<double>& getValLossHistory() const noexcept { return valLossHistory; }
+    const std::vector<double>& getGradientNormHistory() const noexcept { return gradientNormHistory; }
+    const std::vector<double>& getWeightStdHistory() const noexcept { return weightStdHistory; }
+    const std::vector<double>& getWeightMeanAbsHistory() const noexcept { return weightMeanAbsHistory; }
 
     // Explainability
     std::vector<double> calculateFeatureImportance(const std::vector<std::vector<double>>& X, 

@@ -32,8 +32,8 @@ public:
 
     explicit TypedDataset(std::string filename, char delimiter = ',');
 
-    void setNumericSeparatorPolicy(NumericSeparatorPolicy policy) { numericSeparatorPolicy_ = policy; }
-    void setDateLocaleHint(DateLocaleHint hint) { dateLocaleHint_ = hint; }
+    void setNumericSeparatorPolicy(NumericSeparatorPolicy policy) noexcept { numericSeparatorPolicy_ = policy; }
+    void setDateLocaleHint(DateLocaleHint hint) noexcept { dateLocaleHint_ = hint; }
 
     /**
      * @brief Loads CSV content and infers per-column types.
@@ -43,11 +43,11 @@ public:
      * @throws Seldon::IOException / Seldon::DatasetException on IO or parse failure.
      */
     void load();
-    size_t rowCount() const { return rowCount_; }
-    size_t colCount() const { return columns_.size(); }
+    size_t rowCount() const noexcept { return rowCount_; }
+    size_t colCount() const noexcept { return columns_.size(); }
 
-    const std::vector<TypedColumn>& columns() const { return columns_; }
-    std::vector<TypedColumn>& columns() { return columns_; }
+    const std::vector<TypedColumn>& columns() const noexcept { return columns_; }
+    std::vector<TypedColumn>& columns() noexcept { return columns_; }
 
     std::vector<size_t> numericColumnIndices() const;
     std::vector<size_t> categoricalColumnIndices() const;
