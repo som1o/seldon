@@ -1,8 +1,16 @@
-# Usage Guide
+# Usage Reference
 
-This guide covers build, run, configuration, and operational patterns for Seldon.
+## 1. Build and Installation
 
-## Build
+### 1.1 Prerequisites
+
+- C++17 compiler
+- CMake 3.16+
+- Optional: OpenMP runtime
+- Optional: `gnuplot` (for plots)
+- Optional: `pandoc` (for HTML export)
+
+### 1.2 Build Commands
 
 From project root:
 
@@ -13,44 +21,45 @@ cmake -DSELDON_ENABLE_OPENMP=ON ..
 cmake --build . -j
 ```
 
-Disable OpenMP if needed:
+OpenMP-disabled build:
 
 ```bash
 cmake -DSELDON_ENABLE_OPENMP=OFF ..
 cmake --build . -j
 ```
 
-## Run
+The produced executable is `seldon` in the build directory.
 
-From the build directory:
+## 2. Execution Model
+
+### 2.1 Minimal Invocation
 
 ```bash
 ./seldon /path/to/data.csv
 ```
 
-With config file:
+### 2.2 Invocation with Configuration File
 
 ```bash
 ./seldon /path/to/data.csv --config /path/to/config.yaml
 ```
 
-## Common CLI Patterns
+### 2.3 Representative Invocation Patterns
 
-### Target and delimiter
+Target and delimiter:
 
 ```bash
 ./seldon /path/to/data.csv --target sales --delimiter ';'
 ```
 
-### Plot control
+Plot selection:
 
 ```bash
 ./seldon /path/to/data.csv --plots bivariate
 ./seldon /path/to/data.csv --plots all
-./seldon /path/to/data.csv --plot-univariate true --plot-overall false --plot-bivariate true
 ```
 
-### Strategy control
+Strategy selection:
 
 ```bash
 ./seldon /path/to/data.csv \
@@ -60,23 +69,23 @@ With config file:
   --bivariate-strategy auto
 ```
 
-### Fast mode (large datasets)
+Large-data runtime controls:
 
 ```bash
 ./seldon /path/to/data.csv --fast true --fast-max-bivariate-pairs 2500 --fast-neural-sample-rows 25000
 ```
 
-### Reproducibility and stability
+Reproducibility controls:
 
 ```bash
 ./seldon /path/to/data.csv --neural-seed 1337 --benchmark-seed 1337 --gradient-clip 5.0
 ```
 
-## Config File Format
+## 3. Configuration File Specification
 
-Seldon accepts lightweight YAML/JSON-like `key: value` files.
+Seldon accepts a lightweight `key: value` configuration format. Values may be scalar strings, numbers, or booleans, depending on option semantics.
 
-### Minimal example
+### 3.1 Minimal Example
 
 ```yaml
 dataset: /path/to/data.csv
@@ -87,14 +96,13 @@ scaling: auto
 kfold: 5
 ```
 
-### Practical extended example
+### 3.2 Extended Example
 
 ```yaml
 report: neural_synthesis.md
 assets_dir: seldon_report_assets
 delimiter: ,
 
-# Plot settings
 plot_format: png
 plot_width: 1280
 plot_height: 720
@@ -103,27 +111,22 @@ plot_overall: false
 plot_bivariate_significant: true
 plots: bivariate
 
-# Runtime toggles
 generate_html: false
 verbose_analysis: true
 
-# Seeds and clipping
 neural_seed: 1337
 benchmark_seed: 1337
 gradient_clip_norm: 5.0
 
-# Core modes
 target_strategy: auto
 feature_strategy: auto
 neural_strategy: auto
 bivariate_strategy: auto
 
-# Fast mode
 fast_mode: false
 fast_max_bivariate_pairs: 2500
 fast_neural_sample_rows: 25000
 
-# Statistics and thresholds
 significance_alpha: 0.05
 outlier_iqr_multiplier: 1.5
 outlier_z_threshold: 3.0
@@ -131,62 +134,52 @@ feature_min_variance: 1e-10
 feature_leakage_corr_threshold: 0.995
 max_feature_missing_ratio: -1
 
-# Numeric runtime controls
 numeric_epsilon: 1e-12
 beta_fallback_intervals_start: 4096
 beta_fallback_intervals_max: 65536
 beta_fallback_tolerance: 1e-8
 overall_corr_heatmap_max_columns: 50
 
-# Optional column rules
 exclude: id,notes
 impute.sales: median
 impute.region: mode
 ```
 
-## Key Options
+## 4. Option Reference
 
-### Data and preprocessing
+### 4.1 Data and Preprocessing
 
-- `dataset`
-- `target`
-- `delimiter`
+- `dataset`, `target`, `delimiter`
 - `outlier_method`: `iqr` | `zscore` | `modified_zscore` | `adjusted_boxplot` | `lof`
 - `outlier_action`: `flag` | `remove` | `cap`
 - `scaling`: `auto` | `zscore` | `minmax` | `none`
-- `max_feature_missing_ratio`: `-1` or `[0,1]`
+- `max_feature_missing_ratio`: `-1` or value in $[0,1]$
 - `impute.<column>`: `auto` | `mean` | `median` | `zero` | `mode` | `interpolate`
 
-### Pipeline strategies
+### 4.2 Strategy Parameters
 
 - `target_strategy`: `auto` | `quality` | `max_variance` | `last_numeric`
 - `feature_strategy`: `auto` | `adaptive` | `aggressive` | `lenient`
 - `neural_strategy`: `auto` | `none` | `fast` | `balanced` | `expressive`
 - `bivariate_strategy`: `auto` | `balanced` | `corr_heavy` | `importance_heavy`
-- `bivariate_selection_quantile`: `-1` or `[0,1]`
+- `bivariate_selection_quantile`: `-1` or value in $[0,1]$
 
-### Plot and output
+### 4.3 Plot and Output Controls
 
 - `plots`: `none` | `bivariate` | `univariate` | `overall` | `all`
-- when no plot aliases/flags are provided, Seldon auto-enables a dynamic plot set for the current dataset (avoids under-plotting and suppresses low-value plot families on tiny datasets)
-- plot generation auto-selects suitable visuals by data shape (adaptive histogram with KDE, scatter with confidence/residual diagnostics, faceted scatter, stacked bivariate profiles, clustered heatmap, parallel coordinates, Q-Q plots, pie/bar fallback, and project-like Gantt)
-- `plot_univariate`
-- `plot_overall`
-- `plot_bivariate_significant`
+- `plot_univariate`, `plot_overall`, `plot_bivariate_significant`
 - `plot_format`: `png` | `svg` | `pdf`
 - `plot_theme`: `auto` | `light` | `dark`
-- `plot_grid`: `true` | `false`
-- `plot_point_size`, `plot_line_width`
+- `plot_grid`, `plot_point_size`, `plot_line_width`
 - `plot_width`, `plot_height`
 - `ogive_min_points`, `ogive_min_unique`
 - `box_plot_min_points`, `box_plot_min_iqr`
 - `pie_min_categories`, `pie_max_categories`, `pie_max_dominance_ratio`
 - `scatter_fit_min_abs_corr`, `scatter_fit_min_sample_size`
 - `gantt_auto_enabled`, `gantt_min_tasks`, `gantt_max_tasks`, `gantt_duration_hours_threshold`
-- `report`, `assets_dir`
-- `generate_html`
+- `report`, `assets_dir`, `generate_html`
 
-### Neural controls
+### 4.4 Neural and Optimization Controls
 
 - `neural_seed`, `benchmark_seed`
 - `gradient_clip_norm`
@@ -200,7 +193,7 @@ impute.region: mode
 - `neural_use_validation_loss_ema`, `neural_validation_loss_ema_beta`
 - `neural_categorical_input_l2_boost`
 
-### Numeric robustness
+### 4.5 Numerical Robustness Controls
 
 - `significance_alpha`
 - `numeric_epsilon`
@@ -209,64 +202,61 @@ impute.region: mode
 - `beta_fallback_tolerance`
 - `overall_corr_heatmap_max_columns`
 
-## Outputs
+## 5. Output Specification
 
-Always generated:
+### 5.1 Always Generated
 
 - `univariate.md`
 - `bivariate.md`
 - `neural_synthesis.md`
 - `final_analysis.md`
 
-Generated when plotting is enabled and `gnuplot` is available:
+### 5.2 Conditionally Generated
+
+When plotting is enabled and `gnuplot` is available:
 
 - `seldon_report_assets/univariate/`
 - `seldon_report_assets/bivariate/`
 - `seldon_report_assets/overall/`
 
-Generated when `generate_html=true` and `pandoc` is available:
+When `generate_html=true` and `pandoc` is available:
 
 - `univariate.html`
 - `bivariate.html`
 - `neural_synthesis.html`
 - `final_analysis.html`
 
-## Runtime Notes
+## 6. Operational Notes
 
-- Outlier detection runs before imputation using observed numeric values only.
-- Correlation heatmap computation is capped by `overall_corr_heatmap_max_columns` to keep wide datasets tractable.
-- Feature-importance evaluation uses adaptive row sampling and trial limiting for large data.
-- Numeric parsing supports configurable separator policy for locale-like formats.
-- CSV load is streaming two-pass and avoids buffering full datasets in memory.
-- Automated EDA sections include contingency (chi-square/Cramér’s V/odds ratio), one-way ANOVA with post-hoc summary, PCA explained variance + projection plots, k-means profile with silhouette/gap summary, bootstrap confidence intervals, missingness matrix/correlation, and regression diagnostics (residual/Q-Q/Cook/VIF).
+- Outlier detection is computed on observed numeric values before imputation.
+- Correlation heatmap computation is bounded by `overall_corr_heatmap_max_columns`.
+- Large-data execution can be constrained through fast-mode pair and sample limits.
+- CSV ingestion follows a streaming two-pass model rather than full-file buffering.
 
-## Troubleshooting
+## 7. Troubleshooting
 
-### Build fails with OpenMP flags
+### 7.1 OpenMP Build Errors
 
-- Reconfigure with OpenMP disabled:
+Reconfigure with OpenMP disabled:
 
 ```bash
 cmake -DSELDON_ENABLE_OPENMP=OFF ..
+cmake --build . -j
 ```
 
-### No charts generated
+### 7.2 Missing Plot Outputs
 
-- Ensure `gnuplot` is installed and in PATH.
-- Reports still generate without charts.
+Ensure `gnuplot` is available in `PATH` and plotting is enabled by configuration.
 
-### HTML files not generated
+### 7.3 Missing HTML Outputs
 
-- Ensure `pandoc` is installed.
-- Set `generate_html: true`.
+Ensure `pandoc` is available in `PATH` and set `generate_html: true`.
 
-### Config parse errors
+### 7.4 Configuration Parse Failures
 
-- Verify one `key: value` per line.
-- Avoid malformed quotes.
-- Check unsupported option names.
+Use one `key: value` pair per line and verify option names and quoting.
 
-## Related Docs
+## 8. Cross-Reference
 
-- [README.md](../README.md)
-- [docs/ARCHITECTURE.md](ARCHITECTURE.md)
+- [Project Overview](../README.md)
+- [Architecture Reference](ARCHITECTURE.md)
