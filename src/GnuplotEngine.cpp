@@ -45,9 +45,51 @@ std::string normalizePlotTitle(const std::string& title,
         if (!cleaned.empty() && cleaned.back() != ' ' && cleaned.back() != '\n') cleaned.push_back(' ');
     };
 
+    auto isAlphaNum = [](char c) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        return std::isalnum(uc) != 0;
+    };
+
+    auto appendSeparator = [&](const std::string& sep) {
+        if (!cleaned.empty() && cleaned.back() == ' ') cleaned.pop_back();
+        if (!cleaned.empty() && cleaned.back() != '\n') cleaned.push_back(' ');
+        cleaned += sep;
+        cleaned.push_back(' ');
+    };
+
     for (size_t i = 0; i < title.size(); ++i) {
         const char ch = title[i];
-        if (ch == '_' || ch == '-') {
+        const char prevRaw = (i > 0) ? title[i - 1] : '\0';
+        const char nextRaw = (i + 1 < title.size()) ? title[i + 1] : '\0';
+
+        if (ch == ':') {
+            appendSeparator("|");
+            continue;
+        }
+        if (ch == '|') {
+            appendSeparator("|");
+            continue;
+        }
+        if (ch == '-' && nextRaw == '>') {
+            appendSeparator("vs");
+            ++i;
+            continue;
+        }
+        if (ch == '<' && nextRaw == '-') {
+            appendSeparator("vs");
+            ++i;
+            continue;
+        }
+        if (ch == '-') {
+            const bool hyphenatedWord = isAlphaNum(prevRaw) && isAlphaNum(nextRaw);
+            if (hyphenatedWord) {
+                appendSpaceIfNeeded();
+            } else {
+                appendSeparator("|");
+            }
+            continue;
+        }
+        if (ch == '_') {
             appendSpaceIfNeeded();
             continue;
         }
@@ -86,6 +128,24 @@ std::string normalizePlotTitle(const std::string& title,
 
     if (collapsed.size() > maxTotal) {
         collapsed = collapsed.substr(0, maxTotal - 3) + "...";
+    }
+
+    std::string lower = collapsed;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    const bool hasVs = lower.find(" vs ") != std::string::npos;
+    const bool hasPipe = collapsed.find('|') != std::string::npos;
+    if (!hasVs && !hasPipe) {
+        const size_t overPos = lower.find(" over ");
+        if (overPos != std::string::npos) {
+            collapsed.replace(overPos, 6, " vs ");
+        } else {
+            const size_t byPos = lower.find(" by ");
+            if (byPos != std::string::npos) {
+                collapsed.replace(byPos, 4, " | by ");
+            }
+        }
     }
 
     if (collapsed.size() <= wrapAt) return collapsed;
