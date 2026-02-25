@@ -10,10 +10,13 @@ int main(int argc, char* argv[]) {
         AutomationPipeline pipeline;
         return pipeline.run(config);
     } catch (const Seldon::SeldonException& e) {
-        std::cerr << e.what() << "\n";
+        std::cerr << "[Seldon][Error] " << e.what() << "\n";
         return 1;
     } catch (const std::exception& e) {
-        std::cerr << "Unexpected error: " << e.what() << "\n";
+        std::cerr << "[Seldon][Error] Unexpected runtime failure: " << e.what() << "\n";
+        return 1;
+    } catch (...) {
+        std::cerr << "[Seldon][Error] Unknown non-standard exception encountered.\n";
         return 1;
     }
 }

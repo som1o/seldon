@@ -523,7 +523,9 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"scatter_fit_min_abs_corr", {&HeuristicTuningConfig::scatterFitMinAbsCorr, 0.0}},
         {"hybrid_explainability_weight_permutation", {&HeuristicTuningConfig::hybridExplainabilityWeightPermutation, 0.0}},
         {"hybrid_explainability_weight_integrated_gradients", {&HeuristicTuningConfig::hybridExplainabilityWeightIntegratedGradients, 0.0}},
-        {"gantt_duration_hours_threshold", {&HeuristicTuningConfig::ganttDurationHoursThreshold, 0.0}}
+        {"gantt_duration_hours_threshold", {&HeuristicTuningConfig::ganttDurationHoursThreshold, 0.0}},
+        {"lof_fallback_modified_z_threshold", {&HeuristicTuningConfig::lofFallbackModifiedZThreshold, 0.0}},
+        {"lof_threshold_floor", {&HeuristicTuningConfig::lofThresholdFloor, 0.0}}
     };
     static const std::unordered_map<std::string, TuningSizeRule> tuningSizeFields = {
         {"beta_fallback_intervals_start", {&HeuristicTuningConfig::betaFallbackIntervalsStart, 256}},
@@ -535,6 +537,8 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"pie_min_categories", {&HeuristicTuningConfig::pieMinCategories, 2}},
         {"pie_max_categories", {&HeuristicTuningConfig::pieMaxCategories, 2}},
         {"scatter_fit_min_sample_size", {&HeuristicTuningConfig::scatterFitMinSampleSize, 3}},
+        {"time_series_season_period", {&HeuristicTuningConfig::timeSeriesSeasonPeriod, 2}},
+        {"lof_max_rows", {&HeuristicTuningConfig::lofMaxRows, 100}},
         {"gantt_min_tasks", {&HeuristicTuningConfig::ganttMinTasks, 1}},
         {"gantt_max_tasks", {&HeuristicTuningConfig::ganttMaxTasks, 1}}
     };
@@ -611,7 +615,7 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     }
 
     if (argc < 2) {
-        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--plot-theme auto|light|dark] [--plot-grid true|false] [--plot-point-size >0] [--plot-line-width >0] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--neural-optimizer sgd|adam|lookahead] [--neural-lookahead-fast-optimizer sgd|adam] [--neural-lookahead-sync-period N] [--neural-lookahead-alpha 0..1] [--neural-use-batch-norm true|false] [--neural-batch-norm-momentum 0..1) [--neural-batch-norm-epsilon >0] [--neural-use-layer-norm true|false] [--neural-layer-norm-epsilon >0] [--neural-lr-decay 0..1] [--neural-lr-plateau-patience N] [--neural-lr-cooldown-epochs N] [--neural-max-lr-reductions N] [--neural-min-learning-rate >=0] [--neural-use-validation-loss-ema true|false] [--neural-validation-loss-ema-beta 0..1] [--neural-categorical-input-l2-boost >=0] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1] [--tier3-fallback-aggressiveness 0..3] [--ogive-min-points N] [--ogive-min-unique N] [--box-min-points N] [--box-min-iqr >=0] [--pie-min-categories N] [--pie-max-categories N] [--pie-max-dominance 0..1] [--fit-min-corr 0..1] [--fit-min-samples N] [--gantt-auto true|false] [--gantt-min-tasks N] [--gantt-max-tasks N] [--gantt-duration-hours-threshold >0]");
+        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--plot-theme auto|light|dark] [--plot-grid true|false] [--plot-point-size >0] [--plot-line-width >0] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--neural-optimizer sgd|adam|lookahead] [--neural-lookahead-fast-optimizer sgd|adam] [--neural-lookahead-sync-period N] [--neural-lookahead-alpha 0..1] [--neural-use-batch-norm true|false] [--neural-batch-norm-momentum 0..1) [--neural-batch-norm-epsilon >0] [--neural-use-layer-norm true|false] [--neural-layer-norm-epsilon >0] [--neural-lr-decay 0..1] [--neural-lr-plateau-patience N] [--neural-lr-cooldown-epochs N] [--neural-max-lr-reductions N] [--neural-min-learning-rate >=0] [--neural-use-validation-loss-ema true|false] [--neural-validation-loss-ema-beta 0..1] [--neural-categorical-input-l2-boost >=0] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1] [--tier3-fallback-aggressiveness 0..3] [--ogive-min-points N] [--ogive-min-unique N] [--box-min-points N] [--box-min-iqr >=0] [--pie-min-categories N] [--pie-max-categories N] [--pie-max-dominance 0..1] [--fit-min-corr 0..1] [--fit-min-samples N] [--time-series-season-period N] [--lof-max-rows N] [--lof-fallback-modified-z-threshold N] [--lof-threshold-floor N] [--gantt-auto true|false] [--gantt-min-tasks N] [--gantt-max-tasks N] [--gantt-duration-hours-threshold >0]");
     }
 
     AutoConfig config;
@@ -854,6 +858,14 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.tuning.scatterFitMinAbsCorr = parseDoubleStrict(argv[++i], "--fit-min-corr", 0.0);
         } else if (arg == "--fit-min-samples" && i + 1 < argc) {
             config.tuning.scatterFitMinSampleSize = static_cast<size_t>(parseIntStrict(argv[++i], "--fit-min-samples", 3));
+        } else if (arg == "--time-series-season-period" && i + 1 < argc) {
+            config.tuning.timeSeriesSeasonPeriod = static_cast<size_t>(parseIntStrict(argv[++i], "--time-series-season-period", 2));
+        } else if (arg == "--lof-max-rows" && i + 1 < argc) {
+            config.tuning.lofMaxRows = static_cast<size_t>(parseIntStrict(argv[++i], "--lof-max-rows", 100));
+        } else if (arg == "--lof-fallback-modified-z-threshold" && i + 1 < argc) {
+            config.tuning.lofFallbackModifiedZThreshold = parseDoubleStrict(argv[++i], "--lof-fallback-modified-z-threshold", 0.0);
+        } else if (arg == "--lof-threshold-floor" && i + 1 < argc) {
+            config.tuning.lofThresholdFloor = parseDoubleStrict(argv[++i], "--lof-threshold-floor", 0.0);
         } else if (arg == "--gantt-auto" && i + 1 < argc) {
             config.tuning.ganttAutoEnabled = parseBoolStrict(argv[++i], "--gantt-auto");
         } else if (arg == "--gantt-min-tasks" && i + 1 < argc) {
@@ -997,6 +1009,18 @@ void HeuristicTuningConfig::validate() const {
     }
     if (scatterFitMinSampleSize < 3) {
         throw Seldon::ConfigurationException("scatter_fit_min_sample_size must be >= 3");
+    }
+    if (timeSeriesSeasonPeriod < 2) {
+        throw Seldon::ConfigurationException("time_series_season_period must be >= 2");
+    }
+    if (lofMaxRows < 100) {
+        throw Seldon::ConfigurationException("lof_max_rows must be >= 100");
+    }
+    if (lofFallbackModifiedZThreshold <= 0.0) {
+        throw Seldon::ConfigurationException("lof_fallback_modified_z_threshold must be > 0");
+    }
+    if (lofThresholdFloor <= 0.0) {
+        throw Seldon::ConfigurationException("lof_threshold_floor must be > 0");
     }
     if (ganttMinTasks < 1 || ganttMaxTasks < ganttMinTasks) {
         throw Seldon::ConfigurationException("gantt_min_tasks must be >= 1 and <= gantt_max_tasks");

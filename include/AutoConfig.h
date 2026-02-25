@@ -32,6 +32,8 @@ struct HeuristicTuningConfig {
     // box_plot_min_points, box_plot_min_iqr,
     // pie_min_categories, pie_max_categories, pie_max_dominance_ratio,
     // scatter_fit_min_abs_corr, scatter_fit_min_sample_size,
+    // time_series_season_period,
+    // lof_max_rows, lof_fallback_modified_z_threshold, lof_threshold_floor,
     // gantt_auto_enabled, gantt_min_tasks, gantt_max_tasks, gantt_duration_hours_threshold.
     // Global significance threshold used in pairwise significance checks.
     double significanceAlpha = 0.05;
@@ -128,6 +130,12 @@ struct HeuristicTuningConfig {
 
     // Automatic time-series trend overlay tuning
     size_t timeSeriesTrendMinRows = 18;
+    size_t timeSeriesSeasonPeriod = 12;
+
+    // LOF outlier detector tuning
+    size_t lofMaxRows = 120000;
+    double lofFallbackModifiedZThreshold = 3.5;
+    double lofThresholdFloor = 1.5;
 
     // Scatter fitted-line suitability tuning
     double scatterFitMinAbsCorr = 0.35;

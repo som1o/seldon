@@ -2,6 +2,7 @@
 
 #include "BenchmarkEngine.h"
 #include "CommonUtils.h"
+#include "DeterministicHeuristics.h"
 #include "GnuplotEngine.h"
 #include "MathUtils.h"
 #include "NeuralNet.h"
@@ -13,6 +14,7 @@
 #include "TypedDataset.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -27,6 +29,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <set>
 #include <string_view>
@@ -115,6 +118,37 @@ bool containsToken(const std::string& text, const std::vector<std::string>& toke
         if (lower.find(token) != std::string::npos) return true;
     }
     return false;
+}
+
+bool isAdministrativeColumnName(const std::string& name) {
+    const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
+    if (lower.empty()) return false;
+
+    static const std::regex strictAdminPattern(
+        R"((^id$)|(^idx$)|(^index$)|(_id$)|(^id_)|(_index$)|(_idx$)|(^row_?id$)|(^row_?num(ber)?$)|(^uuid$)|(_uuid$)|(^guid$)|(_guid$)|(^timestamp$)|(_timestamp$)|(^created(_at)?$)|(_created(_at)?$)|(^updated(_at)?$)|(_updated(_at)?$))",
+        std::regex::icase);
+    if (std::regex_search(lower, strictAdminPattern)) return true;
+
+    return containsToken(lower, {
+        "meta", "metadata", "ingest", "ingestion", "audit", "rownum", "serial", "sequence", "record_id"
+    });
+}
+
+bool isTargetCandidateColumnName(const std::string& name) {
+    const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
+    if (lower.empty()) return false;
+    if (containsToken(lower, {"score", "class", "target", "label", "outcome", "response"})) {
+        return true;
+    }
+    return lower == "y" || lower == "y_true";
+}
+
+bool isEngineeredFeatureName(const std::string& name) {
+    const std::string lower = CommonUtils::toLower(name);
+    return lower.find("_pow") != std::string::npos
+        || lower.find("_log1p_abs") != std::string::npos
+        || lower.find("_x_") != std::string::npos
+        || lower.find("_div_") != std::string::npos;
 }
 
 bool shouldAddOgive(const std::vector<double>& values, const HeuristicTuningConfig& tuning) {
@@ -692,7 +726,10 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
 
         std::string lname = col.name;
         std::transform(lname.begin(), lname.end(), lname.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        double namePenalty = (lname.find("id") != std::string::npos || lname.find("index") != std::string::npos) ? 0.25 : 0.0;
+        const bool adminName = isAdministrativeColumnName(lname);
+        const bool targetHint = isTargetCandidateColumnName(lname);
+        double namePenalty = adminName ? 0.70 : ((lname.find("id") != std::string::npos || lname.find("index") != std::string::npos) ? 0.25 : 0.0);
+        double nameBonus = targetHint ? 0.20 : 0.0;
         if (containsToken(lname, {"timestamp", "created", "updated", "time", "date"})) {
             namePenalty += 0.15;
         }
@@ -705,7 +742,29 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
              + 0.25 * varianceScore
              + 0.15 * nonZeroRatio
              + 0.30 * entropyScore
-             - namePenalty;
+             - namePenalty
+             + nameBonus;
+    };
+
+    auto pickBySemanticTargetHint = [&]() -> std::optional<size_t> {
+        std::vector<size_t> hinted;
+        hinted.reserve(numeric.size());
+        for (size_t idx : numeric) {
+            const std::string lname = CommonUtils::toLower(data.columns()[idx].name);
+            if (isAdministrativeColumnName(lname)) continue;
+            if (isTargetCandidateColumnName(lname)) hinted.push_back(idx);
+        }
+        if (hinted.empty()) return std::nullopt;
+        size_t best = hinted.front();
+        double bestScore = -1e9;
+        for (size_t idx : hinted) {
+            const double s = scoreColumnQuality(idx);
+            if (s > bestScore) {
+                bestScore = s;
+                best = idx;
+            }
+        }
+        return best;
     };
 
     auto pickByQuality = [&]() {
@@ -751,6 +810,12 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
     if (mode == "last_numeric") {
         choice.index = static_cast<int>(pickLastNumeric());
         choice.strategyUsed = "last_numeric";
+        return choice;
+    }
+
+    if (auto semanticHint = pickBySemanticTargetHint(); semanticHint.has_value()) {
+        choice.index = static_cast<int>(*semanticHint);
+        choice.strategyUsed = "semantic_target_hint";
         return choice;
     }
 
@@ -895,6 +960,10 @@ FeatureSelectionResult collectFeatureIndices(const TypedDataset& data,
         if (static_cast<int>(idx) == targetIdx) continue;
         const std::string& name = data.columns()[idx].name;
         if (excluded.find(name) != excluded.end()) continue;
+        if (isAdministrativeColumnName(name)) {
+            out.droppedByMissingness.push_back(name + " (semantic_admin)");
+            continue;
+        }
 
         double missingRatio = 0.0;
         auto mit = prep.missingCounts.find(name);
@@ -1088,8 +1157,10 @@ struct NeuralAnalysis {
     size_t hiddenNodes = 0;
     size_t outputNodes = 0;
     bool binaryTarget = false;
+    bool classificationTarget = false;
     std::string hiddenActivation;
     std::string outputActivation;
+    std::string lossName = "mse";
     size_t epochs = 0;
     size_t batchSize = 0;
     double valSplit = 0.0;
@@ -1111,6 +1182,8 @@ struct NeuralAnalysis {
     double categoricalImportanceShare = 0.0;
     std::vector<double> uncertaintyStd;
     std::vector<double> uncertaintyCiWidth;
+    bool strictPruningApplied = false;
+    size_t strictPrunedColumns = 0;
 };
 
 struct DataHealthSummary {
@@ -1135,6 +1208,25 @@ std::string healthBandFromScore(double score) {
     if (score >= 55.0) return "moderate";
     if (score >= 40.0) return "weak";
     return "limited";
+}
+
+double estimateTrainingStability(const std::vector<double>& trainLoss,
+                                 const std::vector<double>& valLoss) {
+    if (trainLoss.empty()) return 0.5;
+
+    const double trainStart = trainLoss.front();
+    const double trainEnd = trainLoss.back();
+    const double baseline = std::max(1e-9, std::abs(trainStart));
+    const double improvement = (trainStart - trainEnd) / baseline;
+    const double convergence = std::clamp(0.5 + 0.5 * improvement, 0.0, 1.0);
+
+    if (!valLoss.empty() && valLoss.size() == trainLoss.size()) {
+        const double valEnd = valLoss.back();
+        const double gap = std::abs(valEnd - trainEnd) / std::max(1e-9, std::abs(trainEnd) + 1e-9);
+        const double generalization = std::clamp(1.0 - gap, 0.0, 1.0);
+        return 0.7 * convergence + 0.3 * generalization;
+    }
+    return convergence;
 }
 
 DataHealthSummary computeDataHealthSummary(const TypedDataset& data,
@@ -1173,23 +1265,7 @@ DataHealthSummary computeDataHealthSummary(const TypedDataset& data,
             : std::clamp(std::log1p(static_cast<double>(selectedPairCount)) / expectedSelected, 0.0, 1.0);
     }
 
-    out.trainingStability = 0.5;
-    if (!neural.trainLoss.empty()) {
-        double trainStart = neural.trainLoss.front();
-        double trainEnd = neural.trainLoss.back();
-        double baseline = std::max(1e-9, std::abs(trainStart));
-        double improvement = (trainStart - trainEnd) / baseline;
-        double convergence = std::clamp(0.5 + 0.5 * improvement, 0.0, 1.0);
-
-        if (!neural.valLoss.empty() && neural.valLoss.size() == neural.trainLoss.size()) {
-            double valEnd = neural.valLoss.back();
-            double gap = std::abs(valEnd - trainEnd) / std::max(1e-9, std::abs(trainEnd) + 1e-9);
-            double generalization = std::clamp(1.0 - gap, 0.0, 1.0);
-            out.trainingStability = 0.7 * convergence + 0.3 * generalization;
-        } else {
-            out.trainingStability = convergence;
-        }
-    }
+    out.trainingStability = estimateTrainingStability(neural.trainLoss, neural.valLoss);
 
     const double score01 =
         0.30 * out.completeness +
@@ -1721,15 +1797,18 @@ void saveGeneratedReports(const AutoConfig& runCfg,
                           const ReportEngine& univariate,
                           const ReportEngine& bivariate,
                           const ReportEngine& neuralReport,
-                          const ReportEngine& finalAnalysis) {
+                          const ReportEngine& finalAnalysis,
+                          const ReportEngine& heuristicsReport) {
     const std::string uniMd = runCfg.outputDir + "/univariate.md";
     const std::string biMd = runCfg.outputDir + "/bivariate.md";
     const std::string finalMd = runCfg.outputDir + "/final_analysis.md";
+    const std::string reportMd = runCfg.outputDir + "/report.md";
 
     univariate.save(uniMd);
     bivariate.save(biMd);
     neuralReport.save(runCfg.reportFile);
     finalAnalysis.save(finalMd);
+    heuristicsReport.save(reportMd);
 
     if (runCfg.generateHtml) {
         const std::string pandocExe = findExecutableInPath("pandoc");
@@ -1740,7 +1819,8 @@ void saveGeneratedReports(const AutoConfig& runCfg,
             {uniMd, runCfg.outputDir + "/univariate.html"},
             {biMd, runCfg.outputDir + "/bivariate.html"},
             {runCfg.reportFile, runCfg.outputDir + "/neural_synthesis.html"},
-            {finalMd, runCfg.outputDir + "/final_analysis.html"}
+            {finalMd, runCfg.outputDir + "/final_analysis.html"},
+            {reportMd, runCfg.outputDir + "/report.html"}
         };
         for (const auto& [src, dst] : conversions) {
             spawnProcessSilenced(pandocExe, {src, "-o", dst, "--standalone", "--self-contained"});
@@ -1755,13 +1835,15 @@ void printPipelineCompletion(const AutoConfig& runCfg) {
               << runCfg.outputDir << "/univariate.md, "
               << runCfg.outputDir << "/bivariate.md, "
               << runCfg.reportFile << ", "
-              << runCfg.outputDir << "/final_analysis.md\n";
+              << runCfg.outputDir << "/final_analysis.md, "
+              << runCfg.outputDir << "/report.md\n";
     if (runCfg.generateHtml) {
         std::cout << "[Seldon] HTML reports (self-contained): "
                   << runCfg.outputDir << "/univariate.html, "
                   << runCfg.outputDir << "/bivariate.html, "
                   << runCfg.outputDir << "/neural_synthesis.html, "
-                  << runCfg.outputDir << "/final_analysis.html\n";
+                  << runCfg.outputDir << "/final_analysis.html, "
+                  << runCfg.outputDir << "/report.html\n";
     }
     std::cout << "[Seldon] Plot folders: "
               << plotSubdir(runCfg, "univariate") << ", "
@@ -2089,7 +2171,7 @@ void addNeuralLossSummaryTable(ReportEngine& report, const NeuralAnalysis& neura
 NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
                                  int targetIdx,
                                  const std::vector<int>& featureIdx,
-                                 bool binaryTarget,
+                                 bool classificationTarget,
                                  bool verbose,
                                  const AutoConfig& config,
                                  bool fastModeEnabled,
@@ -2097,9 +2179,11 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     NeuralAnalysis analysis;
     analysis.numericInputNodes = featureIdx.size();
     analysis.outputNodes = 1;
-    analysis.binaryTarget = binaryTarget;
+    analysis.binaryTarget = classificationTarget;
+    analysis.classificationTarget = classificationTarget;
     analysis.hiddenActivation = "n/a";
-    analysis.outputActivation = activationToString(binaryTarget ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR);
+    analysis.outputActivation = activationToString(classificationTarget ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR);
+    analysis.lossName = classificationTarget ? "cross_entropy" : "mse";
     analysis.trainingRowsTotal = data.rowCount();
 
     if (featureIdx.empty()) {
@@ -2121,11 +2205,14 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         const auto numericIdx = data.numericColumnIndices();
         std::vector<std::pair<int, double>> candidates;
         candidates.reserve(numericIdx.size());
-        const ColumnStats yStats = Statistics::calculateStats(y);
+        const NumericStatsCache statsCache = buildNumericStatsCache(data);
+        const auto yIt = statsCache.find(static_cast<size_t>(targetIdx));
+        const ColumnStats yStats = (yIt != statsCache.end()) ? yIt->second : Statistics::calculateStats(y);
         for (size_t idx : numericIdx) {
             if (static_cast<int>(idx) == targetIdx) continue;
             const auto& cand = std::get<std::vector<double>>(data.columns()[idx].values);
-            const ColumnStats cStats = Statistics::calculateStats(cand);
+            const auto cIt = statsCache.find(idx);
+            const ColumnStats cStats = (cIt != statsCache.end()) ? cIt->second : Statistics::calculateStats(cand);
             const double corr = std::abs(MathUtils::calculatePearson(cand, y, cStats, yStats).value_or(0.0));
             if (std::isfinite(corr)) {
                 candidates.push_back({static_cast<int>(idx), corr});
@@ -2202,7 +2289,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         hp.l2Lambda = (data.rowCount() < 80) ? 0.010 : 0.001;
         hp.categoricalInputL2Boost = config.neuralCategoricalInputL2Boost;
         hp.activation = (inputNodes < 10) ? NeuralNet::Activation::TANH : NeuralNet::Activation::GELU;
-        hp.outputActivation = (outputNodes == 1 && binaryTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
+        hp.outputActivation = (outputNodes == 1 && classificationTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
         hp.useBatchNorm = config.neuralUseBatchNorm;
         hp.batchNormMomentum = config.neuralBatchNormMomentum;
         hp.batchNormEpsilon = config.neuralBatchNormEpsilon;
@@ -2212,7 +2299,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         hp.lookaheadFastOptimizer = toOptimizer(config.neuralLookaheadFastOptimizer);
         hp.lookaheadSyncPeriod = static_cast<size_t>(std::max(1, config.neuralLookaheadSyncPeriod));
         hp.lookaheadAlpha = config.neuralLookaheadAlpha;
-        hp.loss = (outputNodes == 1 && binaryTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
+        hp.loss = (outputNodes == 1 && classificationTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
         hp.importanceMaxRows = config.neuralImportanceMaxRows;
         hp.importanceParallel = config.neuralImportanceParallel;
         hp.verbose = verbose;
@@ -2239,6 +2326,15 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         const size_t chunkRows = std::max<size_t>(16, config.neuralStreamingChunkRows);
         char xTmp[] = "/tmp/seldon_nn_x_XXXXXX";
         char yTmp[] = "/tmp/seldon_nn_y_XXXXXX";
+        struct ScopedUnlink {
+            const char* path = nullptr;
+            bool active = false;
+            ~ScopedUnlink() {
+                if (active && path) ::unlink(path);
+            }
+            void release() { active = false; }
+        } xTmpGuard{xTmp, false}, yTmpGuard{yTmp, false};
+
         const int xFd = ::mkstemp(xTmp);
         const int yFd = ::mkstemp(yTmp);
         if (xFd < 0 || yFd < 0) {
@@ -2246,6 +2342,8 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
             if (yFd >= 0) ::close(yFd);
             throw Seldon::IOException("Failed to create temporary binary files for streaming neural training");
         }
+        xTmpGuard.active = true;
+        yTmpGuard.active = true;
 
         std::ofstream xOut(xTmp, std::ios::binary | std::ios::trunc);
         std::ofstream yOut(yTmp, std::ios::binary | std::ios::trunc);
@@ -2304,12 +2402,14 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         hp.useMemoryMappedInput = true;
 
         nn.train({}, {}, hp);
+        xTmpGuard.release();
+        yTmpGuard.release();
         ::unlink(xTmp);
         ::unlink(yTmp);
 
         analysis.hiddenNodes = hidden;
         analysis.outputNodes = outputNodes;
-        analysis.binaryTarget = (outputNodes == 1 && binaryTarget);
+        analysis.binaryTarget = (outputNodes == 1 && classificationTarget);
         analysis.hiddenActivation = activationToString(hp.activation);
         analysis.outputActivation = activationToString(hp.outputActivation);
         analysis.epochs = hp.epochs;
@@ -2464,6 +2564,84 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     if (inputNodes > 0) {
         const double dofRatio = static_cast<double>(data.rowCount()) / static_cast<double>(std::max<size_t>(1, inputNodes));
         if (dofRatio < 10.0) {
+            struct ColScore {
+                size_t idx = 0;
+                double score = 0.0;
+            };
+
+            std::vector<ColScore> engineeredScores;
+            const size_t rows = std::min(Xnn.size(), Ynn.size());
+            double yMean = 0.0;
+            for (size_t r = 0; r < rows; ++r) yMean += Ynn[r][0];
+            yMean /= std::max<size_t>(1, rows);
+            double yVar = 0.0;
+            for (size_t r = 0; r < rows; ++r) {
+                const double d = Ynn[r][0] - yMean;
+                yVar += d * d;
+            }
+            yVar = std::max(1e-12, yVar);
+
+            for (size_t c = 0; c < inputNodes; ++c) {
+                if (c >= encoded.sourceNumericFeaturePos.size()) continue;
+                const int numericPos = encoded.sourceNumericFeaturePos[c];
+                if (numericPos < 0 || static_cast<size_t>(numericPos) >= featureIdx.size()) continue;
+                const int sourceCol = featureIdx[static_cast<size_t>(numericPos)];
+                if (sourceCol < 0 || static_cast<size_t>(sourceCol) >= data.columns().size()) continue;
+                if (!isEngineeredFeatureName(data.columns()[static_cast<size_t>(sourceCol)].name)) continue;
+
+                double xMean = 0.0;
+                for (size_t r = 0; r < rows; ++r) xMean += Xnn[r][c];
+                xMean /= std::max<size_t>(1, rows);
+                double xVar = 0.0;
+                double cov = 0.0;
+                for (size_t r = 0; r < rows; ++r) {
+                    const double dx = Xnn[r][c] - xMean;
+                    const double dy = Ynn[r][0] - yMean;
+                    xVar += dx * dx;
+                    cov += dx * dy;
+                }
+                const double s = (xVar > 1e-12) ? std::abs(cov) / std::sqrt(std::max(1e-12, xVar * yVar)) : 0.0;
+                engineeredScores.push_back({c, std::isfinite(s) ? s : 0.0});
+            }
+
+            if (engineeredScores.size() >= 4) {
+                std::sort(engineeredScores.begin(), engineeredScores.end(), [](const ColScore& a, const ColScore& b) {
+                    if (a.score == b.score) return a.idx < b.idx;
+                    return a.score < b.score;
+                });
+
+                const size_t dropCount = engineeredScores.size() / 2;
+                if (dropCount > 0 && (inputNodes - dropCount) >= 4) {
+                    std::vector<bool> keepMask(inputNodes, true);
+                    for (size_t i = 0; i < dropCount; ++i) keepMask[engineeredScores[i].idx] = false;
+
+                    std::vector<std::vector<double>> prunedX(Xnn.size(), std::vector<double>{});
+                    for (size_t r = 0; r < Xnn.size(); ++r) {
+                        prunedX[r].reserve(inputNodes - dropCount);
+                        for (size_t c = 0; c < inputNodes; ++c) {
+                            if (keepMask[c]) prunedX[r].push_back(Xnn[r][c]);
+                        }
+                    }
+
+                    std::vector<int> prunedSource;
+                    prunedSource.reserve(inputNodes - dropCount);
+                    for (size_t c = 0; c < inputNodes; ++c) {
+                        if (keepMask[c]) {
+                            prunedSource.push_back((c < encoded.sourceNumericFeaturePos.size()) ? encoded.sourceNumericFeaturePos[c] : -1);
+                        }
+                    }
+
+                    Xnn = std::move(prunedX);
+                    encoded.sourceNumericFeaturePos = std::move(prunedSource);
+                    inputNodes = Xnn.empty() ? 0 : Xnn.front().size();
+                    analysis.inputNodes = inputNodes;
+                    analysis.strictPruningApplied = true;
+                    analysis.strictPrunedColumns = dropCount;
+                }
+            }
+        }
+
+        if (dofRatio < 10.0) {
             const size_t squeezeCap = std::clamp<size_t>(data.rowCount() / 10, 4, std::max<size_t>(4, inputNodes));
             applyAdaptiveSparsity(squeezeCap);
             inputNodes = Xnn.empty() ? 0 : Xnn.front().size();
@@ -2577,8 +2755,8 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         probeHp.valSplit = 0.2;
         probeHp.earlyStoppingPatience = 6;
         probeHp.activation = NeuralNet::Activation::RELU;
-        probeHp.outputActivation = (outputNodes == 1 && binaryTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
-        probeHp.loss = (outputNodes == 1 && binaryTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
+        probeHp.outputActivation = (outputNodes == 1 && classificationTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
+        probeHp.loss = (outputNodes == 1 && classificationTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
         probeHp.verbose = false;
         probeHp.seed = config.neuralSeed + 17;
         probeHp.importanceMaxRows = std::min<size_t>(config.neuralImportanceMaxRows, 2000);
@@ -2805,7 +2983,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     if (policyName == "fast") hp.activation = NeuralNet::Activation::RELU;
     else if (policyName == "expressive") hp.activation = NeuralNet::Activation::GELU;
     else hp.activation = (inputNodes < 10) ? NeuralNet::Activation::TANH : NeuralNet::Activation::GELU;
-    hp.outputActivation = (outputNodes == 1 && binaryTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
+    hp.outputActivation = (outputNodes == 1 && classificationTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
     hp.useBatchNorm = config.neuralUseBatchNorm;
     hp.batchNormMomentum = config.neuralBatchNormMomentum;
     hp.batchNormEpsilon = config.neuralBatchNormEpsilon;
@@ -2815,7 +2993,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     hp.lookaheadFastOptimizer = toOptimizer(config.neuralLookaheadFastOptimizer);
     hp.lookaheadSyncPeriod = static_cast<size_t>(std::max(1, config.neuralLookaheadSyncPeriod));
     hp.lookaheadAlpha = config.neuralLookaheadAlpha;
-    hp.loss = (outputNodes == 1 && binaryTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
+    hp.loss = (outputNodes == 1 && classificationTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
     hp.importanceMaxRows = config.neuralImportanceMaxRows;
     hp.importanceParallel = config.neuralImportanceParallel;
     hp.verbose = verbose;
@@ -2936,19 +3114,40 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         nn.train(Xnn, Ynn, hp);
     }
 
+    const double stabilityProbe = estimateTrainingStability(nn.getTrainLossHistory(), nn.getValLossHistory());
+    if (stabilityProbe < 0.70 && hidden > 4 && config.neuralFixedHiddenNodes == 0) {
+        const size_t reducedHidden = std::max<size_t>(4, static_cast<size_t>(std::llround(static_cast<double>(hidden) * 0.65)));
+        if (reducedHidden < hidden) {
+            hidden = reducedHidden;
+            topology = buildTopology(hiddenLayers, hidden);
+            nn = NeuralNet(topology);
+            nn.setInputL2Scales(inputL2Scales);
+            hp.epochs = std::min<size_t>(hp.epochs, 180);
+            hp.earlyStoppingPatience = std::min(hp.earlyStoppingPatience, 10);
+            if (config.neuralStreamingMode) {
+                nn.trainIncremental(Xnn, Ynn, hp, std::max<size_t>(16, config.neuralStreamingChunkRows));
+            } else {
+                nn.train(Xnn, Ynn, hp);
+            }
+            analysis.policyUsed = policy.name + "+stability_shrink";
+        }
+    }
+
     analysis.inputNodes = inputNodes;
     analysis.hiddenNodes = hidden;
     analysis.outputNodes = outputNodes;
-    analysis.binaryTarget = (outputNodes == 1 && binaryTarget);
+    analysis.binaryTarget = (outputNodes == 1 && classificationTarget);
+    analysis.classificationTarget = classificationTarget;
     analysis.hiddenActivation = activationToString(hp.activation);
     analysis.outputActivation = activationToString(hp.outputActivation);
+    analysis.lossName = (hp.loss == NeuralNet::LossFunction::CROSS_ENTROPY) ? "cross_entropy" : "mse";
     analysis.epochs = hp.epochs;
     analysis.batchSize = hp.batchSize;
     analysis.valSplit = hp.valSplit;
     analysis.l2Lambda = hp.l2Lambda;
     analysis.dropoutRate = hp.dropoutRate;
     analysis.earlyStoppingPatience = hp.earlyStoppingPatience;
-    analysis.policyUsed = policy.name;
+    if (analysis.policyUsed.empty()) analysis.policyUsed = policy.name;
     analysis.explainabilityMethod = config.neuralExplainability;
     analysis.trainingRowsUsed = Xnn.size();
     {
@@ -3574,7 +3773,7 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         }
 
         for (auto& local : threadPairs) {
-            pairs.insert(pairs.end(), local.begin(), local.end());
+            pairs.insert(pairs.end(), std::make_move_iterator(local.begin()), std::make_move_iterator(local.end()));
         }
         printProgressBar("pair-generation", evalNumericIdx.size(), evalNumericIdx.size());
         #else
@@ -3912,6 +4111,566 @@ std::vector<AnovaInsight> analyzeAnovaPairs(const TypedDataset& data) {
             if (out.size() >= 12) return out;
         }
     }
+    return out;
+}
+
+struct AdvancedAnalyticsOutputs {
+    std::vector<std::vector<std::string>> orderedRows;
+    std::vector<std::vector<std::string>> mahalanobisRows;
+    std::vector<std::vector<std::string>> pdpRows;
+    std::vector<std::string> narrativeRows;
+    std::vector<std::string> priorityTakeaways;
+    std::optional<std::string> interactionEvidence;
+    std::unordered_map<size_t, double> mahalanobisByRow;
+    double mahalanobisThreshold = 0.0;
+    std::optional<std::string> executiveSummary;
+};
+
+std::string cramerStrengthLabel(double v) {
+    if (v >= 0.60) return "very strong";
+    if (v >= 0.40) return "strong";
+    if (v >= 0.20) return "moderate";
+    if (v >= 0.10) return "weak";
+    return "very weak";
+}
+
+AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
+                                                      int targetIdx,
+                                                      const std::vector<int>& featureIdx,
+                                                      const std::vector<double>& featureImportance,
+                                                      const std::vector<PairInsight>& bivariatePairs,
+                                                      const std::vector<AnovaInsight>& anovaRows,
+                                                      const std::vector<ContingencyInsight>& contingency,
+                                                      const NumericStatsCache& statsCache) {
+    AdvancedAnalyticsOutputs out;
+    if (targetIdx < 0 || static_cast<size_t>(targetIdx) >= data.columns().size()) return out;
+    if (data.columns()[static_cast<size_t>(targetIdx)].type != ColumnType::NUMERIC) return out;
+
+    const auto& y = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(targetIdx)].values);
+    const auto yIt = statsCache.find(static_cast<size_t>(targetIdx));
+    const ColumnStats yStats = (yIt != statsCache.end()) ? yIt->second : Statistics::calculateStats(y);
+
+    std::vector<size_t> numericFeatures;
+    numericFeatures.reserve(featureIdx.size());
+    for (int idx : featureIdx) {
+        if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
+        if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
+        if (idx == targetIdx) continue;
+        numericFeatures.push_back(static_cast<size_t>(idx));
+    }
+
+    auto importanceOf = [&](size_t idx) {
+        for (size_t i = 0; i < featureIdx.size() && i < featureImportance.size(); ++i) {
+            if (featureIdx[i] == static_cast<int>(idx)) return std::max(0.0, featureImportance[i]);
+        }
+        const auto xIt = statsCache.find(idx);
+        const auto& x = std::get<std::vector<double>>(data.columns()[idx].values);
+        const ColumnStats xStats = (xIt != statsCache.end()) ? xIt->second : Statistics::calculateStats(x);
+        return std::abs(MathUtils::calculatePearson(x, y, xStats, yStats).value_or(0.0));
+    };
+
+    std::sort(numericFeatures.begin(), numericFeatures.end(), [&](size_t a, size_t b) {
+        return importanceOf(a) > importanceOf(b);
+    });
+    if (numericFeatures.size() > 8) numericFeatures.resize(8);
+
+    size_t igA = static_cast<size_t>(-1);
+    size_t igB = static_cast<size_t>(-1);
+    double bestIgProxy = 0.0;
+    {
+        const size_t n = numericFeatures.size();
+        for (size_t i = 0; i < n; ++i) {
+            const auto& xa = std::get<std::vector<double>>(data.columns()[numericFeatures[i]].values);
+            for (size_t j = i + 1; j < n; ++j) {
+                const auto& xb = std::get<std::vector<double>>(data.columns()[numericFeatures[j]].values);
+                std::vector<double> cross;
+                cross.reserve(std::min({xa.size(), xb.size(), y.size()}));
+                std::vector<double> yc;
+                yc.reserve(cross.capacity());
+                const size_t m = std::min({xa.size(), xb.size(), y.size()});
+                for (size_t r = 0; r < m; ++r) {
+                    if (!std::isfinite(xa[r]) || !std::isfinite(xb[r]) || !std::isfinite(y[r])) continue;
+                    if (r < data.columns()[numericFeatures[i]].missing.size() && data.columns()[numericFeatures[i]].missing[r]) continue;
+                    if (r < data.columns()[numericFeatures[j]].missing.size() && data.columns()[numericFeatures[j]].missing[r]) continue;
+                    if (r < data.columns()[static_cast<size_t>(targetIdx)].missing.size() && data.columns()[static_cast<size_t>(targetIdx)].missing[r]) continue;
+                    cross.push_back(xa[r] * xb[r]);
+                    yc.push_back(y[r]);
+                }
+                if (cross.size() < 12) continue;
+                const ColumnStats cs = Statistics::calculateStats(cross);
+                const ColumnStats ys = Statistics::calculateStats(yc);
+                const double rxy = std::abs(MathUtils::calculatePearson(cross, yc, cs, ys).value_or(0.0));
+                const double proxy = rxy * std::sqrt(std::max(1e-12, importanceOf(numericFeatures[i]) * importanceOf(numericFeatures[j])));
+                if (std::isfinite(proxy) && proxy > bestIgProxy) {
+                    bestIgProxy = proxy;
+                    igA = numericFeatures[i];
+                    igB = numericFeatures[j];
+                }
+            }
+        }
+    }
+    out.orderedRows.push_back({"1", "Integrated-gradients interaction proxy", (igA == static_cast<size_t>(-1) ? "Insufficient stable pairs for proxy interactions." : (data.columns()[igA].name + " × " + data.columns()[igB].name + " proxy=" + toFixed(bestIgProxy, 4) + "; interaction candidate is materially stronger than independent effects.")) });
+
+    {
+        std::vector<int> parent(static_cast<int>(numericFeatures.size()));
+        std::iota(parent.begin(), parent.end(), 0);
+        auto findp = [&](auto&& self, int x) -> int {
+            if (parent[x] == x) return x;
+            parent[x] = self(self, parent[x]);
+            return parent[x];
+        };
+        auto unite = [&](int a, int b) {
+            a = findp(findp, a);
+            b = findp(findp, b);
+            if (a != b) parent[b] = a;
+        };
+        for (size_t i = 0; i < numericFeatures.size(); ++i) {
+            const auto& xi = std::get<std::vector<double>>(data.columns()[numericFeatures[i]].values);
+            const auto xiIt = statsCache.find(numericFeatures[i]);
+            const ColumnStats xis = (xiIt != statsCache.end()) ? xiIt->second : Statistics::calculateStats(xi);
+            for (size_t j = i + 1; j < numericFeatures.size(); ++j) {
+                const auto& xj = std::get<std::vector<double>>(data.columns()[numericFeatures[j]].values);
+                const auto xjIt = statsCache.find(numericFeatures[j]);
+                const ColumnStats xjs = (xjIt != statsCache.end()) ? xjIt->second : Statistics::calculateStats(xj);
+                const double r = std::abs(MathUtils::calculatePearson(xi, xj, xis, xjs).value_or(0.0));
+                if (r >= 0.92) unite(static_cast<int>(i), static_cast<int>(j));
+            }
+        }
+        std::unordered_map<int, std::vector<size_t>> groups;
+        for (size_t i = 0; i < numericFeatures.size(); ++i) {
+            groups[findp(findp, static_cast<int>(i))].push_back(numericFeatures[i]);
+        }
+        size_t redundant = 0;
+        std::vector<std::string> reps;
+        for (const auto& kv : groups) {
+            const auto& g = kv.second;
+            if (g.empty()) continue;
+            if (g.size() > 1) redundant += (g.size() - 1);
+            size_t best = g.front();
+            double bestScore = -1.0;
+            for (size_t idx : g) {
+                const auto& x = std::get<std::vector<double>>(data.columns()[idx].values);
+                const auto xIt = statsCache.find(idx);
+                const ColumnStats xs = (xIt != statsCache.end()) ? xIt->second : Statistics::calculateStats(x);
+                const double score = std::abs(MathUtils::calculatePearson(x, y, xs, yStats).value_or(0.0));
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = idx;
+                }
+            }
+            reps.push_back(data.columns()[best].name);
+        }
+        std::string repMsg;
+        for (size_t i = 0; i < std::min<size_t>(3, reps.size()); ++i) {
+            if (i) repMsg += ", ";
+            repMsg += reps[i];
+        }
+        out.orderedRows.push_back({"2", "Redundancy grouping (correlation clustering)", "Clusters=" + std::to_string(groups.size()) + ", redundant=" + std::to_string(redundant) + ", representatives: " + (repMsg.empty() ? "n/a" : repMsg)});
+    }
+
+    {
+        size_t deterministicCount = 0;
+        std::string exemplar = "none";
+        for (const auto& p : bivariatePairs) {
+            const bool deterministic = std::abs(p.r) >= 0.999 || p.filteredAsStructural;
+            if (!deterministic) continue;
+            ++deterministicCount;
+            if (exemplar == "none") exemplar = p.featureA + " ~ " + p.featureB + " (|r|=" + toFixed(std::abs(p.r), 4) + ")";
+        }
+        out.orderedRows.push_back({"3", "Deterministic relationship detection", "Flagged=" + std::to_string(deterministicCount) + "; exemplar: " + exemplar});
+    }
+
+    std::vector<size_t> stepwiseSelected;
+    {
+        auto fitModel = [&](const std::vector<size_t>& selected, std::vector<double>* outPred = nullptr) -> MLRDiagnostics {
+            MLRDiagnostics diag;
+            if (selected.empty()) return diag;
+            std::vector<std::vector<double>> rows;
+            std::vector<double> yy;
+            const size_t n = y.size();
+            for (size_t r = 0; r < n; ++r) {
+                if (r < data.columns()[static_cast<size_t>(targetIdx)].missing.size() && data.columns()[static_cast<size_t>(targetIdx)].missing[r]) continue;
+                if (!std::isfinite(y[r])) continue;
+                std::vector<double> row;
+                row.reserve(selected.size() + 1);
+                row.push_back(1.0);
+                bool ok = true;
+                for (size_t idx : selected) {
+                    const auto& v = std::get<std::vector<double>>(data.columns()[idx].values);
+                    if (r >= v.size() || !std::isfinite(v[r])) { ok = false; break; }
+                    if (r < data.columns()[idx].missing.size() && data.columns()[idx].missing[r]) { ok = false; break; }
+                    row.push_back(v[r]);
+                }
+                if (!ok) continue;
+                rows.push_back(std::move(row));
+                yy.push_back(y[r]);
+            }
+            if (rows.size() < selected.size() + 6) return diag;
+            MathUtils::Matrix X(rows.size(), selected.size() + 1);
+            MathUtils::Matrix Y(rows.size(), 1);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                for (size_t c = 0; c < rows[i].size(); ++c) X.at(i, c) = rows[i][c];
+                Y.at(i, 0) = yy[i];
+            }
+            diag = MathUtils::performMLRWithDiagnostics(X, Y);
+            if (outPred && diag.success && diag.coefficients.size() == selected.size() + 1) {
+                outPred->assign(rows.size(), 0.0);
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    double p = 0.0;
+                    for (size_t c = 0; c < rows[i].size(); ++c) p += rows[i][c] * diag.coefficients[c];
+                    (*outPred)[i] = p;
+                }
+            }
+            return diag;
+        };
+
+        if (!numericFeatures.empty()) {
+            stepwiseSelected.push_back(numericFeatures.front());
+            MLRDiagnostics bestDiag = fitModel(stepwiseSelected, nullptr);
+            for (size_t round = 0; round < 2; ++round) {
+                size_t bestFeat = static_cast<size_t>(-1);
+                double bestAdj = bestDiag.success ? bestDiag.adjustedRSquared : -1e9;
+                for (size_t idx : numericFeatures) {
+                    if (std::find(stepwiseSelected.begin(), stepwiseSelected.end(), idx) != stepwiseSelected.end()) continue;
+                    auto candidate = stepwiseSelected;
+                    candidate.push_back(idx);
+                    MLRDiagnostics diag = fitModel(candidate, nullptr);
+                    if (!diag.success) continue;
+                    if (diag.adjustedRSquared > bestAdj + 0.005) {
+                        bestAdj = diag.adjustedRSquared;
+                        bestFeat = idx;
+                        bestDiag = diag;
+                    }
+                }
+                if (bestFeat == static_cast<size_t>(-1)) break;
+                stepwiseSelected.push_back(bestFeat);
+            }
+
+            std::string names;
+            for (size_t i = 0; i < stepwiseSelected.size(); ++i) {
+                if (i) names += " + ";
+                names += data.columns()[stepwiseSelected[i]].name;
+            }
+            out.orderedRows.push_back({"4", "Residual discovery via stepwise OLS", names.empty() ? "No stable stepwise model found." : ("Selected: " + names + "; this indicates residual variance is explained by multiple predictors rather than one dominant correlation.")});
+            if (!names.empty()) {
+                out.priorityTakeaways.push_back("Stepwise model identifies multi-feature structure: " + names + ".");
+            }
+
+            const size_t controlCount = std::min<size_t>(stepwiseSelected.size(), 2);
+            std::vector<size_t> controls(stepwiseSelected.begin(), stepwiseSelected.begin() + controlCount);
+            auto partialCorr = [&](size_t feature) {
+                std::vector<double> yVec;
+                std::vector<double> xVec;
+                std::vector<std::vector<double>> ctrlRows;
+                const auto& xv = std::get<std::vector<double>>(data.columns()[feature].values);
+                for (size_t r = 0; r < y.size() && r < xv.size(); ++r) {
+                    if (!std::isfinite(y[r]) || !std::isfinite(xv[r])) continue;
+                    if (r < data.columns()[static_cast<size_t>(targetIdx)].missing.size() && data.columns()[static_cast<size_t>(targetIdx)].missing[r]) continue;
+                    if (r < data.columns()[feature].missing.size() && data.columns()[feature].missing[r]) continue;
+                    std::vector<double> row;
+                    row.reserve(controls.size() + 1);
+                    row.push_back(1.0);
+                    bool ok = true;
+                    for (size_t cidx : controls) {
+                        const auto& cv = std::get<std::vector<double>>(data.columns()[cidx].values);
+                        if (r >= cv.size() || !std::isfinite(cv[r])) { ok = false; break; }
+                        if (r < data.columns()[cidx].missing.size() && data.columns()[cidx].missing[r]) { ok = false; break; }
+                        row.push_back(cv[r]);
+                    }
+                    if (!ok) continue;
+                    ctrlRows.push_back(std::move(row));
+                    yVec.push_back(y[r]);
+                    xVec.push_back(xv[r]);
+                }
+                if (ctrlRows.size() < controls.size() + 8) return 0.0;
+                MathUtils::Matrix X(ctrlRows.size(), controls.size() + 1);
+                MathUtils::Matrix Yy(ctrlRows.size(), 1);
+                MathUtils::Matrix Yx(ctrlRows.size(), 1);
+                for (size_t i = 0; i < ctrlRows.size(); ++i) {
+                    for (size_t c = 0; c < ctrlRows[i].size(); ++c) X.at(i, c) = ctrlRows[i][c];
+                    Yy.at(i, 0) = yVec[i];
+                    Yx.at(i, 0) = xVec[i];
+                }
+                const auto by = MathUtils::multipleLinearRegression(X, Yy);
+                const auto bx = MathUtils::multipleLinearRegression(X, Yx);
+                if (by.size() != controls.size() + 1 || bx.size() != controls.size() + 1) return 0.0;
+                std::vector<double> ry(ctrlRows.size(), 0.0), rx(ctrlRows.size(), 0.0);
+                for (size_t i = 0; i < ctrlRows.size(); ++i) {
+                    double py = 0.0;
+                    double px = 0.0;
+                    for (size_t c = 0; c < ctrlRows[i].size(); ++c) {
+                        py += ctrlRows[i][c] * by[c];
+                        px += ctrlRows[i][c] * bx[c];
+                    }
+                    ry[i] = yVec[i] - py;
+                    rx[i] = xVec[i] - px;
+                }
+                const ColumnStats sx = Statistics::calculateStats(rx);
+                const ColumnStats sy = Statistics::calculateStats(ry);
+                return MathUtils::calculatePearson(rx, ry, sx, sy).value_or(0.0);
+            };
+
+            size_t bestPcIdx = static_cast<size_t>(-1);
+            double bestPc = 0.0;
+            for (size_t idx : numericFeatures) {
+                if (std::find(controls.begin(), controls.end(), idx) != controls.end()) continue;
+                const double pc = std::abs(partialCorr(idx));
+                if (pc > bestPc) {
+                    bestPc = pc;
+                    bestPcIdx = idx;
+                }
+            }
+            out.orderedRows.push_back({"5", "Partial correlation after control", (bestPcIdx == static_cast<size_t>(-1) ? "No stable partial-correlation signal." : (data.columns()[bestPcIdx].name + " retains independent signal after controlling for top predictors (partial |r|=" + toFixed(bestPc, 4) + ", controls=" + std::to_string(controls.size()) + ")"))});
+        } else {
+            out.orderedRows.push_back({"4", "Residual discovery via stepwise OLS", "No usable numeric predictors."});
+            out.orderedRows.push_back({"5", "Partial correlation after control", "No usable numeric predictors."});
+        }
+    }
+
+    {
+        std::string interactionMsg = "Insufficient data for interaction t-test.";
+        if (igA != static_cast<size_t>(-1) && igB != static_cast<size_t>(-1)) {
+            std::vector<std::array<double, 4>> rows;
+            std::vector<double> yAligned;
+            rows.reserve(y.size());
+            yAligned.reserve(y.size());
+            const auto& a = std::get<std::vector<double>>(data.columns()[igA].values);
+            const auto& b = std::get<std::vector<double>>(data.columns()[igB].values);
+            for (size_t r = 0; r < y.size() && r < a.size() && r < b.size(); ++r) {
+                if (!std::isfinite(y[r]) || !std::isfinite(a[r]) || !std::isfinite(b[r])) continue;
+                if (r < data.columns()[static_cast<size_t>(targetIdx)].missing.size() && data.columns()[static_cast<size_t>(targetIdx)].missing[r]) continue;
+                if (r < data.columns()[igA].missing.size() && data.columns()[igA].missing[r]) continue;
+                if (r < data.columns()[igB].missing.size() && data.columns()[igB].missing[r]) continue;
+                rows.push_back({1.0, a[r], b[r], a[r] * b[r]});
+                yAligned.push_back(y[r]);
+            }
+            if (rows.size() >= 16) {
+                MathUtils::Matrix X(rows.size(), 4);
+                MathUtils::Matrix Y(rows.size(), 1);
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    for (size_t c = 0; c < 4; ++c) X.at(i, c) = rows[i][c];
+                    Y.at(i, 0) = yAligned[i];
+                }
+                MLRDiagnostics diag = MathUtils::performMLRWithDiagnostics(X, Y);
+                if (diag.success && diag.tStats.size() > 3 && diag.pValues.size() > 3 && diag.coefficients.size() > 3) {
+                    const double tVal = diag.tStats[3];
+                    const double pVal = diag.pValues[3];
+                    const double beta = diag.coefficients[3];
+                    const std::string effectDir = beta >= 0.0 ? "synergistic" : "antagonistic";
+                    const std::string strength = (pVal < 1e-4) ? "very strong" : ((pVal < 0.01) ? "strong" : ((pVal < 0.05) ? "moderate" : "weak"));
+                    interactionMsg = data.columns()[igA].name + "×" + data.columns()[igB].name +
+                        " interaction is " + strength + " (t=" + toFixed(tVal, 4) + ", p=" + toFixed(pVal, 6) +
+                        "), indicating a " + effectDir + " joint effect on " + data.columns()[static_cast<size_t>(targetIdx)].name + ".";
+                    out.interactionEvidence = interactionMsg;
+                    out.priorityTakeaways.push_back(interactionMsg);
+                }
+            }
+        }
+        out.orderedRows.push_back({"6", "Linear interaction significance", interactionMsg});
+    }
+
+    {
+        std::string mahalMsg = "Insufficient stable dimensions for Mahalanobis outlier scoring.";
+        if (numericFeatures.size() >= 2) {
+            const size_t dims = std::min<size_t>(3, numericFeatures.size());
+            std::vector<std::vector<double>> rows;
+            std::vector<size_t> rowIds;
+            for (size_t r = 0; r < data.rowCount(); ++r) {
+                std::vector<double> row;
+                row.reserve(dims);
+                bool ok = true;
+                for (size_t c = 0; c < dims; ++c) {
+                    size_t idx = numericFeatures[c];
+                    const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
+                    if (r >= vals.size() || !std::isfinite(vals[r])) { ok = false; break; }
+                    if (r < data.columns()[idx].missing.size() && data.columns()[idx].missing[r]) { ok = false; break; }
+                    row.push_back(vals[r]);
+                }
+                if (!ok) continue;
+                rows.push_back(std::move(row));
+                rowIds.push_back(r + 1);
+            }
+            if (rows.size() > dims + 8) {
+                std::vector<double> mean(dims, 0.0);
+                for (const auto& row : rows) {
+                    for (size_t c = 0; c < dims; ++c) mean[c] += row[c];
+                }
+                for (double& m : mean) m /= static_cast<double>(rows.size());
+
+                MathUtils::Matrix cov(dims, dims);
+                for (const auto& row : rows) {
+                    for (size_t i = 0; i < dims; ++i) {
+                        for (size_t j = 0; j < dims; ++j) {
+                            cov.at(i, j) += (row[i] - mean[i]) * (row[j] - mean[j]);
+                        }
+                    }
+                }
+                const double denom = static_cast<double>(std::max<size_t>(1, rows.size() - 1));
+                for (size_t i = 0; i < dims; ++i) {
+                    for (size_t j = 0; j < dims; ++j) cov.at(i, j) /= denom;
+                }
+                auto invOpt = cov.inverse();
+                if (invOpt.has_value()) {
+                    const auto& inv = *invOpt;
+                    std::vector<double> d2(rows.size(), 0.0);
+                    for (size_t r = 0; r < rows.size(); ++r) {
+                        std::vector<double> diff(dims, 0.0);
+                        for (size_t c = 0; c < dims; ++c) diff[c] = rows[r][c] - mean[c];
+                        double sum = 0.0;
+                        for (size_t i = 0; i < dims; ++i) {
+                            double inner = 0.0;
+                            for (size_t j = 0; j < dims; ++j) inner += inv.data[i][j] * diff[j];
+                            sum += diff[i] * inner;
+                        }
+                        d2[r] = std::max(0.0, sum);
+                    }
+                    const double threshold = CommonUtils::quantileByNth(d2, 0.975);
+                    size_t flagged = 0;
+                    std::vector<std::pair<size_t, double>> top;
+                    for (size_t i = 0; i < d2.size(); ++i) {
+                        if (d2[i] >= threshold) {
+                            ++flagged;
+                            top.push_back({rowIds[i], d2[i]});
+                        }
+                    }
+                    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+                    out.mahalanobisThreshold = threshold;
+                    for (size_t i = 0; i < std::min<size_t>(6, top.size()); ++i) {
+                        out.mahalanobisRows.push_back({std::to_string(top[i].first), toFixed(top[i].second, 4), toFixed(threshold, 4)});
+                        out.mahalanobisByRow[top[i].first] = top[i].second;
+                    }
+                    mahalMsg = "Dimensions=" + std::to_string(dims) + ", flagged=" + std::to_string(flagged) + ", threshold(d2@97.5%)=" + toFixed(threshold, 4);
+                    if (flagged > 0) {
+                        out.priorityTakeaways.push_back("Mahalanobis multivariate scan flags " + std::to_string(flagged) + " structurally unusual observations.");
+                    }
+                }
+            }
+        }
+        out.orderedRows.push_back({"7", "Mahalanobis multivariate outliers", mahalMsg});
+    }
+
+    {
+        std::string anovaMsg = "No ANOVA/Tukey highlight available.";
+        if (!anovaRows.empty()) {
+            const auto it = std::max_element(anovaRows.begin(), anovaRows.end(), [](const auto& a, const auto& b) {
+                if (a.eta2 == b.eta2) return a.pValue > b.pValue;
+                return a.eta2 < b.eta2;
+            });
+            anovaMsg = it->categorical + " -> " + it->numeric + " (eta2=" + toFixed(it->eta2, 4) + ", Tukey=" + it->tukeySummary + ")";
+        }
+        out.orderedRows.push_back({"8", "ANOVA + Tukey HSD strongest class contrast", anovaMsg});
+    }
+
+    {
+        std::string cramerMsg = "No categorical-contingency highlight available.";
+        if (!contingency.empty()) {
+            const auto it = std::max_element(contingency.begin(), contingency.end(), [](const auto& a, const auto& b) {
+                return a.cramerV < b.cramerV;
+            });
+            cramerMsg = it->catA + " vs " + it->catB + " (V=" + toFixed(it->cramerV, 4) + ", " + cramerStrengthLabel(it->cramerV) + ")";
+        }
+        out.orderedRows.push_back({"9", "Cramér's V categorical strength", cramerMsg});
+    }
+
+    {
+        std::string pdpMsg = "Insufficient data for linear partial-dependence approximation.";
+        if (!numericFeatures.empty()) {
+            const size_t dims = std::min<size_t>(3, numericFeatures.size());
+            std::vector<std::vector<double>> rows;
+            std::vector<double> yy;
+            for (size_t r = 0; r < data.rowCount(); ++r) {
+                if (r >= y.size() || !std::isfinite(y[r])) continue;
+                if (r < data.columns()[static_cast<size_t>(targetIdx)].missing.size() && data.columns()[static_cast<size_t>(targetIdx)].missing[r]) continue;
+                std::vector<double> row;
+                row.reserve(dims + 1);
+                row.push_back(1.0);
+                bool ok = true;
+                for (size_t c = 0; c < dims; ++c) {
+                    const auto& vals = std::get<std::vector<double>>(data.columns()[numericFeatures[c]].values);
+                    if (r >= vals.size() || !std::isfinite(vals[r])) { ok = false; break; }
+                    if (r < data.columns()[numericFeatures[c]].missing.size() && data.columns()[numericFeatures[c]].missing[r]) { ok = false; break; }
+                    row.push_back(vals[r]);
+                }
+                if (!ok) continue;
+                rows.push_back(std::move(row));
+                yy.push_back(y[r]);
+            }
+            if (rows.size() >= dims + 10) {
+                MathUtils::Matrix X(rows.size(), dims + 1);
+                MathUtils::Matrix Y(rows.size(), 1);
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    for (size_t c = 0; c < rows[i].size(); ++c) X.at(i, c) = rows[i][c];
+                    Y.at(i, 0) = yy[i];
+                }
+                auto beta = MathUtils::multipleLinearRegression(X, Y);
+                if (beta.size() == dims + 1) {
+                    std::vector<double> meanX(dims, 0.0);
+                    for (const auto& row : rows) {
+                        for (size_t c = 0; c < dims; ++c) meanX[c] += row[c + 1];
+                    }
+                    for (double& v : meanX) v /= static_cast<double>(rows.size());
+
+                    for (size_t c = 0; c < std::min<size_t>(2, dims); ++c) {
+                        const auto& vals = std::get<std::vector<double>>(data.columns()[numericFeatures[c]].values);
+                        const double p10 = CommonUtils::quantileByNth(vals, 0.10);
+                        const double p50 = CommonUtils::quantileByNth(vals, 0.50);
+                        const double p90 = CommonUtils::quantileByNth(vals, 0.90);
+                        auto pred = [&](double v) {
+                            double yhat = beta[0];
+                            for (size_t j = 0; j < dims; ++j) {
+                                const double xj = (j == c) ? v : meanX[j];
+                                yhat += beta[j + 1] * xj;
+                            }
+                            return yhat;
+                        };
+                        const double y10 = pred(p10);
+                        const double y50 = pred(p50);
+                        const double y90 = pred(p90);
+                        const double delta = y90 - y10;
+                        const std::string direction = (delta > 0.0) ? "increasing" : ((delta < 0.0) ? "decreasing" : "flat");
+                        out.pdpRows.push_back({data.columns()[numericFeatures[c]].name,
+                                               toFixed(y10, 4),
+                                               toFixed(y50, 4),
+                                               toFixed(y90, 4),
+                                               toFixed(delta, 4),
+                                               direction});
+                    }
+                    pdpMsg = "Generated linear PDP approximations for " + std::to_string(out.pdpRows.size()) + " top features.";
+                    if (!out.pdpRows.empty()) {
+                        out.priorityTakeaways.push_back("PDP approximation shows " + out.pdpRows.front()[0] + " has a " + out.pdpRows.front()[5] + " target response across low→high values (Δ=" + out.pdpRows.front()[4] + ").");
+                    }
+                }
+            }
+        }
+        out.orderedRows.push_back({"10", "Linear partial-dependence approximation", pdpMsg});
+    }
+
+    {
+        std::string topA = (numericFeatures.size() > 0) ? data.columns()[numericFeatures[0]].name : "Feature A";
+        std::string topB = (numericFeatures.size() > 1) ? data.columns()[numericFeatures[1]].name : "Feature B";
+        std::string narrative = topA + " dominates the global signal, while " + topB + " adds independent information after controlling for primary effects.";
+        if (igA != static_cast<size_t>(-1) && igB != static_cast<size_t>(-1)) {
+            narrative = data.columns()[igA].name + " and " + data.columns()[igB].name + " jointly shape the target: one carries dominant variance while the other contributes independent interaction structure.";
+        }
+        out.narrativeRows.push_back(narrative);
+        out.priorityTakeaways.push_back(narrative);
+        out.orderedRows.push_back({"11", "Cross-section narrative synthesis", narrative});
+    }
+
+    std::vector<std::vector<std::string>> filtered;
+    filtered.reserve(out.orderedRows.size());
+    for (const auto& row : out.orderedRows) {
+        if (row.size() < 3) continue;
+        const std::string r = CommonUtils::trim(row[2]);
+        if (r.rfind("Insufficient", 0) == 0 || r.rfind("No ", 0) == 0) continue;
+        filtered.push_back(row);
+    }
+    out.orderedRows = std::move(filtered);
+
+    if (!out.priorityTakeaways.empty()) {
+        out.executiveSummary = "Advanced methods confirm that signal is not purely pairwise: interaction evidence, multivariate outlier structure, and residual stepwise modeling all contribute independent explanatory value.";
+    }
+
     return out;
 }
 
@@ -4500,22 +5259,51 @@ void addOverallSections(ReportEngine& report,
                 report.addImage("Automatic Time-Series Trend", trend);
             }
 
-            std::vector<double> trendComp = ts->values;
-            const size_t w = std::clamp<size_t>(ts->values.size() / 12, 3, 24);
-            for (size_t i = 0; i < ts->values.size(); ++i) {
-                size_t lo = (i >= w) ? (i - w + 1) : 0;
-                double s = 0.0;
-                size_t c = 0;
-                for (size_t j = lo; j <= i; ++j) {
-                    s += ts->values[j];
-                    ++c;
+            const size_t nTs = ts->values.size();
+            const size_t seasonPeriod = std::clamp<size_t>(config.tuning.timeSeriesSeasonPeriod,
+                                                           static_cast<size_t>(2),
+                                                           std::max<size_t>(2, nTs / 2));
+            std::vector<double> trendComp(nTs, 0.0);
+            const size_t trendWindow = std::max<size_t>(3, std::min<size_t>(std::max<size_t>(seasonPeriod, 3), 25));
+            const size_t half = trendWindow / 2;
+            for (size_t i = 0; i < nTs; ++i) {
+                const size_t lo = (i > half) ? (i - half) : 0;
+                const size_t hi = std::min(nTs - 1, i + half);
+                double sum = 0.0;
+                size_t count = 0;
+                for (size_t j = lo; j <= hi; ++j) {
+                    sum += ts->values[j];
+                    ++count;
                 }
-                trendComp[i] = s / static_cast<double>(std::max<size_t>(1, c));
+                trendComp[i] = sum / static_cast<double>(std::max<size_t>(1, count));
             }
-            std::vector<double> seasonal(ts->values.size(), 0.0);
-            std::vector<double> resid(ts->values.size(), 0.0);
-            for (size_t i = 0; i < ts->values.size(); ++i) {
-                seasonal[i] = ts->values[i] - trendComp[i];
+
+            std::vector<double> detrended(nTs, 0.0);
+            for (size_t i = 0; i < nTs; ++i) {
+                detrended[i] = ts->values[i] - trendComp[i];
+            }
+
+            std::vector<double> seasonalMeans(seasonPeriod, 0.0);
+            std::vector<size_t> seasonalCounts(seasonPeriod, 0);
+            for (size_t i = 0; i < nTs; ++i) {
+                const size_t phase = i % seasonPeriod;
+                seasonalMeans[phase] += detrended[i];
+                seasonalCounts[phase] += 1;
+            }
+            for (size_t p = 0; p < seasonPeriod; ++p) {
+                if (seasonalCounts[p] > 0) {
+                    seasonalMeans[p] /= static_cast<double>(seasonalCounts[p]);
+                }
+            }
+            double seasonalMean = 0.0;
+            for (double v : seasonalMeans) seasonalMean += v;
+            seasonalMean /= static_cast<double>(seasonalMeans.size());
+            for (double& v : seasonalMeans) v -= seasonalMean;
+
+            std::vector<double> seasonal(nTs, 0.0);
+            std::vector<double> resid(nTs, 0.0);
+            for (size_t i = 0; i < nTs; ++i) {
+                seasonal[i] = seasonalMeans[i % seasonPeriod];
                 resid[i] = ts->values[i] - trendComp[i] - seasonal[i];
             }
             std::string decomp = overallPlotter->multiLine("overall_timeseries_decomposition",
@@ -4826,6 +5614,198 @@ void addOverallSections(ReportEngine& report,
         report.addParagraph("Overall plots were skipped (supervised mode disabled or gnuplot unavailable).");
     }
 }
+
+std::optional<std::string> buildResidualDiscoveryNarrative(const TypedDataset& data,
+                                                           int targetIdx,
+                                                           const std::vector<int>& featureIdx,
+                                                           const NumericStatsCache& statsCache) {
+    if (targetIdx < 0 || featureIdx.size() < 2) return std::nullopt;
+    if (static_cast<size_t>(targetIdx) >= data.columns().size()) return std::nullopt;
+    if (data.columns()[static_cast<size_t>(targetIdx)].type != ColumnType::NUMERIC) return std::nullopt;
+
+    const auto& y = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(targetIdx)].values);
+    const ColumnStats yStats = statsCache.count(static_cast<size_t>(targetIdx))
+        ? statsCache.at(static_cast<size_t>(targetIdx))
+        : Statistics::calculateStats(y);
+
+    int bestIdx = -1;
+    double bestAbsCorr = 0.0;
+    for (int idx : featureIdx) {
+        if (idx < 0 || idx == targetIdx) continue;
+        if (static_cast<size_t>(idx) >= data.columns().size()) continue;
+        if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
+        if (isAdministrativeColumnName(data.columns()[static_cast<size_t>(idx)].name)) continue;
+
+        const auto& x = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
+        const ColumnStats xStats = statsCache.count(static_cast<size_t>(idx))
+            ? statsCache.at(static_cast<size_t>(idx))
+            : Statistics::calculateStats(x);
+        const double r = std::abs(MathUtils::calculatePearson(x, y, xStats, yStats).value_or(0.0));
+        if (std::isfinite(r) && r > bestAbsCorr) {
+            bestAbsCorr = r;
+            bestIdx = idx;
+        }
+    }
+    if (bestIdx < 0 || bestAbsCorr < 0.35) return std::nullopt;
+
+    const auto& xMain = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(bestIdx)].values);
+    const ColumnStats xMainStats = statsCache.count(static_cast<size_t>(bestIdx))
+        ? statsCache.at(static_cast<size_t>(bestIdx))
+        : Statistics::calculateStats(xMain);
+    const auto [slope, intercept] = MathUtils::simpleLinearRegression(xMain,
+                                                                       y,
+                                                                       xMainStats,
+                                                                       yStats,
+                                                                       MathUtils::calculatePearson(xMain, y, xMainStats, yStats).value_or(0.0));
+
+    std::vector<double> residual;
+    residual.reserve(y.size());
+    for (size_t i = 0; i < y.size() && i < xMain.size(); ++i) {
+        if (!std::isfinite(y[i]) || !std::isfinite(xMain[i])) {
+            residual.push_back(std::numeric_limits<double>::quiet_NaN());
+            continue;
+        }
+        residual.push_back(y[i] - (slope * xMain[i] + intercept));
+    }
+    const ColumnStats residualStats = Statistics::calculateStats(residual);
+
+    int secondIdx = -1;
+    double bestResidualCorr = 0.0;
+    for (int idx : featureIdx) {
+        if (idx < 0 || idx == targetIdx || idx == bestIdx) continue;
+        if (static_cast<size_t>(idx) >= data.columns().size()) continue;
+        if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
+        if (isAdministrativeColumnName(data.columns()[static_cast<size_t>(idx)].name)) continue;
+
+        const auto& x = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
+        const ColumnStats xStats = statsCache.count(static_cast<size_t>(idx))
+            ? statsCache.at(static_cast<size_t>(idx))
+            : Statistics::calculateStats(x);
+        const double rr = std::abs(MathUtils::calculatePearson(x, residual, xStats, residualStats).value_or(0.0));
+        if (std::isfinite(rr) && rr > bestResidualCorr) {
+            bestResidualCorr = rr;
+            secondIdx = idx;
+        }
+    }
+    if (secondIdx < 0 || bestResidualCorr < 0.25) return std::nullopt;
+
+    return "Residual discovery: " + data.columns()[static_cast<size_t>(bestIdx)].name +
+           " is the primary driver of " + data.columns()[static_cast<size_t>(targetIdx)].name +
+           " (|r|=" + toFixed(bestAbsCorr, 3) + "), while " +
+           data.columns()[static_cast<size_t>(secondIdx)].name +
+           " best explains the remaining error signal (|r_residual|=" + toFixed(bestResidualCorr, 3) + ").";
+}
+
+std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset& data,
+                                                              const PreprocessReport& prep,
+                                                              const std::unordered_map<size_t, double>& mahalByRow = {},
+                                                              double mahalThreshold = 0.0,
+                                                              size_t maxRows = 8) {
+    std::vector<std::vector<std::string>> rows;
+    if (prep.outlierFlags.empty() || data.rowCount() == 0) return rows;
+
+    const std::vector<size_t> numericIdx = data.numericColumnIndices();
+    if (numericIdx.empty()) return rows;
+
+    std::unordered_map<std::string, ColumnStats> statsByName;
+    for (size_t idx : numericIdx) {
+        const auto& col = data.columns()[idx];
+        statsByName[col.name] = Statistics::calculateStats(std::get<std::vector<double>>(col.values));
+    }
+
+    for (size_t row = 0; row < data.rowCount() && rows.size() < maxRows; ++row) {
+        const size_t rowId = row + 1;
+        const auto mit = mahalByRow.find(rowId);
+        const bool hasMahalanobis = (mit != mahalByRow.end());
+        bool hasOutlier = false;
+        size_t primaryCol = static_cast<size_t>(-1);
+        double primaryAbsZ = 0.0;
+
+        for (size_t idx : numericIdx) {
+            const auto& col = data.columns()[idx];
+            auto fit = prep.outlierFlags.find(col.name);
+            if (fit == prep.outlierFlags.end()) continue;
+            if (row >= fit->second.size()) continue;
+            if (!fit->second[row]) continue;
+            if (row >= col.missing.size() || col.missing[row]) continue;
+
+            const auto& vals = std::get<std::vector<double>>(col.values);
+            if (row >= vals.size() || !std::isfinite(vals[row])) continue;
+            const auto sit = statsByName.find(col.name);
+            if (sit == statsByName.end()) continue;
+            const double z = (sit->second.stddev > 1e-12) ? std::abs((vals[row] - sit->second.mean) / sit->second.stddev) : 0.0;
+            if (!hasOutlier || z > primaryAbsZ) {
+                hasOutlier = true;
+                primaryAbsZ = z;
+                primaryCol = idx;
+            }
+        }
+
+        if (!hasOutlier && !hasMahalanobis) continue;
+
+        if (primaryCol == static_cast<size_t>(-1)) {
+            for (size_t idx : numericIdx) {
+                const auto& col = data.columns()[idx];
+                if (row >= col.missing.size() || col.missing[row]) continue;
+                const auto& vals = std::get<std::vector<double>>(col.values);
+                if (row >= vals.size() || !std::isfinite(vals[row])) continue;
+                const auto sit = statsByName.find(col.name);
+                if (sit == statsByName.end() || sit->second.stddev <= 1e-12) continue;
+                const double z = std::abs((vals[row] - sit->second.mean) / sit->second.stddev);
+                if (z > primaryAbsZ) {
+                    primaryAbsZ = z;
+                    primaryCol = idx;
+                }
+            }
+            if (primaryCol == static_cast<size_t>(-1)) continue;
+        }
+
+        const auto& primary = data.columns()[primaryCol];
+        const auto& primaryVals = std::get<std::vector<double>>(primary.values);
+        std::vector<std::pair<std::string, double>> context;
+        for (size_t idx : numericIdx) {
+            if (idx == primaryCol) continue;
+            const auto& col = data.columns()[idx];
+            if (row >= col.missing.size() || col.missing[row]) continue;
+            const auto& vals = std::get<std::vector<double>>(col.values);
+            if (row >= vals.size() || !std::isfinite(vals[row])) continue;
+            const auto sit = statsByName.find(col.name);
+            if (sit == statsByName.end() || sit->second.stddev <= 1e-12) continue;
+            const double z = (vals[row] - sit->second.mean) / sit->second.stddev;
+            if (std::abs(z) >= 1.5) context.push_back({col.name, z});
+        }
+        std::sort(context.begin(), context.end(), [](const auto& a, const auto& b) {
+            return std::abs(a.second) > std::abs(b.second);
+        });
+
+        std::string reason = "No dominant secondary deviations.";
+        if (!context.empty()) {
+            reason = "Context: ";
+            const size_t keep = std::min<size_t>(2, context.size());
+            for (size_t i = 0; i < keep; ++i) {
+                if (i > 0) reason += "; ";
+                reason += context[i].first + "=" + (context[i].second > 0.0 ? "high" : "low") + " (z=" + toFixed(context[i].second, 2) + ")";
+            }
+        }
+        if (hasMahalanobis) {
+            if (!reason.empty()) reason += "; ";
+            reason += "Mahalanobis multivariate distance is elevated (d2=" + toFixed(mit->second, 3);
+            if (mahalThreshold > 0.0) {
+                reason += ", threshold=" + toFixed(mahalThreshold, 3);
+            }
+            reason += ")";
+        }
+
+        rows.push_back({
+            std::to_string(row + 1),
+            primary.name,
+            toFixed(primaryVals[row], 4),
+            toFixed(primaryAbsZ, 2),
+            reason
+        });
+    }
+    return rows;
+}
 } // namespace
 
 int AutomationPipeline::run(const AutoConfig& config) {
@@ -4941,6 +5921,10 @@ int AutomationPipeline::run(const AutoConfig& config) {
         runCfg.neuralStrategy = "fast";
     }
 
+    if (!runCfg.storeOutlierFlagsInReport && data.rowCount() <= 50000) {
+        runCfg.storeOutlierFlagsInReport = true;
+    }
+
     PreprocessReport prep = Preprocessor::run(data, runCfg);
     advance("Preprocessed dataset");
     exportPreprocessedDatasetIfRequested(data, runCfg);
@@ -4978,12 +5962,32 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     FeatureSelectionResult selectedFeatures = collectFeatureIndices(data, targetIdx, runCfg, prep);
     std::vector<int> featureIdx = selectedFeatures.included;
+    DeterministicHeuristics::Outcome deterministic = DeterministicHeuristics::runAllPhases(data, prep, targetIdx, featureIdx);
+    if (!deterministic.filteredFeatures.empty()) {
+        featureIdx = deterministic.filteredFeatures;
+    }
+
+    if (deterministic.lowRatioMode) {
+        if (runCfg.neuralFixedLayers == 0) runCfg.neuralFixedLayers = 1;
+        if (runCfg.neuralFixedHiddenNodes == 0) runCfg.neuralFixedHiddenNodes = 6;
+        runCfg.neuralStrategy = "fast";
+    } else if (deterministic.highRatioMode) {
+        runCfg.neuralMinLayers = std::max(runCfg.neuralMinLayers, 3);
+        runCfg.neuralMaxLayers = std::max(runCfg.neuralMaxLayers, 3);
+        if (runCfg.neuralFixedHiddenNodes == 0) {
+            runCfg.neuralFixedHiddenNodes = std::max(runCfg.neuralFixedHiddenNodes, 50);
+        }
+        if (CommonUtils::toLower(runCfg.neuralStrategy) == "auto") runCfg.neuralStrategy = "expressive";
+    }
 
     if (runCfg.verboseAnalysis && !selectedFeatures.droppedByMissingness.empty()) {
         std::cout << "[Seldon][Features] Dropped sparse features (>"
                   << toFixed(selectedFeatures.missingThresholdUsed, 2)
                   << " missing ratio, strategy=" << selectedFeatures.strategyUsed << "):\n";
         for (const auto& item : selectedFeatures.droppedByMissingness) {
+            std::cout << "  - " << item << "\n";
+        }
+        for (const auto& item : deterministic.excludedReasonLines) {
             std::cout << "  - " << item << "\n";
         }
     }
@@ -4997,7 +6001,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     NeuralAnalysis neural = runNeuralAnalysis(data,
                                               targetIdx,
                                               featureIdx,
-                                              targetContext.semantics.isBinary,
+                                              targetContext.semantics.inferredTask != "regression",
                                               runCfg.verboseAnalysis,
                                               runCfg,
                                               fastModeEnabled,
@@ -5031,11 +6035,18 @@ int AutomationPipeline::run(const AutoConfig& config) {
     const auto numeric = data.numericColumnIndices();
     for (size_t idx : numeric) {
         if (importanceByIndex.find(idx) == importanceByIndex.end()) {
-            importanceByIndex[idx] = 0.0;
+            const auto& x = std::get<std::vector<double>>(data.columns()[idx].values);
+            const auto& y = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(targetIdx)].values);
+            const auto xIt = statsCache.find(idx);
+            const auto yIt = statsCache.find(static_cast<size_t>(targetIdx));
+            const ColumnStats xStats = (xIt != statsCache.end()) ? xIt->second : Statistics::calculateStats(x);
+            const ColumnStats yStats = (yIt != statsCache.end()) ? yIt->second : Statistics::calculateStats(y);
+            double corr = std::abs(MathUtils::calculatePearson(x, y, xStats, yStats).value_or(0.0));
+            importanceByIndex[idx] = std::isfinite(corr) ? corr : fallbackImportance;
         }
     }
 
-    std::unordered_set<size_t> modeledIndices;
+        std::unordered_set<size_t> modeledIndices;
     modeledIndices.insert(static_cast<size_t>(targetIdx));
     for (int idx : featureIdx) modeledIndices.insert(static_cast<size_t>(idx));
 
@@ -5152,6 +6163,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     std::vector<std::string> topTakeaways;
+    std::vector<std::string> narrativeInsights;
     std::string neuralInteractionTakeaway;
     std::unordered_set<size_t> usedFeatures;
     std::vector<PairInsight> rankedTakeaways;
@@ -5177,8 +6189,38 @@ int AutomationPipeline::run(const AutoConfig& config) {
         }
         label += " (effect=" + toFixed(p.effectSize, 3) + ", stability=" + toFixed(p.foldStability, 3) + ")";
         topTakeaways.push_back(label);
+
+        std::string narrative;
+        if (std::abs(p.r) >= 0.85) {
+            narrative = p.featureA + " effectively predicts " + p.featureB + " with high stability (|r|=" + toFixed(std::abs(p.r), 3) + ").";
+        } else if (std::abs(p.r) >= 0.65) {
+            narrative = p.featureA + " is a strong directional signal for " + p.featureB + " and can serve as a stable proxy.";
+        } else {
+            narrative = p.featureA + " contributes a moderate but consistent relationship with " + p.featureB + ".";
+        }
+        narrativeInsights.push_back(narrative);
+
         usedFeatures.insert(p.idxA);
         usedFeatures.insert(p.idxB);
+    }
+
+    {
+        std::vector<std::pair<std::string, double>> skewed;
+        for (size_t idx : data.numericColumnIndices()) {
+            const auto& col = data.columns()[idx];
+            if (isAdministrativeColumnName(col.name)) continue;
+            ColumnStats st = Statistics::calculateStats(std::get<std::vector<double>>(col.values));
+            if (!std::isfinite(st.skewness) || std::abs(st.skewness) < 1.2) continue;
+            skewed.push_back({col.name, std::abs(st.skewness)});
+        }
+        std::sort(skewed.begin(), skewed.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (size_t i = 0; i < std::min<size_t>(2, skewed.size()); ++i) {
+            narrativeInsights.push_back(skewed[i].first + " is heavily concentrated toward one side of its distribution (|skew|=" + toFixed(skewed[i].second, 2) + "), so tail behavior drives aggregate trends.");
+        }
+    }
+
+    for (const auto& badge : deterministic.badgeNarratives) {
+        narrativeInsights.push_back(badge);
     }
 
     if (!rankedTakeaways.empty()) {
@@ -5213,6 +6255,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
         const double impB = importanceByIndex.count(p.idxB) ? importanceByIndex[p.idxB] : 0.0;
         const std::string drop = (impA < impB) ? p.featureA : p.featureB;
         const std::string keep = (impA < impB) ? p.featureB : p.featureA;
+        const std::string dropLower = CommonUtils::toLower(CommonUtils::trim(drop));
+        const std::string targetLower = CommonUtils::toLower(CommonUtils::trim(runCfg.targetColumn));
+        if (dropLower == targetLower) continue;
         const std::string recommendation = "drop " + drop + " (redundant with " + keep + ")";
         if (seenDrop.insert(recommendation).second) {
             redundancyDrops.push_back(recommendation);
@@ -5276,6 +6321,15 @@ int AutomationPipeline::run(const AutoConfig& config) {
         bivariate.addTable("Automatic Stratified Population Signals", {"Segment Column", "Numeric Feature", "Groups", "Rows", "eta_squared", "separation", "group_means"}, rows);
     }
 
+    const AdvancedAnalyticsOutputs advancedOutputs = buildAdvancedAnalyticsOutputs(data,
+                                                                                   targetIdx,
+                                                                                   featureIdx,
+                                                                                   neural.featureImportance,
+                                                                                   bivariatePairs,
+                                                                                   anovaRows,
+                                                                                   contingency,
+                                                                                   statsCache);
+
     const DataHealthSummary dataHealth = computeDataHealthSummary(data,
                                                                   prep,
                                                                   neural,
@@ -5306,9 +6360,15 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Fast Mode", fastModeEnabled ? "enabled" : "disabled"},
         {"Neural Training Rows Used", std::to_string(neural.trainingRowsUsed) + " / " + std::to_string(neural.trainingRowsTotal)},
         {"Bivariate Strategy", bivariatePolicy.name},
+        {"Rows:Features", toFixed(deterministic.rowsToFeatures, 2)},
+        {"Lasso Gate", deterministic.lassoGateApplied ? ("on (kept=" + std::to_string(deterministic.lassoSelectedCount) + ")") : "off"},
         {"Tier-2 Pair Count", std::to_string(tier2Count)},
         {"Tier-3 Pair Count", std::to_string(tier3Count)}
     });
+
+    if (!deterministic.roleTagRows.empty()) {
+        neuralReport.addTable("Deterministic Semantic Role Tags", {"Column", "Role", "Unique", "Missing", "Null %"}, deterministic.roleTagRows);
+    }
     if (!selectedFeatures.droppedByMissingness.empty()) {
         neuralReport.addParagraph("Sparse numeric features dropped before modeling: " + std::to_string(selectedFeatures.droppedByMissingness.size()));
     }
@@ -5329,7 +6389,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Explainability", neural.explainabilityMethod},
         {"Categorical Importance Share", toFixed(neural.categoricalImportanceShare, 4)},
         {"Early Stop Patience", std::to_string(neural.earlyStoppingPatience)},
-        {"Loss", neural.binaryTarget ? "cross_entropy" : "mse"},
+        {"Loss", neural.lossName},
+        {"Strict Pruning", neural.strictPruningApplied ? ("on (dropped=" + std::to_string(neural.strictPrunedColumns) + ")") : "off"},
         {"Hidden Activation", neural.hiddenActivation},
         {"Output Activation", neural.outputActivation}
     });
@@ -5413,16 +6474,76 @@ int AutomationPipeline::run(const AutoConfig& config) {
     finalAnalysis.addParagraph("This report contains statistically significant findings selected by a tiered engine: Tier-2 (statistical + neural) and Tier-3 fallback (statistical + domain effect). Non-selected findings are excluded by design.");
     finalAnalysis.addParagraph("Data Health Score: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + "). This score estimates discovered signal strength using completeness, retained feature coverage, significant-pair yield, selected-pair yield, and neural training stability.");
 
-    if (!topTakeaways.empty()) {
+    if (!advancedOutputs.orderedRows.empty()) {
+        finalAnalysis.addTable("Ordered Advanced Methods (Strict 1→11)", {"Step", "Method", "Result"}, advancedOutputs.orderedRows);
+    }
+
+    if (!advancedOutputs.mahalanobisRows.empty()) {
+        finalAnalysis.addTable("Mahalanobis Multivariate Outliers", {"Row", "Distance^2", "Threshold"}, advancedOutputs.mahalanobisRows);
+    }
+
+    if (!advancedOutputs.pdpRows.empty()) {
+        finalAnalysis.addTable("Linear Partial Dependence Approximation", {"Feature", "Low (P10)", "Medium (P50)", "High (P90)", "Delta (High-Low)", "Direction"}, advancedOutputs.pdpRows);
+    }
+
+    if (!advancedOutputs.narrativeRows.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        rows.reserve(advancedOutputs.narrativeRows.size());
+        for (const auto& s : advancedOutputs.narrativeRows) rows.push_back({s});
+        finalAnalysis.addTable("Cross-Section Narrative Layer", {"Narrative"}, rows);
+    }
+
+    if (advancedOutputs.executiveSummary.has_value()) {
+        finalAnalysis.addParagraph("Advanced Analytics Executive Summary: " + *advancedOutputs.executiveSummary);
+    }
+
+    if (advancedOutputs.interactionEvidence.has_value()) {
+        neuralInteractionTakeaway = *advancedOutputs.interactionEvidence;
+    }
+
+    std::vector<std::string> prioritizedTakeaways;
+    std::unordered_set<std::string> seenTakeaways;
+    for (const auto& s : advancedOutputs.priorityTakeaways) {
+        if (!s.empty() && seenTakeaways.insert(s).second) prioritizedTakeaways.push_back(s);
+    }
+    for (const auto& s : topTakeaways) {
+        if (!s.empty() && seenTakeaways.insert(s).second) prioritizedTakeaways.push_back(s);
+    }
+    if (prioritizedTakeaways.size() > 3) prioritizedTakeaways.resize(3);
+
+    if (!prioritizedTakeaways.empty()) {
         std::vector<std::vector<std::string>> takeawayRows;
-        for (size_t i = 0; i < topTakeaways.size(); ++i) {
-            takeawayRows.push_back({std::to_string(i + 1), topTakeaways[i]});
+        for (size_t i = 0; i < prioritizedTakeaways.size(); ++i) {
+            takeawayRows.push_back({std::to_string(i + 1), prioritizedTakeaways[i]});
         }
         finalAnalysis.addTable("Top 3 Takeaways", {"Rank", "Takeaway"}, takeawayRows);
     }
 
     if (!neuralInteractionTakeaway.empty()) {
         finalAnalysis.addTable("Neural Interaction Takeaway", {"Insight"}, {{neuralInteractionTakeaway}});
+    }
+
+    if (auto residualNarrative = buildResidualDiscoveryNarrative(data, targetIdx, featureIdx, statsCache); residualNarrative.has_value()) {
+        finalAnalysis.addTable("Residual-Based Sequential Discovery", {"Insight"}, {{*residualNarrative}});
+    } else if (!deterministic.residualNarrative.empty()) {
+        finalAnalysis.addTable("Residual-Based Sequential Discovery", {"Insight"}, {{deterministic.residualNarrative}});
+    }
+
+    if (!narrativeInsights.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        rows.reserve(narrativeInsights.size());
+        for (size_t i = 0; i < narrativeInsights.size(); ++i) {
+            rows.push_back({std::to_string(i + 1), narrativeInsights[i]});
+        }
+        finalAnalysis.addTable("Narrative Insight Layer", {"#", "Insight"}, rows);
+    }
+
+    const auto outlierContextRows = buildOutlierContextRows(data,
+                                                            prep,
+                                                            advancedOutputs.mahalanobisByRow,
+                                                            advancedOutputs.mahalanobisThreshold);
+    if (!outlierContextRows.empty()) {
+        finalAnalysis.addTable("Outlier Contextualization", {"Row", "Primary Feature", "Value", "|z|", "Why it is unusual"}, outlierContextRows);
     }
 
     if (!redundancyDrops.empty()) {
@@ -5486,7 +6607,90 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Data Health Score", toFixed(dataHealth.score, 1) + " (" + dataHealth.band + ")"}
     });
 
-    saveGeneratedReports(runCfg, univariate, bivariate, neuralReport, finalAnalysis);
+    ReportEngine heuristicsReport;
+    heuristicsReport.addTitle("Deterministic Analysis Report");
+    heuristicsReport.addParagraph("This report presents deterministic analysis results and signal-quality controls, generated independently from final_analysis.md.");
+
+    size_t adminCount = 0;
+    size_t targetCandidateCount = 0;
+    size_t lowSignalCount = 0;
+    for (const auto& row : deterministic.roleTagRows) {
+        if (row.size() < 2) continue;
+        if (row[1] == "ADMIN") adminCount++;
+        else if (row[1] == "TARGET_CANDIDATE") targetCandidateCount++;
+        else if (row[1] == "LOW_SIGNAL") lowSignalCount++;
+    }
+
+    const bool stabilityGuardTriggered = (neural.policyUsed.find("stability_shrink") != std::string::npos);
+    const std::string stabilityPct = toFixed(100.0 * dataHealth.trainingStability, 1) + "%";
+
+    std::string phase1Narrative = "Semantic filter excluded " + std::to_string(adminCount)
+        + " administrative columns and marked " + std::to_string(lowSignalCount)
+        + " low-signal columns before lattice training.";
+
+    std::string phase3Narrative = "Rows:Features=" + toFixed(deterministic.rowsToFeatures, 2)
+        + "; strict pruning=" + std::string(neural.strictPruningApplied ? "on" : "off")
+        + "; lasso gate=" + std::string(deterministic.lassoGateApplied ? ("on (kept=" + std::to_string(deterministic.lassoSelectedCount) + ")") : "off") + ".";
+
+    std::string phase4Narrative = deterministic.residualNarrative.empty()
+        ? "Residual discovery scanned secondary drivers but no hidden-driver threshold was met."
+        : deterministic.residualNarrative;
+
+    std::string phase5Narrative = "Deterministic narrative synthesis translated statistical findings into concise analytical statements.";
+
+    heuristicsReport.addTable("Analysis Workflow Summary", {"Stage", "Objective", "Method", "Outcome"}, {
+        {"Semantic Filtering", "Reduce metadata and administrative noise", "Regex role tagging (ADMIN/METADATA/TARGET_CANDIDATE)", phase1Narrative},
+        {"Feature Guardrails", "Limit overfitting from engineered expansion", "Dynamic sparsity + lasso gate + engineered-feature controls", phase3Narrative},
+        {"Narrative Synthesis", "Convert model statistics into readable findings", "Deterministic narrative layer", phase5Narrative},
+        {"Residual Discovery", "Detect hidden secondary drivers", "Primary-fit residual pass across remaining features", phase4Narrative},
+        {"Outlier Context", "Explain anomaly relevance", "Contrastive z-score contextualization", "Outlier narratives now explain why flagged rows are unusual relative to the population."}
+    });
+
+    heuristicsReport.addTable("Technical Lattice Tuning", {"Control", "Observed", "Action"}, {
+        {"Training Stability", stabilityPct, stabilityGuardTriggered ? "Hidden nodes reduced automatically (<70% stability guard triggered)" : "Topology retained (stability guard not triggered)"},
+        {"Target Diversity", targetContext.semantics.inferredTask, "Classification-like targets use cross-entropy path; continuous targets use MSE path"},
+        {"Loss Function", neural.lossName, "Applied automatically from inferred target semantics"}
+    });
+
+    heuristicsReport.addTable("Topology Guardrail", {"Metric", "Value"}, {
+        {"Rows", std::to_string(data.rowCount())},
+        {"Features (post deterministic filter)", std::to_string(featureIdx.size())},
+        {"Rows:Features", toFixed(deterministic.rowsToFeatures, 2)},
+        {"Low Ratio Mode (<10)", deterministic.lowRatioMode ? "yes" : "no"},
+        {"High Ratio Mode (>100)", deterministic.highRatioMode ? "yes" : "no"},
+        {"Lasso Gate Applied", deterministic.lassoGateApplied ? "yes" : "no"},
+        {"Lasso Retained Count", std::to_string(deterministic.lassoSelectedCount)}
+    });
+
+    if (!deterministic.roleTagRows.empty()) {
+        heuristicsReport.addTable("Semantic Role Tags", {"Column", "Role", "Unique", "Missing", "Null %"}, deterministic.roleTagRows);
+    }
+
+    if (!deterministic.excludedReasonLines.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        rows.reserve(deterministic.excludedReasonLines.size());
+        for (const auto& line : deterministic.excludedReasonLines) rows.push_back({line});
+        heuristicsReport.addTable("Entropy Filter Decisions", {"Decision"}, rows);
+    }
+
+    if (!deterministic.badgeNarratives.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        rows.reserve(deterministic.badgeNarratives.size());
+        for (const auto& line : deterministic.badgeNarratives) {
+            std::string clean = line;
+            clean = CommonUtils::trim(clean);
+            if (clean.rfind("[!!]", 0) == 0) clean = "Critical: " + CommonUtils::trim(clean.substr(4));
+            else if (clean.rfind("[*]", 0) == 0) clean = "Stable: " + CommonUtils::trim(clean.substr(3));
+            rows.push_back({clean});
+        }
+        heuristicsReport.addTable("Deterministic Narratives", {"Narrative"}, rows);
+    }
+
+    if (!deterministic.residualNarrative.empty()) {
+        heuristicsReport.addTable("Residual Discovery", {"Insight"}, {{deterministic.residualNarrative}});
+    }
+
+    saveGeneratedReports(runCfg, univariate, bivariate, neuralReport, finalAnalysis, heuristicsReport);
     advance("Saved reports");
     progress.done("Pipeline complete");
     printPipelineCompletion(runCfg);

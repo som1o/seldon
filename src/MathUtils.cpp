@@ -555,6 +555,7 @@ MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>&
 void MathUtils::Matrix::qrDecomposition(Matrix& Q, Matrix& R) const {
     size_t m = rows;
     size_t n = cols;
+    const double eps = runtimeConfig().numericEpsilon;
     Q = Matrix::identity(m);
     R = *this;
 
@@ -568,7 +569,7 @@ void MathUtils::Matrix::qrDecomposition(Matrix& Q, Matrix& R) const {
         }
         normX = std::sqrt(normX);
 
-        if (normX <= 1e-12) continue;
+        if (normX <= eps) continue;
 
         // Choose sign to avoid cancellation in Householder vector u
         double alpha = (R.data[k][k] > 0 ? -1.0 : 1.0) * normX;
@@ -579,7 +580,7 @@ void MathUtils::Matrix::qrDecomposition(Matrix& Q, Matrix& R) const {
         double normU = 0;
         for (double val : u) normU += val * val;
         normU = std::sqrt(normU);
-        if (normU > 1e-12) {
+        if (normU > eps) {
             for (double& val : u) val /= normU;
         } else {
             continue;
@@ -630,16 +631,15 @@ std::vector<double> MathUtils::multipleLinearRegression(const Matrix& X, const M
     Matrix QT = Q.transpose();
     Matrix QTY = QT.multiply(Y);
 
-    size_t n = X.cols;
-    std::vector<double> beta(n, 0.0);
+    const size_t n = X.cols;
+    std::vector<double> rhs(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        rhs[i] = QTY.data[i][0];
+    }
 
-    // Back substitution
-    for (size_t i = n; i-- > 0;) {
-        double sum = QTY.data[i][0];
-        for (size_t j = i + 1; j < n; ++j) {
-            sum -= R.data[i][j] * beta[j];
-        }
-        beta[i] = sum / R.data[i][i];
+    std::vector<double> beta;
+    if (!solveUpperTriangular(R, n, rhs, beta)) {
+        return std::vector<double>();
     }
     return beta;
 }

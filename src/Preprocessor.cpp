@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <numeric>
@@ -641,7 +642,9 @@ std::vector<bool> detectOutliersAdjustedBoxplotObserved(const NumVec& values, co
     return flags;
 }
 
-std::vector<bool> detectOutliersLOFObserved(const NumVec& values, const MissingMask& missing) {
+std::vector<bool> detectOutliersLOFObserved(const NumVec& values,
+                                            const MissingMask& missing,
+                                            const HeuristicTuningConfig& tuning) {
     std::vector<bool> flags(values.size(), false);
     NumVec observed;
     std::vector<size_t> obsIdx;
@@ -653,9 +656,8 @@ std::vector<bool> detectOutliersLOFObserved(const NumVec& values, const MissingM
     if (observed.size() < 12) return flags;
 
     const size_t n = observed.size();
-    constexpr size_t kLofMaxRows = 120000;
-    if (n > kLofMaxRows) {
-        return detectOutliersModifiedZObserved(values, missing, 3.5);
+    if (n > tuning.lofMaxRows) {
+        return detectOutliersModifiedZObserved(values, missing, tuning.lofFallbackModifiedZThreshold);
     }
 
     const size_t k = std::min<size_t>(10, std::max<size_t>(3, n / 12));
@@ -744,7 +746,7 @@ std::vector<bool> detectOutliersLOFObserved(const NumVec& values, const MissingM
 
     const double q3 = CommonUtils::quantileByNth(lof, 0.75);
     const double q1 = CommonUtils::quantileByNth(lof, 0.25);
-    const double threshold = std::max(1.5, q3 + 1.5 * (q3 - q1));
+    const double threshold = std::max(tuning.lofThresholdFloor, q3 + 1.5 * (q3 - q1));
     for (size_t i = 0; i < n; ++i) {
         if (lof[i] > threshold) flags[obsIdx[i]] = true;
     }
@@ -779,18 +781,17 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
         const auto& values = std::get<NumVec>(col.values);
 
         const std::string method = CommonUtils::toLower(config.outlierMethod);
-        std::vector<bool> flags;
-        if (method == "zscore") {
-            flags = detectOutliersZObserved(values, col.missing, config.tuning.outlierZThreshold);
-        } else if (method == "modified_zscore") {
-            flags = detectOutliersModifiedZObserved(values, col.missing, config.tuning.outlierZThreshold);
-        } else if (method == "adjusted_boxplot") {
-            flags = detectOutliersAdjustedBoxplotObserved(values, col.missing, config.tuning.outlierIqrMultiplier);
-        } else if (method == "lof") {
-            flags = detectOutliersLOFObserved(values, col.missing);
-        } else {
-            flags = detectOutliersIQRObserved(values, col.missing, config.tuning.outlierIqrMultiplier);
-        }
+        const std::unordered_map<std::string, std::function<std::vector<bool>()>> outlierFactory = {
+            {"iqr", [&]() { return detectOutliersIQRObserved(values, col.missing, config.tuning.outlierIqrMultiplier); }},
+            {"zscore", [&]() { return detectOutliersZObserved(values, col.missing, config.tuning.outlierZThreshold); }},
+            {"modified_zscore", [&]() { return detectOutliersModifiedZObserved(values, col.missing, config.tuning.outlierZThreshold); }},
+            {"adjusted_boxplot", [&]() { return detectOutliersAdjustedBoxplotObserved(values, col.missing, config.tuning.outlierIqrMultiplier); }},
+            {"lof", [&]() { return detectOutliersLOFObserved(values, col.missing, config.tuning); }}
+        };
+
+        const auto itFactory = outlierFactory.find(method);
+        std::vector<bool> flags = (itFactory != outlierFactory.end()) ? itFactory->second()
+                                                                       : outlierFactory.at("iqr")();
 
         detectedFlags[col.name] = flags;
         if (config.storeOutlierFlagsInReport) {

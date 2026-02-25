@@ -23,6 +23,50 @@ TypedDataset::TypedDataset(std::string filename, char delimiter)
     : filename_(std::move(filename)), delimiter_(delimiter) {}
 
 namespace {
+class TempFile {
+public:
+    TempFile() = default;
+    TempFile(std::string path, bool active) : path_(std::move(path)), active_(active) {}
+    TempFile(const TempFile&) = delete;
+    TempFile& operator=(const TempFile&) = delete;
+    TempFile(TempFile&& other) noexcept
+        : path_(std::move(other.path_)), active_(other.active_) {
+        other.active_ = false;
+    }
+    TempFile& operator=(TempFile&& other) noexcept {
+        if (this == &other) return *this;
+        cleanup();
+        path_ = std::move(other.path_);
+        active_ = other.active_;
+        other.active_ = false;
+        return *this;
+    }
+    ~TempFile() { cleanup(); }
+
+    const std::string& path() const { return path_; }
+    std::string release() {
+        active_ = false;
+        return path_;
+    }
+
+private:
+    void cleanup() noexcept {
+        if (!active_ || path_.empty()) return;
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+
+    std::string path_;
+    bool active_ = false;
+};
+
+std::string makeUniqueTempCsvPath(const std::string& sourcePath) {
+    namespace fs = std::filesystem;
+    const auto token = std::to_string(static_cast<unsigned long long>(
+        std::hash<std::string>{}(sourcePath + std::to_string(std::time(nullptr)) + std::to_string(::getpid()))));
+    return (fs::temp_directory_path() / ("seldon_input_" + token + ".csv")).string();
+}
+
 bool isMissingToken(const std::string& raw) {
     std::string s = CommonUtils::trim(raw);
     if (s.empty()) return true;
@@ -246,17 +290,14 @@ std::pair<std::string, bool> resolveDatasetInputPath(const std::string& sourcePa
         return {sourcePath, false};
     }
 
-    const fs::path tmpBase = fs::temp_directory_path() / ("seldon_input_" + std::to_string(static_cast<unsigned long long>(std::hash<std::string>{}(sourcePath + std::to_string(std::time(nullptr))))) + ".csv");
-    const std::string tmpPath = tmpBase.string();
+    TempFile tmpFile(makeUniqueTempCsvPath(sourcePath), true);
 
     auto runToTmp = [&](const std::string& executable, const std::vector<std::string>& args) {
-        const int rc = spawnToFile(executable, args, tmpPath);
+        const int rc = spawnToFile(executable, args, tmpFile.path());
         if (rc != 0) {
-            std::error_code ec;
-            std::filesystem::remove(tmpPath, ec);
             throw Seldon::DatasetException("Failed to convert input source: " + sourcePath);
         }
-        return std::make_pair(tmpPath, true);
+        return std::make_pair(tmpFile.release(), true);
     };
 
     if (lowerExt == ".gz") {
@@ -588,15 +629,7 @@ void TypedDataset::load() {
     const CSVUtils::ParseLimits parseLimits{};
 
     auto [resolvedPath, isTemporary] = resolveDatasetInputPath(filename_);
-    struct TempFileGuard {
-        std::string path;
-        bool enabled = false;
-        ~TempFileGuard() {
-            if (!enabled) return;
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-        }
-    } tempGuard{resolvedPath, isTemporary};
+    TempFile tempGuard(resolvedPath, isTemporary);
 
     std::ifstream in(resolvedPath, std::ios::binary);
     if (!in) throw Seldon::IOException("Could not open file: " + resolvedPath);
