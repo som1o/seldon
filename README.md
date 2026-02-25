@@ -135,11 +135,39 @@ cmake -DSELDON_ENABLE_OPENMP=OFF ..
 cmake --build . -j
 ```
 
-### 5.3 Binary Location
+### 5.3 Build With Neural Float32
+
+Use this to cut neural tensor memory roughly in half (weights/activations/gradients).
+
+```bash
+mkdir -p build
+cd build
+cmake -DSELDON_ENABLE_OPENMP=ON -DSELDON_NEURAL_FLOAT32=ON ..
+cmake --build . -j
+```
+
+### 5.4 Binary Location
 
 The executable is emitted as:
 
 - `build/seldon`
+
+### 5.5 Memory Profiling With Massif
+
+If `valgrind` is installed, profile peak memory with:
+
+```bash
+valgrind --tool=massif --massif-out-file=massif.out \
+  ./build/seldon /absolute/path/to/data.csv --low-memory true
+
+ms_print massif.out > massif_report.txt
+```
+
+Focus on the largest snapshots in `massif_report.txt` and compare before/after enabling:
+
+- `--low-memory true`
+- `--neural-streaming-mode true`
+- `-DSELDON_NEURAL_FLOAT32=ON`
 
 ---
 

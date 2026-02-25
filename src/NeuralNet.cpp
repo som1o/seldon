@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -13,6 +14,9 @@
 #include <random>
 #include <sstream>
 #include <utility>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #ifdef USE_OPENMP
 #include <omp.h>
 #endif
@@ -24,6 +28,81 @@ constexpr uint64_t kChecksumPrime = 1099511628211ULL;
 constexpr size_t kHardMaxTopologyNodes = 65536;
 constexpr size_t kHardMaxTrainableParams = 100000000;
 constexpr double kNumericEps = 1e-12;
+
+struct MappedFileView {
+    int fd = -1;
+    size_t sizeBytes = 0;
+    void* data = nullptr;
+
+    MappedFileView() = default;
+    MappedFileView(const MappedFileView&) = delete;
+    MappedFileView& operator=(const MappedFileView&) = delete;
+    MappedFileView(MappedFileView&& other) noexcept {
+        fd = other.fd;
+        sizeBytes = other.sizeBytes;
+        data = other.data;
+        other.fd = -1;
+        other.sizeBytes = 0;
+        other.data = nullptr;
+    }
+    MappedFileView& operator=(MappedFileView&& other) noexcept {
+        if (this == &other) return *this;
+        if (data != nullptr && data != MAP_FAILED) {
+            ::munmap(data, sizeBytes);
+        }
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        fd = other.fd;
+        sizeBytes = other.sizeBytes;
+        data = other.data;
+        other.fd = -1;
+        other.sizeBytes = 0;
+        other.data = nullptr;
+        return *this;
+    }
+
+    ~MappedFileView() {
+        if (data != nullptr && data != MAP_FAILED) {
+            ::munmap(data, sizeBytes);
+        }
+        if (fd >= 0) {
+            ::close(fd);
+        }
+    }
+};
+
+MappedFileView mapReadOnlyFile(const std::string& path, size_t minBytes) {
+    MappedFileView view;
+    view.fd = ::open(path.c_str(), O_RDONLY);
+    if (view.fd < 0) {
+        throw Seldon::IOException("Failed to open binary training file: " + path);
+    }
+
+    struct stat st {};
+    if (::fstat(view.fd, &st) != 0) {
+        throw Seldon::IOException("Failed to stat binary training file: " + path);
+    }
+    if (st.st_size < 0) {
+        throw Seldon::IOException("Invalid binary training file size: " + path);
+    }
+
+    view.sizeBytes = static_cast<size_t>(st.st_size);
+    if (view.sizeBytes < minBytes) {
+        throw Seldon::IOException("Binary training file is smaller than expected: " + path);
+    }
+
+    if (view.sizeBytes == 0) {
+        throw Seldon::IOException("Binary training file is empty: " + path);
+    }
+
+    view.data = ::mmap(nullptr, view.sizeBytes, PROT_READ, MAP_PRIVATE, view.fd, 0);
+    if (view.data == MAP_FAILED) {
+        throw Seldon::IOException("Failed to mmap binary training file: " + path);
+    }
+
+    return view;
+}
 
 bool isLittleEndian() {
     uint16_t number = 0x1;
@@ -62,7 +141,7 @@ void readLE(std::istream& in, T& value) {
     if (!isLittleEndian()) swapEndian(value);
 }
 
-double meanSquaredError(const std::vector<double>& prediction,
+double meanSquaredError(const std::vector<NeuralScalar>& prediction,
                         const std::vector<double>& target,
                         size_t outDim) {
     double err = 0.0;
@@ -123,6 +202,34 @@ void NeuralNet::setInputL2Scales(const std::vector<double>& scales) {
         throw Seldon::NeuralNetException("Input L2 scales must match input layer width");
     }
     m_inputL2Scales = scales;
+}
+
+void NeuralNet::ensureBatchWorkspace() {
+    if (m_gradBAccumWorkspace.size() != m_layers.size()) {
+        m_gradBAccumWorkspace.assign(m_layers.size(), {});
+        m_gradWAccumWorkspace.assign(m_layers.size(), {});
+        m_gradBWorkWorkspace.assign(m_layers.size(), {});
+        m_gradWWorkWorkspace.assign(m_layers.size(), {});
+    }
+
+    for (size_t l = 1; l < m_layers.size(); ++l) {
+        const size_t bSize = m_layers[l].size();
+        const size_t wSize = m_layers[l].weights().size();
+
+        if (m_gradBAccumWorkspace[l].size() != bSize) m_gradBAccumWorkspace[l].assign(bSize, static_cast<Scalar>(0.0));
+        else std::fill(m_gradBAccumWorkspace[l].begin(), m_gradBAccumWorkspace[l].end(), static_cast<Scalar>(0.0));
+
+        if (m_gradWAccumWorkspace[l].size() != wSize) m_gradWAccumWorkspace[l].assign(wSize, static_cast<Scalar>(0.0));
+        else std::fill(m_gradWAccumWorkspace[l].begin(), m_gradWAccumWorkspace[l].end(), static_cast<Scalar>(0.0));
+
+        if (m_gradBWorkWorkspace[l].size() != bSize) m_gradBWorkWorkspace[l].assign(bSize, static_cast<Scalar>(0.0));
+        if (m_gradWWorkWorkspace[l].size() != wSize) m_gradWWorkWorkspace[l].assign(wSize, static_cast<Scalar>(0.0));
+    }
+
+    const size_t outDim = m_layers.back().size();
+    if (m_targetWork.size() != outDim) {
+        m_targetWork.assign(outDim, 0.0);
+    }
 }
 
 void NeuralNet::updateEmaWeights(double decay) {
@@ -273,7 +380,7 @@ void NeuralNet::backpropagate(const std::vector<double>& targetValues, const Hyp
         if (norm > hp.gradientClipNorm && norm > kNumericEps) {
             const double scale = hp.gradientClipNorm / norm;
             for (size_t l = 1; l < m_layers.size(); ++l) {
-                for (double& g : m_layers[l].gradients()) g *= scale;
+                for (auto& g : m_layers[l].gradients()) g = static_cast<NeuralScalar>(g * scale);
             }
         }
     }
@@ -298,18 +405,12 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
         if (fastOptimizer == Optimizer::LOOKAHEAD) fastOptimizer = Optimizer::ADAM;
     }
 
-    std::vector<std::vector<double>> gradBAccum(m_layers.size());
-    std::vector<std::vector<double>> gradWAccum(m_layers.size());
-    std::vector<std::vector<double>> gradBWork(m_layers.size());
-    std::vector<std::vector<double>> gradWWork(m_layers.size());
-    for (size_t l = 1; l < m_layers.size(); ++l) {
-        gradBAccum[l].assign(m_layers[l].size(), 0.0);
-        gradWAccum[l].assign(m_layers[l].weights().size(), 0.0);
-        gradBWork[l].assign(m_layers[l].size(), 0.0);
-        gradWWork[l].assign(m_layers[l].weights().size(), 0.0);
-    }
-
-    std::vector<double> targetWork(outDim, 0.0);
+    ensureBatchWorkspace();
+    auto& gradBAccum = m_gradBAccumWorkspace;
+    auto& gradWAccum = m_gradWAccumWorkspace;
+    auto& gradBWork = m_gradBWorkWorkspace;
+    auto& gradWWork = m_gradWWorkWorkspace;
+    auto& targetWork = m_targetWork;
     size_t microCount = 0;
 
     for (size_t b = batchStart; b < batchEnd; ++b) {
@@ -337,7 +438,7 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
                 std::normal_distribution<double> noiseDist(0.0, noiseStd);
                 for (size_t l = 1; l < m_layers.size(); ++l) {
                     auto& g = m_layers[l].gradients();
-                    for (double& v : g) v += noiseDist(rng);
+                    for (auto& v : g) v = static_cast<NeuralScalar>(v + noiseDist(rng));
                 }
             }
         }
@@ -348,10 +449,10 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
             auto& gb = gradBAccum[l];
             auto& gw = gradWAccum[l];
             for (size_t n = 0; n < g.size(); ++n) {
-                gb[n] += g[n];
+                gb[n] += static_cast<Scalar>(g[n]);
                 const size_t offset = n * prevOut.size();
                 for (size_t pn = 0; pn < prevOut.size(); ++pn) {
-                    gw[offset + pn] += g[n] * prevOut[pn];
+                    gw[offset + pn] += static_cast<Scalar>(g[n] * prevOut[pn]);
                 }
             }
         }
@@ -361,7 +462,7 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
         const auto& out = m_layers.back().outputs();
         if (hp.loss == LossFunction::CROSS_ENTROPY) {
             for (size_t j = 0; j < out.size() && j < Y[idx].size(); ++j) {
-                const double p = std::clamp(out[j], 1e-15, 1.0 - 1e-15);
+                const double p = static_cast<double>(std::clamp(out[j], static_cast<NeuralScalar>(1e-15), static_cast<NeuralScalar>(1.0 - 1e-15)));
                 const double y = Y[idx][j];
                 batchLoss -= (y * std::log(p) + (1.0 - y) * std::log(1.0 - p));
             }
@@ -375,12 +476,12 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
         const double invMicro = 1.0 / static_cast<double>(std::max<size_t>(1, microCount));
         double sqNorm = 0.0;
         for (size_t l = 1; l < m_layers.size(); ++l) {
-            for (double v : gradBAccum[l]) {
-                const double g = v * invMicro;
+            for (Scalar v : gradBAccum[l]) {
+                const double g = static_cast<double>(v) * invMicro;
                 sqNorm += g * g;
             }
-            for (double v : gradWAccum[l]) {
-                const double g = v * invMicro;
+            for (Scalar v : gradWAccum[l]) {
+                const double g = static_cast<double>(v) * invMicro;
                 sqNorm += g * g;
             }
         }
@@ -408,8 +509,14 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
         for (size_t l = 1; l < m_layers.size(); ++l) {
             auto& gb = gradBWork[l];
             auto& gw = gradWWork[l];
-            for (size_t i = 0; i < gb.size(); ++i) gb[i] = gradBAccum[l][i] * invMicro * clipScale;
-            for (size_t i = 0; i < gw.size(); ++i) gw[i] = gradWAccum[l][i] * invMicro * clipScale;
+            #ifdef USE_OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (size_t i = 0; i < gb.size(); ++i) gb[i] = static_cast<Scalar>(gradBAccum[l][i] * invMicro * clipScale);
+            #ifdef USE_OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (size_t i = 0; i < gw.size(); ++i) gw[i] = static_cast<Scalar>(gradWAccum[l][i] * invMicro * clipScale);
 
             const std::vector<double>* l2Scales = nullptr;
             if (l == 1 && !m_inputL2Scales.empty()) l2Scales = &m_inputL2Scales;
@@ -421,8 +528,8 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
                                                     gw,
                                                     l2Scales);
 
-            std::fill(gradBAccum[l].begin(), gradBAccum[l].end(), 0.0);
-            std::fill(gradWAccum[l].begin(), gradWAccum[l].end(), 0.0);
+            std::fill(gradBAccum[l].begin(), gradBAccum[l].end(), static_cast<Scalar>(0.0));
+            std::fill(gradWAccum[l].begin(), gradWAccum[l].end(), static_cast<Scalar>(0.0));
         }
 
         if (hp.optimizer == Optimizer::LOOKAHEAD) {
@@ -520,7 +627,7 @@ double NeuralNet::validate(const std::vector<std::vector<double>>& X,
 
         if (hp.loss == LossFunction::CROSS_ENTROPY) {
             for (size_t j = 0; j < out.size() && j < Y[idx].size(); ++j) {
-                const double p = std::clamp(out[j], 1e-15, 1.0 - 1e-15);
+                const double p = static_cast<double>(std::clamp(out[j], static_cast<NeuralScalar>(1e-15), static_cast<NeuralScalar>(1.0 - 1e-15)));
                 const double y = Y[idx][j];
                 loss -= (y * std::log(p) + (1.0 - y) * std::log(1.0 - p));
             }
@@ -539,6 +646,24 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
                       const Hyperparameters& hp,
                       const std::vector<ScaleInfo>& inScales,
                       const std::vector<ScaleInfo>& outScales) {
+    if (hp.useDiskStreaming) {
+        const size_t rows = hp.streamingRows;
+        const size_t inputDim = hp.streamingInputDim;
+        const size_t outputDim = hp.streamingOutputDim;
+        const size_t chunkRows = std::max<size_t>(16, hp.streamingChunkRows);
+        trainIncrementalFromBinary(hp.inputBinaryPath,
+                                   hp.targetBinaryPath,
+                                   rows,
+                                   inputDim,
+                                   outputDim,
+                                   hp,
+                                   chunkRows,
+                                   hp.useMemoryMappedInput,
+                                   inScales,
+                                   outScales);
+        return;
+    }
+
     if (X.empty() || Y.empty()) throw Seldon::NeuralNetException("Training data cannot be empty");
     if (X.size() != Y.size()) throw Seldon::NeuralNetException("Input and target sample counts must match");
     if (hp.batchSize == 0) throw Seldon::NeuralNetException("Batch size must be greater than zero");
@@ -589,6 +714,23 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
         m_layers[l].setActivation((l + 1 == m_layers.size()) ? hp.outputActivation : hp.activation);
     }
 
+    Hyperparameters hpEffective = hp;
+    {
+        const size_t inputWidth = m_layers.front().size();
+        const size_t dataRows = X.size();
+        size_t autoBatchCap = hp.batchSize;
+        if (inputWidth >= 1024) autoBatchCap = std::min(autoBatchCap, static_cast<size_t>(8));
+        else if (inputWidth >= 512) autoBatchCap = std::min(autoBatchCap, static_cast<size_t>(12));
+        else if (inputWidth >= 256) autoBatchCap = std::min(autoBatchCap, static_cast<size_t>(16));
+        else if (inputWidth >= 96) autoBatchCap = std::min(autoBatchCap, static_cast<size_t>(24));
+        else if (inputWidth >= 48) autoBatchCap = std::min(autoBatchCap, static_cast<size_t>(32));
+
+        if (dataRows < 128) autoBatchCap = std::min(autoBatchCap, static_cast<size_t>(16));
+        if (dataRows < 64) autoBatchCap = std::min(autoBatchCap, static_cast<size_t>(8));
+
+        hpEffective.batchSize = std::max<size_t>(1, autoBatchCap);
+    }
+
     size_t valSize = static_cast<size_t>(std::llround(static_cast<double>(X.size()) * hp.valSplit));
     if (X.size() >= 16) {
         const size_t minVal = std::min<size_t>(8, X.size() / 2);
@@ -618,8 +760,8 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
     bool emaReady = false;
     double valEma = 0.0;
 
-    std::vector<std::vector<double>> bestW(m_layers.size());
-    std::vector<std::vector<double>> bestB(m_layers.size());
+    std::vector<std::vector<Scalar>> bestW(m_layers.size());
+    std::vector<std::vector<Scalar>> bestB(m_layers.size());
 
     for (size_t epoch = 0; epoch < hp.epochs; ++epoch) {
         if (hp.verbose && (epoch % std::max<size_t>(1, hp.epochs / 10) == 0)) {
@@ -629,24 +771,24 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
 
         std::shuffle(indices.begin(), indices.end(), rng);
 
-        Hyperparameters h = hp;
-        const size_t warmupEpochs = std::min(hp.lrWarmupEpochs, hp.epochs);
+        Hyperparameters h = hpEffective;
+        const size_t warmupEpochs = std::min(hpEffective.lrWarmupEpochs, hpEffective.epochs);
         double scheduledLr = lr;
         if (warmupEpochs > 0 && epoch < warmupEpochs) {
             const double warm = static_cast<double>(epoch + 1) / static_cast<double>(warmupEpochs);
             scheduledLr *= std::clamp(warm, 0.0, 1.0);
         }
 
-        const double lrFloorFactor = std::clamp(hp.lrScheduleMinFactor, 0.0, 1.0);
-        const double lrFloor = std::max(hp.minLearningRate, lr * lrFloorFactor);
+        const double lrFloorFactor = std::clamp(hpEffective.lrScheduleMinFactor, 0.0, 1.0);
+        const double lrFloor = std::max(hpEffective.minLearningRate, lr * lrFloorFactor);
         if (epoch >= warmupEpochs) {
-            if (hp.useCosineAnnealing) {
-                const size_t span = std::max<size_t>(1, hp.epochs - warmupEpochs);
+            if (hpEffective.useCosineAnnealing) {
+                const size_t span = std::max<size_t>(1, hpEffective.epochs - warmupEpochs);
                 const double t = static_cast<double>(epoch - warmupEpochs) / static_cast<double>(span);
                 const double cosine = 0.5 * (1.0 + std::cos(3.14159265358979323846 * std::clamp(t, 0.0, 1.0)));
                 scheduledLr = lrFloor + (lr - lrFloor) * cosine;
-            } else if (hp.useCyclicalLr) {
-                const size_t cycle = std::max<size_t>(2, hp.lrCycleEpochs);
+            } else if (hpEffective.useCyclicalLr) {
+                const size_t cycle = std::max<size_t>(2, hpEffective.lrCycleEpochs);
                 const size_t cyclePos = (epoch - warmupEpochs) % cycle;
                 const double phase = static_cast<double>(cyclePos) / static_cast<double>(cycle - 1);
                 const double tri = 1.0 - std::abs(2.0 * phase - 1.0);
@@ -654,9 +796,9 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
             }
         }
 
-        h.learningRate = std::max(hp.minLearningRate, scheduledLr);
+        h.learningRate = std::max(hpEffective.minLearningRate, scheduledLr);
         const double trainLoss = runEpoch(X, Y, indices, trainSize, h, t_step);
-        const double rawVal = (valSize > 0) ? validate(X, Y, indices, trainSize, hp) : 0.0;
+        const double rawVal = (valSize > 0) ? validate(X, Y, indices, trainSize, hpEffective) : 0.0;
 
         double monitoredVal = rawVal;
         if (valSize > 0 && hp.useValidationLossEma) {
@@ -745,19 +887,123 @@ void NeuralNet::trainIncremental(const std::vector<std::vector<double>>& X,
 
     Hyperparameters h = hp;
     h.incrementalMode = true;
+    h.useDiskStreaming = false;
 
     const size_t n = X.size();
+    std::vector<std::vector<double>> chunkX;
+    std::vector<std::vector<double>> chunkY;
+    chunkX.reserve(std::max<size_t>(1, chunkRows));
+    chunkY.reserve(std::max<size_t>(1, chunkRows));
+
     for (size_t start = 0; start < n; start += chunkRows) {
         const size_t end = std::min(start + chunkRows, n);
-        std::vector<std::vector<double>> chunkX;
-        std::vector<std::vector<double>> chunkY;
-        chunkX.reserve(end - start);
-        chunkY.reserve(end - start);
+        chunkX.clear();
+        chunkY.clear();
         for (size_t i = start; i < end; ++i) {
             chunkX.push_back(X[i]);
             chunkY.push_back(Y[i]);
         }
         train(chunkX, chunkY, h, inScales, outScales);
+        if (h.incrementalMode) {
+            std::vector<std::vector<double>>().swap(chunkX);
+            std::vector<std::vector<double>>().swap(chunkY);
+            chunkX.reserve(std::max<size_t>(1, chunkRows));
+            chunkY.reserve(std::max<size_t>(1, chunkRows));
+        }
+    }
+}
+
+void NeuralNet::trainIncrementalFromBinary(const std::string& inputBinaryPath,
+                                           const std::string& targetBinaryPath,
+                                           size_t rows,
+                                           size_t inputDim,
+                                           size_t outputDim,
+                                           const Hyperparameters& hp,
+                                           size_t chunkRows,
+                                           bool useMemoryMap,
+                                           const std::vector<ScaleInfo>& inScales,
+                                           const std::vector<ScaleInfo>& outScales) {
+    if (rows == 0 || inputDim == 0 || outputDim == 0) {
+        throw Seldon::NeuralNetException("Disk streaming training requires non-zero rows/input/output dimensions");
+    }
+
+    const size_t expectedInput = m_layers.front().size();
+    const size_t expectedOutput = m_layers.back().size();
+    if (inputDim != expectedInput || outputDim != expectedOutput) {
+        throw Seldon::NeuralNetException("Disk streaming matrix dimensions do not match network topology");
+    }
+
+    const size_t bytesX = rows * inputDim * sizeof(float);
+    const size_t bytesY = rows * outputDim * sizeof(double);
+
+    Hyperparameters h = hp;
+    h.incrementalMode = true;
+    h.useDiskStreaming = false;
+
+    std::vector<std::vector<double>> chunkX;
+    std::vector<std::vector<double>> chunkY;
+    chunkX.reserve(std::max<size_t>(1, chunkRows));
+    chunkY.reserve(std::max<size_t>(1, chunkRows));
+
+    if (useMemoryMap) {
+        MappedFileView xMap = mapReadOnlyFile(inputBinaryPath, bytesX);
+        MappedFileView yMap = mapReadOnlyFile(targetBinaryPath, bytesY);
+        const float* xData = static_cast<const float*>(xMap.data);
+        const double* yData = static_cast<const double*>(yMap.data);
+
+        for (size_t start = 0; start < rows; start += chunkRows) {
+            const size_t end = std::min(start + chunkRows, rows);
+            const size_t n = end - start;
+            chunkX.assign(n, std::vector<double>(inputDim, 0.0));
+            chunkY.assign(n, std::vector<double>(outputDim, 0.0));
+
+            #ifdef USE_OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (size_t r = 0; r < n; ++r) {
+                const size_t globalRow = start + r;
+                const float* srcX = xData + globalRow * inputDim;
+                const double* srcY = yData + globalRow * outputDim;
+                for (size_t c = 0; c < inputDim; ++c) chunkX[r][c] = static_cast<double>(srcX[c]);
+                for (size_t c = 0; c < outputDim; ++c) chunkY[r][c] = srcY[c];
+            }
+
+            train(chunkX, chunkY, h, inScales, outScales);
+            std::vector<std::vector<double>>().swap(chunkX);
+            std::vector<std::vector<double>>().swap(chunkY);
+            chunkX.reserve(std::max<size_t>(1, chunkRows));
+            chunkY.reserve(std::max<size_t>(1, chunkRows));
+        }
+        return;
+    }
+
+    std::ifstream xIn(inputBinaryPath, std::ios::binary);
+    std::ifstream yIn(targetBinaryPath, std::ios::binary);
+    if (!xIn || !yIn) {
+        throw Seldon::IOException("Failed to open disk streaming binary inputs");
+    }
+
+    for (size_t start = 0; start < rows; start += chunkRows) {
+        const size_t end = std::min(start + chunkRows, rows);
+        const size_t n = end - start;
+        chunkX.assign(n, std::vector<double>(inputDim, 0.0));
+        chunkY.assign(n, std::vector<double>(outputDim, 0.0));
+
+        for (size_t r = 0; r < n; ++r) {
+            std::vector<float> xRow(inputDim, 0.0f);
+            xIn.read(reinterpret_cast<char*>(xRow.data()), static_cast<std::streamsize>(inputDim * sizeof(float)));
+            if (!xIn) throw Seldon::IOException("Failed reading disk streaming input row");
+            for (size_t c = 0; c < inputDim; ++c) chunkX[r][c] = static_cast<double>(xRow[c]);
+
+            yIn.read(reinterpret_cast<char*>(chunkY[r].data()), static_cast<std::streamsize>(outputDim * sizeof(double)));
+            if (!yIn) throw Seldon::IOException("Failed reading disk streaming target row");
+        }
+
+        train(chunkX, chunkY, h, inScales, outScales);
+        std::vector<std::vector<double>>().swap(chunkX);
+        std::vector<std::vector<double>>().swap(chunkY);
+        chunkX.reserve(std::max<size_t>(1, chunkRows));
+        chunkY.reserve(std::max<size_t>(1, chunkRows));
     }
 }
 
@@ -1191,11 +1437,11 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
 
     for (size_t l = 1; l < m_layers.size(); ++l) {
         auto& layer = m_layers[l];
-        for (double& b : layer.biases()) {
+        for (auto& b : layer.biases()) {
             readLE(in, b);
             updateChecksum(checksum, b);
         }
-        for (double& w : layer.weights()) {
+        for (auto& w : layer.weights()) {
             readLE(in, w);
             updateChecksum(checksum, w);
         }

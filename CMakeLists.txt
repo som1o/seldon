@@ -12,6 +12,12 @@ add_executable(seldon ${SOURCES})
 target_include_directories(seldon PRIVATE include)
 
 option(SELDON_ENABLE_OPENMP "Enable OpenMP acceleration for supported kernels" ON)
+option(SELDON_NEURAL_FLOAT32 "Use float32 for neural-layer tensors (weights/activations/gradients)" OFF)
+
+if(SELDON_NEURAL_FLOAT32)
+    target_compile_definitions(seldon PRIVATE SELDON_NEURAL_FLOAT32)
+    message(STATUS "Seldon: Neural float32 precision enabled")
+endif()
 
 if(SELDON_ENABLE_OPENMP)
     find_package(OpenMP QUIET)

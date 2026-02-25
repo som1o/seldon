@@ -1209,6 +1209,21 @@ struct EncodedNeuralMatrix {
     size_t categoricalColumnsUsed = 0;
 };
 
+struct NeuralCategoryPlan {
+    size_t columnIdx = 0;
+    std::vector<std::string_view> keptLabels;
+    bool includeOther = false;
+};
+
+struct NeuralEncodingPlan {
+    std::vector<int> sourceNumericFeaturePos;
+    std::vector<size_t> numericColumns;
+    std::vector<NeuralCategoryPlan> categoryPlans;
+    size_t encodedWidth = 0;
+    size_t categoricalEncodedNodes = 0;
+    size_t categoricalColumnsUsed = 0;
+};
+
 using NumericStatsCache = std::unordered_map<size_t, ColumnStats>;
 
 NumericStatsCache buildNumericStatsCache(const TypedDataset& data) {
@@ -1260,33 +1275,33 @@ std::vector<double> computeFeatureTargetAbsCorr(const TypedDataset& data,
     return out;
 }
 
-EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
-                                             int targetIdx,
-                                             const std::vector<int>& numericFeatureIdx,
-                                             const AutoConfig& config) {
-    EncodedNeuralMatrix out;
-    out.X.assign(data.rowCount(), std::vector<double>{});
-
+NeuralEncodingPlan buildNeuralEncodingPlan(const TypedDataset& data,
+                                           int targetIdx,
+                                           const std::vector<int>& numericFeatureIdx,
+                                           const AutoConfig& config) {
+    NeuralEncodingPlan plan;
     const std::unordered_set<std::string> excluded(config.excludedColumns.begin(), config.excludedColumns.end());
-    const size_t maxOneHotPerColumn = std::max<size_t>(1, config.neuralMaxOneHotPerColumn);
+    const size_t baseMaxOneHot = std::max<size_t>(1, config.neuralMaxOneHotPerColumn);
+    const size_t rowAdaptiveCap = (data.rowCount() < 500)
+        ? std::max<size_t>(1, std::min<size_t>(baseMaxOneHot, data.rowCount() / 25 + 1))
+        : baseMaxOneHot;
+    const size_t maxOneHotPerColumn = config.lowMemoryMode
+        ? std::max<size_t>(1, std::min<size_t>(rowAdaptiveCap, 8))
+        : rowAdaptiveCap;
+    const size_t lowMemoryFreqCap = config.lowMemoryMode
+        ? std::max<size_t>(maxOneHotPerColumn * 8, maxOneHotPerColumn)
+        : std::numeric_limits<size_t>::max();
 
-    struct CategoryPlan {
-        size_t columnIdx = 0;
-        std::vector<std::pair<std::string_view, size_t>> categories;
-        size_t keepCount = 0;
-        bool includeOther = false;
-    };
-
-    std::vector<CategoryPlan> categoryPlans;
     const auto categoricalIdx = data.categoricalColumnIndices();
-    categoryPlans.reserve(categoricalIdx.size());
+    plan.categoryPlans.reserve(categoricalIdx.size());
 
-    size_t reservedWidth = 0;
     for (size_t featurePos = 0; featurePos < numericFeatureIdx.size(); ++featurePos) {
         int idx = numericFeatureIdx[featurePos];
         if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
         if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
-        reservedWidth++;
+        plan.numericColumns.push_back(static_cast<size_t>(idx));
+        plan.sourceNumericFeaturePos.push_back(static_cast<int>(featurePos));
+        plan.encodedWidth++;
     }
 
     for (size_t idx : categoricalIdx) {
@@ -1298,79 +1313,103 @@ EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
         if (values.empty()) continue;
 
         std::unordered_map<std::string_view, size_t> freq;
+        size_t overflowCount = 0;
+        if (lowMemoryFreqCap != std::numeric_limits<size_t>::max()) {
+            freq.reserve(lowMemoryFreqCap);
+        }
         for (const auto& v : values) {
-            if (!v.empty()) freq[v]++;
+            if (v.empty()) continue;
+            const std::string_view key(v);
+            auto it = freq.find(key);
+            if (it != freq.end()) {
+                ++it->second;
+                continue;
+            }
+            if (freq.size() < lowMemoryFreqCap) {
+                freq.emplace(key, 1);
+            } else {
+                ++overflowCount;
+            }
         }
         if (freq.empty()) continue;
 
-        CategoryPlan plan;
-        plan.columnIdx = idx;
-        plan.categories.assign(freq.begin(), freq.end());
-        std::sort(plan.categories.begin(), plan.categories.end(), [](const auto& a, const auto& b) {
+        std::vector<std::pair<std::string_view, size_t>> categories(freq.begin(), freq.end());
+        std::sort(categories.begin(), categories.end(), [](const auto& a, const auto& b) {
             if (a.second == b.second) return a.first < b.first;
             return a.second > b.second;
         });
-        plan.keepCount = std::min(maxOneHotPerColumn, plan.categories.size());
-        if (plan.keepCount == 0) continue;
-        plan.includeOther = plan.categories.size() > plan.keepCount;
-        reservedWidth += plan.keepCount + (plan.includeOther ? 1 : 0);
-        categoryPlans.push_back(std::move(plan));
-    }
+        const size_t keepCount = std::min(maxOneHotPerColumn, categories.size());
+        if (keepCount == 0) continue;
 
-    for (auto& row : out.X) {
-        row.reserve(reservedWidth);
-    }
-
-    for (size_t featurePos = 0; featurePos < numericFeatureIdx.size(); ++featurePos) {
-        int idx = numericFeatureIdx[featurePos];
-        if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
-        if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
-        const auto& values = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
-        const size_t rowLimit = std::min(out.X.size(), values.size());
-        #ifdef USE_OPENMP
-        #pragma omp parallel for schedule(static)
-        #endif
-        for (size_t r = 0; r < rowLimit; ++r) {
-            out.X[r].push_back(values[r]);
-        }
-        out.sourceNumericFeaturePos.push_back(static_cast<int>(featurePos));
-    }
-
-    for (const auto& plan : categoryPlans) {
-        const size_t idx = plan.columnIdx;
-        const auto& values = std::get<std::vector<std::string>>(data.columns()[idx].values);
-        const size_t keepCount = plan.keepCount;
-        std::unordered_set<std::string> kept;
-        kept.reserve(keepCount);
+        NeuralCategoryPlan catPlan;
+        catPlan.columnIdx = idx;
+        catPlan.includeOther = (categories.size() > keepCount) || (overflowCount > 0);
+        catPlan.keptLabels.reserve(keepCount);
         for (size_t i = 0; i < keepCount; ++i) {
-            const std::string label(plan.categories[i].first);
-            kept.insert(label);
-            const size_t rowLimit = std::min(out.X.size(), values.size());
-            #ifdef USE_OPENMP
-            #pragma omp parallel for schedule(static)
-            #endif
-            for (size_t r = 0; r < rowLimit; ++r) {
-                out.X[r].push_back(values[r] == label ? 1.0 : 0.0);
-            }
-            out.sourceNumericFeaturePos.push_back(-1);
-            out.categoricalEncodedNodes++;
+            catPlan.keptLabels.push_back(categories[i].first);
+            plan.sourceNumericFeaturePos.push_back(-1);
+            plan.categoricalEncodedNodes++;
+            plan.encodedWidth++;
         }
-
-        if (plan.includeOther) {
-            const size_t rowLimit = std::min(out.X.size(), values.size());
-            #ifdef USE_OPENMP
-            #pragma omp parallel for schedule(static)
-            #endif
-            for (size_t r = 0; r < rowLimit; ++r) {
-                out.X[r].push_back(kept.find(values[r]) == kept.end() ? 1.0 : 0.0);
-            }
-            out.sourceNumericFeaturePos.push_back(-1);
-            out.categoricalEncodedNodes++;
+        if (catPlan.includeOther) {
+            plan.sourceNumericFeaturePos.push_back(-1);
+            plan.categoricalEncodedNodes++;
+            plan.encodedWidth++;
         }
-
-        out.categoricalColumnsUsed++;
+        plan.categoryPlans.push_back(std::move(catPlan));
+        plan.categoricalColumnsUsed++;
     }
 
+    return plan;
+}
+
+void encodeNeuralRows(const TypedDataset& data,
+                      const NeuralEncodingPlan& plan,
+                      size_t rowStart,
+                      size_t rowEnd,
+                      std::vector<std::vector<double>>& outRows) {
+    const size_t nRows = (rowEnd > rowStart) ? (rowEnd - rowStart) : 0;
+    outRows.assign(nRows, std::vector<double>(plan.encodedWidth, 0.0));
+
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (size_t localRow = 0; localRow < nRows; ++localRow) {
+        const size_t r = rowStart + localRow;
+        auto& out = outRows[localRow];
+        size_t offset = 0;
+
+        for (size_t idx : plan.numericColumns) {
+            const auto& values = std::get<std::vector<double>>(data.columns()[idx].values);
+            out[offset++] = (r < values.size()) ? values[r] : 0.0;
+        }
+
+        for (const auto& catPlan : plan.categoryPlans) {
+            const auto& values = std::get<std::vector<std::string>>(data.columns()[catPlan.columnIdx].values);
+            const std::string_view value = (r < values.size()) ? std::string_view(values[r]) : std::string_view();
+            bool matched = false;
+            for (std::string_view kept : catPlan.keptLabels) {
+                const bool isMatch = (value == kept);
+                out[offset++] = isMatch ? 1.0 : 0.0;
+                matched = matched || isMatch;
+            }
+            if (catPlan.includeOther) {
+                out[offset++] = matched ? 0.0 : 1.0;
+            }
+        }
+    }
+}
+
+EncodedNeuralMatrix buildEncodedNeuralInputs(const TypedDataset& data,
+                                             int targetIdx,
+                                             const std::vector<int>& numericFeatureIdx,
+                                             const AutoConfig& config) {
+    EncodedNeuralMatrix out;
+    const NeuralEncodingPlan plan = buildNeuralEncodingPlan(data, targetIdx, numericFeatureIdx, config);
+    out.sourceNumericFeaturePos = plan.sourceNumericFeaturePos;
+    out.categoricalEncodedNodes = plan.categoricalEncodedNodes;
+    out.categoricalColumnsUsed = plan.categoricalColumnsUsed;
+    encodeNeuralRows(data, plan, 0, data.rowCount(), out.X);
     return out;
 }
 
@@ -1453,6 +1492,60 @@ void validateExcludedColumns(const TypedDataset& data, const AutoConfig& config)
             throw Seldon::ConfigurationException("Excluded column not found: " + ex);
         }
     }
+}
+
+struct PreflightCullSummary {
+    double threshold = 0.95;
+    size_t dropped = 0;
+    std::vector<std::string> droppedColumns;
+};
+
+PreflightCullSummary applyPreflightSparseColumnCull(TypedDataset& data,
+                                                    const std::optional<std::string>& protectedColumn,
+                                                    bool verbose,
+                                                    double threshold = 0.95) {
+    PreflightCullSummary summary;
+    summary.threshold = threshold;
+
+    if (data.rowCount() == 0 || data.colCount() == 0) {
+        return summary;
+    }
+
+    std::vector<bool> keep(data.colCount(), true);
+    const double denom = static_cast<double>(std::max<size_t>(1, data.rowCount()));
+    const std::string protectedName = protectedColumn.has_value()
+        ? CommonUtils::toLower(CommonUtils::trim(*protectedColumn))
+        : "";
+
+    for (size_t c = 0; c < data.columns().size(); ++c) {
+        const auto& col = data.columns()[c];
+        const std::string colLower = CommonUtils::toLower(CommonUtils::trim(col.name));
+        if (!protectedName.empty() && colLower == protectedName) {
+            continue;
+        }
+
+        const size_t missingCount = std::count(col.missing.begin(), col.missing.end(), static_cast<uint8_t>(1));
+        const double missingRatio = static_cast<double>(missingCount) / denom;
+        if (missingRatio > threshold) {
+            keep[c] = false;
+            summary.droppedColumns.push_back(col.name + " (missing=" + toFixed(100.0 * missingRatio, 2) + "%)");
+        }
+    }
+
+    summary.dropped = summary.droppedColumns.size();
+    if (summary.dropped > 0) {
+        data.removeColumns(keep);
+        if (verbose) {
+            std::cout << "[Seldon][PreFlight] Dropped " << summary.dropped
+                      << " sparse columns (>" << toFixed(100.0 * threshold, 1)
+                      << "% missing) before preprocessing/univariate cycle.\n";
+            for (const auto& item : summary.droppedColumns) {
+                std::cout << "  - " << item << "\n";
+            }
+        }
+    }
+
+    return summary;
 }
 
 struct TargetContext {
@@ -2046,10 +2139,235 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         }
     }
 
+    if (config.neuralStreamingMode) {
+        const NeuralEncodingPlan plan = buildNeuralEncodingPlan(data, targetIdx, featureIdx, config);
+        const size_t inputNodes = plan.encodedWidth;
+        const size_t outputNodes = targetIndices.size();
+
+        analysis.outputAuxTargets = (targetIndices.size() > 1) ? (targetIndices.size() - 1) : 0;
+        analysis.inputNodes = inputNodes;
+        analysis.categoricalColumnsUsed = plan.categoricalColumnsUsed;
+        analysis.categoricalEncodedNodes = plan.categoricalEncodedNodes;
+
+        if (inputNodes == 0 || outputNodes == 0) {
+            analysis.policyUsed = "none_streaming_no_encoded_features";
+            analysis.featureImportance.assign(featureIdx.size(), 0.0);
+            analysis.trainingRowsUsed = data.rowCount();
+            return analysis;
+        }
+
+        size_t hidden = std::clamp<size_t>(
+            static_cast<size_t>(std::llround(std::sqrt(static_cast<double>(std::max<size_t>(1, inputNodes) * std::max<size_t>(8, data.rowCount() / 6))))),
+            4,
+            static_cast<size_t>(std::max(4, config.neuralMaxHiddenNodes)));
+
+        if (static_cast<double>(data.rowCount()) < 10.0 * static_cast<double>(std::max<size_t>(1, inputNodes))) {
+            hidden = std::min(hidden, std::clamp<size_t>(data.rowCount() / 3, 4, 20));
+        }
+        if (config.neuralFixedHiddenNodes > 0) {
+            hidden = static_cast<size_t>(config.neuralFixedHiddenNodes);
+        }
+
+        std::vector<size_t> topology = {inputNodes, hidden, outputNodes};
+        NeuralNet nn(topology);
+        NeuralNet::Hyperparameters hp;
+
+        auto toOptimizer = [](const std::string& name) {
+            const std::string n = CommonUtils::toLower(name);
+            if (n == "sgd") return NeuralNet::Optimizer::SGD;
+            if (n == "adam") return NeuralNet::Optimizer::ADAM;
+            return NeuralNet::Optimizer::LOOKAHEAD;
+        };
+
+        hp.epochs = std::clamp<size_t>(120 + data.rowCount() / 2, 100, 320);
+        hp.batchSize = std::clamp<size_t>(data.rowCount() / 24, 4, 64);
+        hp.learningRate = config.neuralLearningRate;
+        hp.earlyStoppingPatience = std::clamp<int>(static_cast<int>(hp.epochs / 12), 6, 24);
+        hp.lrDecay = config.neuralLrDecay;
+        hp.lrPlateauPatience = config.neuralLrPlateauPatience;
+        hp.lrCooldownEpochs = config.neuralLrCooldownEpochs;
+        hp.maxLrReductions = config.neuralMaxLrReductions;
+        hp.minLearningRate = config.neuralMinLearningRate;
+        hp.lrWarmupEpochs = static_cast<size_t>(std::max(0, config.neuralLrWarmupEpochs));
+        hp.useCosineAnnealing = config.neuralUseCosineAnnealing;
+        hp.useCyclicalLr = config.neuralUseCyclicalLr;
+        hp.lrCycleEpochs = static_cast<size_t>(std::max(2, config.neuralLrCycleEpochs));
+        hp.lrScheduleMinFactor = config.neuralLrScheduleMinFactor;
+        hp.useValidationLossEma = config.neuralUseValidationLossEma;
+        hp.validationLossEmaBeta = config.neuralValidationLossEmaBeta;
+        hp.dropoutRate = (inputNodes >= 12) ? 0.12 : (inputNodes >= 6 ? 0.08 : 0.04);
+        hp.valSplit = std::clamp((data.rowCount() < 80) ? 0.30 : 0.20, 0.10, 0.40);
+        hp.l2Lambda = (data.rowCount() < 80) ? 0.010 : 0.001;
+        hp.categoricalInputL2Boost = config.neuralCategoricalInputL2Boost;
+        hp.activation = (inputNodes < 10) ? NeuralNet::Activation::TANH : NeuralNet::Activation::GELU;
+        hp.outputActivation = (outputNodes == 1 && binaryTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
+        hp.useBatchNorm = config.neuralUseBatchNorm;
+        hp.batchNormMomentum = config.neuralBatchNormMomentum;
+        hp.batchNormEpsilon = config.neuralBatchNormEpsilon;
+        hp.useLayerNorm = config.neuralUseLayerNorm;
+        hp.layerNormEpsilon = config.neuralLayerNormEpsilon;
+        hp.optimizer = toOptimizer(config.neuralOptimizer);
+        hp.lookaheadFastOptimizer = toOptimizer(config.neuralLookaheadFastOptimizer);
+        hp.lookaheadSyncPeriod = static_cast<size_t>(std::max(1, config.neuralLookaheadSyncPeriod));
+        hp.lookaheadAlpha = config.neuralLookaheadAlpha;
+        hp.loss = (outputNodes == 1 && binaryTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
+        hp.importanceMaxRows = config.neuralImportanceMaxRows;
+        hp.importanceParallel = config.neuralImportanceParallel;
+        hp.verbose = verbose;
+        hp.seed = config.neuralSeed;
+        hp.gradientClipNorm = config.gradientClipNorm;
+        hp.adaptiveGradientClipping = config.neuralUseAdaptiveGradientClipping;
+        hp.adaptiveClipBeta = config.neuralAdaptiveClipBeta;
+        hp.adaptiveClipMultiplier = config.neuralAdaptiveClipMultiplier;
+        hp.adaptiveClipMin = config.neuralAdaptiveClipMin;
+        hp.gradientNoiseStd = config.neuralGradientNoiseStd;
+        hp.gradientNoiseDecay = config.neuralGradientNoiseDecay;
+        hp.useEmaWeights = config.neuralUseEmaWeights;
+        hp.emaDecay = config.neuralEmaDecay;
+        hp.labelSmoothing = config.neuralLabelSmoothing;
+        hp.gradientAccumulationSteps = static_cast<size_t>(std::max(1, config.neuralGradientAccumulationSteps));
+        hp.incrementalMode = true;
+
+        std::vector<double> inputL2Scales(inputNodes, 1.0);
+        for (size_t i = 0; i < inputL2Scales.size() && i < plan.sourceNumericFeaturePos.size(); ++i) {
+            if (plan.sourceNumericFeaturePos[i] < 0) inputL2Scales[i] = hp.categoricalInputL2Boost;
+        }
+        nn.setInputL2Scales(inputL2Scales);
+
+        const size_t chunkRows = std::max<size_t>(16, config.neuralStreamingChunkRows);
+        char xTmp[] = "/tmp/seldon_nn_x_XXXXXX";
+        char yTmp[] = "/tmp/seldon_nn_y_XXXXXX";
+        const int xFd = ::mkstemp(xTmp);
+        const int yFd = ::mkstemp(yTmp);
+        if (xFd < 0 || yFd < 0) {
+            if (xFd >= 0) ::close(xFd);
+            if (yFd >= 0) ::close(yFd);
+            throw Seldon::IOException("Failed to create temporary binary files for streaming neural training");
+        }
+
+        std::ofstream xOut(xTmp, std::ios::binary | std::ios::trunc);
+        std::ofstream yOut(yTmp, std::ios::binary | std::ios::trunc);
+        if (!xOut || !yOut) {
+            ::close(xFd);
+            ::close(yFd);
+            ::unlink(xTmp);
+            ::unlink(yTmp);
+            throw Seldon::IOException("Failed to open temporary binary output streams for neural training");
+        }
+
+        std::vector<std::vector<double>> chunkX;
+        std::vector<std::vector<double>> chunkY;
+        for (size_t start = 0; start < data.rowCount(); start += chunkRows) {
+            const size_t end = std::min(start + chunkRows, data.rowCount());
+            encodeNeuralRows(data, plan, start, end, chunkX);
+
+            chunkY.assign(end - start, std::vector<double>(outputNodes, 0.0));
+            #ifdef USE_OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (size_t r = start; r < end; ++r) {
+                const size_t local = r - start;
+                for (size_t t = 0; t < targetIndices.size(); ++t) {
+                    const int idx = targetIndices[t];
+                    const auto& targetVals = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
+                    chunkY[local][t] = (r < targetVals.size()) ? targetVals[r] : 0.0;
+                }
+            }
+
+            std::vector<float> xRow(static_cast<size_t>(inputNodes), 0.0f);
+            for (size_t r = 0; r < chunkX.size(); ++r) {
+                for (size_t c = 0; c < inputNodes; ++c) xRow[c] = static_cast<float>(chunkX[r][c]);
+                xOut.write(reinterpret_cast<const char*>(xRow.data()), static_cast<std::streamsize>(xRow.size() * sizeof(float)));
+                yOut.write(reinterpret_cast<const char*>(chunkY[r].data()), static_cast<std::streamsize>(chunkY[r].size() * sizeof(double)));
+            }
+
+            std::vector<std::vector<double>>().swap(chunkX);
+            std::vector<std::vector<double>>().swap(chunkY);
+        }
+
+        xOut.flush();
+        yOut.flush();
+        xOut.close();
+        yOut.close();
+        ::close(xFd);
+        ::close(yFd);
+
+        hp.useDiskStreaming = true;
+        hp.inputBinaryPath = xTmp;
+        hp.targetBinaryPath = yTmp;
+        hp.streamingRows = data.rowCount();
+        hp.streamingInputDim = inputNodes;
+        hp.streamingOutputDim = outputNodes;
+        hp.streamingChunkRows = chunkRows;
+        hp.useMemoryMappedInput = true;
+
+        nn.train({}, {}, hp);
+        ::unlink(xTmp);
+        ::unlink(yTmp);
+
+        analysis.hiddenNodes = hidden;
+        analysis.outputNodes = outputNodes;
+        analysis.binaryTarget = (outputNodes == 1 && binaryTarget);
+        analysis.hiddenActivation = activationToString(hp.activation);
+        analysis.outputActivation = activationToString(hp.outputActivation);
+        analysis.epochs = hp.epochs;
+        analysis.batchSize = hp.batchSize;
+        analysis.valSplit = hp.valSplit;
+        analysis.l2Lambda = hp.l2Lambda;
+        analysis.dropoutRate = hp.dropoutRate;
+        analysis.earlyStoppingPatience = hp.earlyStoppingPatience;
+        analysis.policyUsed = "streaming_on_the_fly";
+        analysis.explainabilityMethod = config.neuralExplainability;
+        analysis.trainingRowsUsed = data.rowCount();
+        analysis.topology = std::to_string(inputNodes) + " -> " + std::to_string(hidden) + " -> " + std::to_string(outputNodes);
+        analysis.trainLoss = nn.getTrainLossHistory();
+        analysis.valLoss = nn.getValLossHistory();
+        analysis.gradientNorm = nn.getGradientNormHistory();
+        analysis.weightStd = nn.getWeightStdHistory();
+        analysis.weightMeanAbs = nn.getWeightMeanAbsHistory();
+
+        const size_t sampleRows = std::min<size_t>(data.rowCount(), std::max<size_t>(64, std::min<size_t>(config.neuralImportanceMaxRows, static_cast<size_t>(1024))));
+        std::vector<std::vector<double>> sampleX;
+        std::vector<std::vector<double>> sampleY;
+        encodeNeuralRows(data, plan, 0, sampleRows, sampleX);
+        sampleY.assign(sampleRows, std::vector<double>(outputNodes, 0.0));
+        #ifdef USE_OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (size_t r = 0; r < sampleRows; ++r) {
+            for (size_t t = 0; t < targetIndices.size(); ++t) {
+                const int idx = targetIndices[t];
+                const auto& targetVals = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
+                sampleY[r][t] = (r < targetVals.size()) ? targetVals[r] : 0.0;
+            }
+        }
+
+        const std::vector<double> rawImportance = nn.calculateFeatureImportance(sampleX,
+                                                                                 sampleY,
+                                                                                 (config.neuralImportanceTrials > 0) ? config.neuralImportanceTrials : 5,
+                                                                                 config.neuralImportanceMaxRows,
+                                                                                 config.neuralImportanceParallel);
+        analysis.featureImportance.assign(featureIdx.size(), 0.0);
+        for (size_t i = 0; i < rawImportance.size() && i < plan.sourceNumericFeaturePos.size(); ++i) {
+            const int numericPos = plan.sourceNumericFeaturePos[i];
+            if (numericPos >= 0) {
+                const size_t numericPosU = static_cast<size_t>(numericPos);
+                if (numericPosU < analysis.featureImportance.size()) {
+                    analysis.featureImportance[numericPosU] += std::max(0.0, std::isfinite(rawImportance[i]) ? rawImportance[i] : 0.0);
+                }
+            }
+        }
+
+        return analysis;
+    }
+
     EncodedNeuralMatrix encoded = buildEncodedNeuralInputs(data, targetIdx, featureIdx, config);
     std::vector<std::vector<double>> Xnn = std::move(encoded.X);
     std::vector<std::vector<double>> Ynn(data.rowCount(), std::vector<double>(targetIndices.size(), 0.0));
 
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (size_t r = 0; r < data.rowCount(); ++r) {
         for (size_t t = 0; t < targetIndices.size(); ++t) {
             const int idx = targetIndices[t];
@@ -2146,6 +2464,13 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         if (dofRatio < 10.0) {
             const size_t squeezeCap = std::clamp<size_t>(data.rowCount() / 10, 4, std::max<size_t>(4, inputNodes));
             applyAdaptiveSparsity(squeezeCap);
+            inputNodes = Xnn.empty() ? 0 : Xnn.front().size();
+            analysis.inputNodes = inputNodes;
+        }
+
+        if (config.lowMemoryMode && inputNodes > 64) {
+            const size_t lowMemCap = std::clamp<size_t>(std::max<size_t>(24, data.rowCount() / 12), 24, static_cast<size_t>(64));
+            applyAdaptiveSparsity(lowMemCap);
             inputNodes = Xnn.empty() ? 0 : Xnn.front().size();
             analysis.inputNodes = inputNodes;
         }
@@ -4322,6 +4647,27 @@ void addOverallSections(ReportEngine& report,
 
 int AutomationPipeline::run(const AutoConfig& config) {
     AutoConfig runCfg = config;
+
+    if (runCfg.lowMemoryMode) {
+        runCfg.fastMode = true;
+        runCfg.fastMaxBivariatePairs = std::min<size_t>(runCfg.fastMaxBivariatePairs, 600);
+        runCfg.fastNeuralSampleRows = std::min<size_t>(runCfg.fastNeuralSampleRows, 10000);
+        runCfg.neuralStreamingMode = true;
+        runCfg.neuralStreamingChunkRows = std::min<size_t>(std::max<size_t>(128, runCfg.neuralStreamingChunkRows), 512);
+        runCfg.neuralMaxOneHotPerColumn = std::min<size_t>(runCfg.neuralMaxOneHotPerColumn, 8);
+        runCfg.featureEngineeringEnablePoly = false;
+        runCfg.featureEngineeringEnableLog = false;
+        runCfg.featureEngineeringMaxGeneratedColumns = std::min<size_t>(runCfg.featureEngineeringMaxGeneratedColumns, 64);
+        if (CommonUtils::toLower(runCfg.neuralStrategy) == "auto") {
+            runCfg.neuralStrategy = "fast";
+        }
+        runCfg.plotUnivariate = false;
+        runCfg.plotOverall = false;
+        runCfg.plotBivariateSignificant = true;
+        runCfg.plotModesExplicit = true;
+        runCfg.generateHtml = false;
+    }
+
     runCfg.plot.format = "png";
     {
         namespace fs = std::filesystem;
@@ -4391,6 +4737,17 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     validateExcludedColumns(data, config);
+    const size_t loadedColumnCount = data.colCount();
+    const std::optional<std::string> protectedTargetName = config.targetColumn.empty()
+        ? std::optional<std::string>{}
+        : std::optional<std::string>{config.targetColumn};
+    const PreflightCullSummary preflightCull = applyPreflightSparseColumnCull(data,
+                                                                               protectedTargetName,
+                                                                               runCfg.verboseAnalysis,
+                                                                               0.95);
+    if (data.colCount() == 0) {
+        throw Seldon::DatasetException("All columns were removed by pre-flight missingness cull (>95% missing)");
+    }
     const TargetContext targetContext = resolveTargetContext(data, config, runCfg);
     const int targetIdx = targetContext.targetIdx;
     applyDynamicPlotDefaultsIfUnset(runCfg, data);
@@ -4401,7 +4758,6 @@ int AutomationPipeline::run(const AutoConfig& config) {
         runCfg.neuralStrategy = "fast";
     }
 
-    const size_t rawColumnCount = data.colCount();
     PreprocessReport prep = Preprocessor::run(data, runCfg);
     advance("Preprocessed dataset");
     exportPreprocessedDatasetIfRequested(data, runCfg);
@@ -4417,11 +4773,16 @@ int AutomationPipeline::run(const AutoConfig& config) {
     univariate.addTitle("Univariate Analysis");
     univariate.addParagraph("Dataset: " + runCfg.datasetPath);
     const size_t totalAnalysisDimensions = data.colCount();
+    const size_t rawColumnsAfterPreflight = data.colCount();
     const size_t engineeredFeatureCount =
-        (totalAnalysisDimensions >= rawColumnCount) ? (totalAnalysisDimensions - rawColumnCount) : 0;
+        (totalAnalysisDimensions >= rawColumnsAfterPreflight) ? (totalAnalysisDimensions - rawColumnsAfterPreflight) : 0;
     univariate.addParagraph("Dataset Stats:");
     univariate.addParagraph("Rows: " + std::to_string(data.rowCount()));
-    univariate.addParagraph("Raw Columns: " + std::to_string(rawColumnCount));
+    univariate.addParagraph("Raw Columns (loaded): " + std::to_string(loadedColumnCount));
+    univariate.addParagraph("Raw Columns (post pre-flight cull): " + std::to_string(rawColumnsAfterPreflight));
+    if (preflightCull.dropped > 0) {
+        univariate.addParagraph("Pre-flight cull removed " + std::to_string(preflightCull.dropped) + " sparse columns (>" + toFixed(100.0 * preflightCull.threshold, 1) + "% missing) before univariate profiling.");
+    }
     univariate.addParagraph("Engineered Features: " + std::to_string(engineeredFeatureCount));
     univariate.addParagraph("Total Analysis Dimensions: " + std::to_string(totalAnalysisDimensions));
     addUnivariateDetailedSection(univariate, data, prep, runCfg.verboseAnalysis, statsCache);
@@ -4523,37 +4884,45 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     std::vector<std::vector<std::string>> allRows;
     std::vector<std::vector<std::string>> sigRows;
+    const bool compactBivariateRows = runCfg.lowMemoryMode;
+    const size_t compactRejectedCap = 256;
+    size_t compactRejectedCount = 0;
     size_t statSigCount = 0;
     for (const auto& p : bivariatePairs) {
         if (p.statSignificant) statSigCount++;
-        allRows.push_back({
-            p.featureA,
-            p.featureB,
-            toFixed(p.r),
-            toFixed(p.spearman),
-            toFixed(p.kendallTau),
-            toFixed(p.r2),
-            toFixed(p.effectSize, 6),
-            toFixed(p.foldStability, 6),
-            toFixed(p.slope),
-            toFixed(p.intercept),
-            toFixed(p.tStat, 6),
-            toFixed(p.pValue, 6),
-            p.statSignificant ? "yes" : "no",
-            toFixed(p.neuralScore, 6),
-            p.selected ? "yes" : "no",
-            p.filteredAsRedundant ? "yes" : "no",
-            p.filteredAsStructural ? "yes" : "no",
-            p.leakageRisk ? "yes" : "no",
-            p.redundancyGroup.empty() ? "-" : p.redundancyGroup,
-            p.relationLabel.empty() ? "-" : p.relationLabel,
-            p.fitLineAdded ? "yes" : "no",
-            p.confidenceBandAdded ? "yes" : "no",
-            p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
-            p.residualPlotPath.empty() ? "-" : p.residualPlotPath,
-            p.facetedPlotPath.empty() ? "-" : p.facetedPlotPath,
-            p.plotPath.empty() ? "-" : p.plotPath
-        });
+        if (!compactBivariateRows || p.selected || compactRejectedCount < compactRejectedCap) {
+            allRows.push_back({
+                p.featureA,
+                p.featureB,
+                toFixed(p.r),
+                toFixed(p.spearman),
+                toFixed(p.kendallTau),
+                toFixed(p.r2),
+                toFixed(p.effectSize, 6),
+                toFixed(p.foldStability, 6),
+                toFixed(p.slope),
+                toFixed(p.intercept),
+                toFixed(p.tStat, 6),
+                toFixed(p.pValue, 6),
+                p.statSignificant ? "yes" : "no",
+                toFixed(p.neuralScore, 6),
+                p.selected ? "yes" : "no",
+                p.filteredAsRedundant ? "yes" : "no",
+                p.filteredAsStructural ? "yes" : "no",
+                p.leakageRisk ? "yes" : "no",
+                p.redundancyGroup.empty() ? "-" : p.redundancyGroup,
+                p.relationLabel.empty() ? "-" : p.relationLabel,
+                p.fitLineAdded ? "yes" : "no",
+                p.confidenceBandAdded ? "yes" : "no",
+                p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
+                p.residualPlotPath.empty() ? "-" : p.residualPlotPath,
+                p.facetedPlotPath.empty() ? "-" : p.facetedPlotPath,
+                p.plotPath.empty() ? "-" : p.plotPath
+            });
+            if (compactBivariateRows && !p.selected) {
+                ++compactRejectedCount;
+            }
+        }
 
         if (p.selected) {
             sigRows.push_back({
@@ -4594,6 +4963,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     std::vector<std::string> topTakeaways;
+    std::string neuralInteractionTakeaway;
     std::unordered_set<size_t> usedFeatures;
     std::vector<PairInsight> rankedTakeaways;
     for (const auto& p : bivariatePairs) {
@@ -4622,6 +4992,30 @@ int AutomationPipeline::run(const AutoConfig& config) {
         usedFeatures.insert(p.idxB);
     }
 
+    if (!rankedTakeaways.empty()) {
+        const PairInsight* bestInteraction = nullptr;
+        double bestInteractionScore = -1.0;
+        for (const auto& p : rankedTakeaways) {
+            const double absCorr = std::clamp(std::abs(p.r), 0.0, 1.0);
+            const double nonLinearHint = 1.0 - (0.50 * absCorr);
+            const double interactionScore = p.neuralScore * (0.60 + 0.40 * p.foldStability) * nonLinearHint;
+            if (interactionScore > bestInteractionScore) {
+                bestInteractionScore = interactionScore;
+                bestInteraction = &p;
+            }
+        }
+
+        if (bestInteraction) {
+            const std::string interactionType = (std::abs(bestInteraction->r) < 0.55)
+                ? "complementary"
+                : "reinforcing";
+            neuralInteractionTakeaway = "Neural Interaction: " + bestInteraction->featureA + " × " + bestInteraction->featureB +
+                " form a " + interactionType + " predictive interaction (neural=" + toFixed(bestInteraction->neuralScore, 3) +
+                ", effect=" + toFixed(bestInteraction->effectSize, 3) +
+                ", stability=" + toFixed(bestInteraction->foldStability, 3) + ").";
+        }
+    }
+
     std::vector<std::string> redundancyDrops;
     std::unordered_set<std::string> seenDrop;
     for (const auto& p : bivariatePairs) {
@@ -4637,14 +5031,18 @@ int AutomationPipeline::run(const AutoConfig& config) {
         }
     }
 
-    bivariate.addParagraph("Total pairs evaluated: " + std::to_string(allRows.size()));
+    bivariate.addParagraph("Total pairs evaluated: " + std::to_string(bivariatePairs.size()));
     bivariate.addParagraph("Statistically significant pairs (p<" + toFixed(MathUtils::getSignificanceAlpha(), 4) + "): " + std::to_string(statSigCount));
     bivariate.addParagraph("Final neural-selected significant pairs: " + std::to_string(sigRows.size()));
     const size_t redundantPairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.filteredAsRedundant; }));
     const size_t structuralPairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.filteredAsStructural; }));
     const size_t leakagePairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.leakageRisk; }));
     bivariate.addParagraph("Information-theoretic filtering: redundant=" + std::to_string(redundantPairs) + ", structural=" + std::to_string(structuralPairs) + ", leakage-risk=" + std::to_string(leakagePairs) + ".");
-    bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "redundant", "structural", "leakage_risk", "cluster_rep", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, allRows);
+    if (compactBivariateRows) {
+        bivariate.addParagraph("Low-memory mode: omitted full pair table and kept only selected + capped rejected samples for diagnostics.");
+    } else {
+        bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "redundant", "structural", "leakage_risk", "cluster_rep", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, allRows);
+    }
     bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
 
     const auto contingency = analyzeContingencyPairs(data);
@@ -4689,6 +5087,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Categorical Columns Encoded", std::to_string(neural.categoricalColumnsUsed)},
         {"Categorical One-Hot Nodes", std::to_string(neural.categoricalEncodedNodes)},
         {"Sparse Features Dropped", std::to_string(selectedFeatures.droppedByMissingness.size())},
+        {"Pre-Flight Sparse Columns Culled", std::to_string(preflightCull.dropped)},
         {"Neural Strategy", neural.policyUsed},
         {"Fast Mode", fastModeEnabled ? "enabled" : "disabled"},
         {"Neural Training Rows Used", std::to_string(neural.trainingRowsUsed) + " / " + std::to_string(neural.trainingRowsTotal)},
@@ -4787,6 +5186,10 @@ int AutomationPipeline::run(const AutoConfig& config) {
             takeawayRows.push_back({std::to_string(i + 1), topTakeaways[i]});
         }
         finalAnalysis.addTable("Top 3 Takeaways", {"Rank", "Takeaway"}, takeawayRows);
+    }
+
+    if (!neuralInteractionTakeaway.empty()) {
+        finalAnalysis.addTable("Neural Interaction Takeaway", {"Insight"}, {{neuralInteractionTakeaway}});
     }
 
     if (!redundancyDrops.empty()) {

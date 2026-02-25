@@ -233,6 +233,31 @@ void applyProfile(AutoConfig& config, const std::string& profileRaw) {
     }
 }
 
+void applyLowMemoryDefaults(AutoConfig& config) {
+    config.lowMemoryMode = true;
+    config.fastMode = true;
+    config.profile = (config.profile == "auto") ? "quick" : config.profile;
+
+    config.fastMaxBivariatePairs = std::min<size_t>(config.fastMaxBivariatePairs, 600);
+    config.fastNeuralSampleRows = std::min<size_t>(config.fastNeuralSampleRows, 10000);
+    config.neuralStrategy = (config.neuralStrategy == "auto") ? "fast" : config.neuralStrategy;
+    config.neuralStreamingMode = true;
+    config.neuralStreamingChunkRows = std::min<size_t>(std::max<size_t>(128, config.neuralStreamingChunkRows), 512);
+    config.neuralMaxOneHotPerColumn = std::min<size_t>(config.neuralMaxOneHotPerColumn, 8);
+
+    config.featureEngineeringEnablePoly = false;
+    config.featureEngineeringEnableLog = false;
+    config.featureEngineeringMaxGeneratedColumns = std::min<size_t>(config.featureEngineeringMaxGeneratedColumns, 64);
+
+    config.plotUnivariate = false;
+    config.plotOverall = false;
+    config.plotBivariateSignificant = true;
+    config.plotModesExplicit = true;
+    config.generateHtml = false;
+
+    config.tuning.overallCorrHeatmapMaxColumns = std::min<size_t>(config.tuning.overallCorrHeatmapMaxColumns, 24);
+}
+
 AutoConfig runInteractiveWizard() {
     AutoConfig cfg;
     cfg.interactiveMode = true;
@@ -392,6 +417,7 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_use_adaptive_gradient_clipping", &AutoConfig::neuralUseAdaptiveGradientClipping},
         {"neural_use_ema_weights", &AutoConfig::neuralUseEmaWeights},
         {"fast_mode", &AutoConfig::fastMode},
+        {"low_memory_mode", &AutoConfig::lowMemoryMode},
         {"neural_streaming_mode", &AutoConfig::neuralStreamingMode},
         {"neural_multi_output", &AutoConfig::neuralMultiOutput},
         {"neural_importance_parallel", &AutoConfig::neuralImportanceParallel},
@@ -779,6 +805,8 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.bivariateStrategy = CommonUtils::toLower(argv[++i]);
         } else if (arg == "--fast" && i + 1 < argc) {
             config.fastMode = parseBoolStrict(argv[++i], "--fast");
+        } else if (arg == "--low-memory" && i + 1 < argc) {
+            config.lowMemoryMode = parseBoolStrict(argv[++i], "--low-memory");
         } else if (arg == "--fast-max-bivariate-pairs" && i + 1 < argc) {
             config.fastMaxBivariatePairs = static_cast<size_t>(parseIntStrict(argv[++i], "--fast-max-bivariate-pairs", 1));
         } else if (arg == "--fast-neural-sample-rows" && i + 1 < argc) {
@@ -832,6 +860,9 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     }
 
     applyProfile(config, config.profile);
+    if (config.lowMemoryMode) {
+        applyLowMemoryDefaults(config);
+    }
 
     config.validate();
 

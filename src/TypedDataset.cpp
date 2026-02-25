@@ -27,7 +27,8 @@ bool isMissingToken(const std::string& raw) {
     std::string s = CommonUtils::trim(raw);
     if (s.empty()) return true;
     s = CommonUtils::toLower(std::move(s));
-    return s == "na" || s == "n/a" || s == "null" || s == "none" || s == "nan" || s == "missing";
+    return s == "na" || s == "n/a" || s == "null" || s == "none" || s == "nan" || s == "missing" ||
+           s == "unknown" || s == "unk" || s == "?" || s == "-" || s == "--" || s == "tbd";
 }
 
 bool parseFixedInt(const std::string& s, size_t offset, size_t len, int& out) {
@@ -584,6 +585,8 @@ bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) 
 }
 
 void TypedDataset::load() {
+    const CSVUtils::ParseLimits parseLimits{};
+
     auto [resolvedPath, isTemporary] = resolveDatasetInputPath(filename_);
     struct TempFileGuard {
         std::string path;
@@ -601,7 +604,11 @@ void TypedDataset::load() {
     CSVUtils::skipBOM(in);
 
     bool malformed = false;
-    auto header = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
+    bool parseLimitExceeded = false;
+    auto header = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+    if (parseLimitExceeded) {
+        throw Seldon::DatasetException("CSV header exceeds parser safety limits");
+    }
     if (malformed || header.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
     header = CSVUtils::normalizeHeader(header);
 
@@ -802,7 +809,10 @@ void TypedDataset::load() {
     std::vector<double> runningSums(header.size(), 0.0);
 
     while (in.peek() != EOF) {
-        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
+        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+        if (parseLimitExceeded) {
+            throw Seldon::DatasetException("CSV record exceeds parser safety limits");
+        }
         if (row.empty() || malformed || isSkippableControlRow(row)) continue;
         reconcileRowWidth(row);
         repairDateShiftedRow(row);
@@ -893,14 +903,21 @@ void TypedDataset::load() {
     in.seekg(0, std::ios::beg);
     CSVUtils::skipBOM(in);
     malformed = false;
-    auto headerSecondPass = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
+    parseLimitExceeded = false;
+    auto headerSecondPass = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+    if (parseLimitExceeded) {
+        throw Seldon::DatasetException("CSV header exceeds parser safety limits");
+    }
     if (malformed || headerSecondPass.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
 
     size_t r = 0;
     size_t decisionIdx = 0;
     std::fill(runningSums.begin(), runningSums.end(), 0.0);
     while (in.peek() != EOF) {
-        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
+        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+        if (parseLimitExceeded) {
+            throw Seldon::DatasetException("CSV record exceeds parser safety limits");
+        }
         if (row.empty() || malformed || isSkippableControlRow(row)) continue;
         reconcileRowWidth(row);
         repairDateShiftedRow(row);
@@ -987,14 +1004,21 @@ void TypedDataset::load() {
     in.seekg(0, std::ios::beg);
     CSVUtils::skipBOM(in);
     malformed = false;
-    auto headerThirdPass = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
+    parseLimitExceeded = false;
+    auto headerThirdPass = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+    if (parseLimitExceeded) {
+        throw Seldon::DatasetException("CSV header exceeds parser safety limits");
+    }
     if (malformed || headerThirdPass.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
 
     size_t rowIdx = 0;
     size_t fallbackDecisionIdx = 0;
     std::fill(runningSums.begin(), runningSums.end(), 0.0);
     while (in.peek() != EOF) {
-        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr);
+        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+        if (parseLimitExceeded) {
+            throw Seldon::DatasetException("CSV record exceeds parser safety limits");
+        }
         if (row.empty() || malformed || isSkippableControlRow(row)) continue;
         reconcileRowWidth(row);
         repairDateShiftedRow(row);
@@ -1137,4 +1161,18 @@ void TypedDataset::removeRows(const MissingMask& keepMask) {
     }
 
     rowCount_ = std::count(keepMask.begin(), keepMask.end(), static_cast<uint8_t>(1));
+}
+
+void TypedDataset::removeColumns(const std::vector<bool>& keepMask) {
+    if (keepMask.size() != columns_.size()) {
+        throw Seldon::DatasetException("Column mask size mismatch");
+    }
+
+    std::vector<TypedColumn> next;
+    next.reserve(columns_.size());
+    for (size_t i = 0; i < columns_.size(); ++i) {
+        if (!keepMask[i]) continue;
+        next.push_back(std::move(columns_[i]));
+    }
+    columns_ = std::move(next);
 }

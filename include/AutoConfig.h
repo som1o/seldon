@@ -192,6 +192,7 @@ struct AutoConfig {
     std::string neuralStrategy = "auto";    // auto|none|fast|balanced|expressive
     std::string bivariateStrategy = "auto"; // auto|balanced|corr_heavy|importance_heavy
     bool fastMode = false;
+    bool lowMemoryMode = false;
     size_t fastMaxBivariatePairs = 2500;
     size_t fastNeuralSampleRows = 25000;
 

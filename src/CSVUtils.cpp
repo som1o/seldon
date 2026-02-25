@@ -25,21 +25,63 @@ void skipBOM(std::istream& is) {
     }
 }
 
-std::vector<std::string> parseCSVLine(std::istream& is, char delimiter, bool* malformed, size_t* consumedLines) {
+std::vector<std::string> parseCSVLine(std::istream& is,
+                                      char delimiter,
+                                      bool* malformed,
+                                      size_t* consumedLines,
+                                      bool* limitExceeded,
+                                      const ParseLimits& limits) {
     if (malformed) *malformed = false;
     if (consumedLines) *consumedLines = 0;
+    if (limitExceeded) *limitExceeded = false;
     if (is.peek() == EOF) return {};
 
     std::vector<std::string> row;
-    std::vector<uint8_t> fieldQuoted;
     std::string val;
     bool inQuotes = false;
     bool currentFieldQuoted = false;
+    bool lastPushedFieldQuoted = false;
     bool hasRecordData = false;
     bool hadDelimiter = false;
+    bool recordHadAnyNewline = false;
+    size_t recordBytes = 0;
+    size_t physicalLineCount = 1;
     char c;
 
+    auto markLimitExceeded = [&]() {
+        if (limitExceeded) *limitExceeded = true;
+    };
+
+    auto exceedsRecordBytes = [&](size_t delta) {
+        if (limits.maxRecordBytes == 0) return false;
+        if (recordBytes > limits.maxRecordBytes - delta) {
+            markLimitExceeded();
+            return true;
+        }
+        recordBytes += delta;
+        return false;
+    };
+
+    auto exceedsFieldBytes = [&](size_t fieldSize) {
+        if (limits.maxFieldBytes == 0) return false;
+        if (fieldSize > limits.maxFieldBytes) {
+            markLimitExceeded();
+            return true;
+        }
+        return false;
+    };
+
+    auto pushField = [&]() {
+        row.push_back(currentFieldQuoted ? val : trimUnquotedField(val));
+        lastPushedFieldQuoted = currentFieldQuoted;
+        if (limits.maxColumns > 0 && row.size() > limits.maxColumns) {
+            markLimitExceeded();
+        }
+    };
+
     while (is.get(c)) {
+        if (exceedsRecordBytes(1)) break;
+
         if (c == '"') {
             if (!inQuotes && val.empty()) {
                 inQuotes = true;
@@ -47,23 +89,27 @@ std::vector<std::string> parseCSVLine(std::istream& is, char delimiter, bool* ma
                 hasRecordData = true;
             } else if (inQuotes) {
                 if (is.peek() == '"') {
-                    val += '"';
                     is.get();
+                    if (exceedsRecordBytes(1)) break;
+                    val += '"';
+                    if (exceedsFieldBytes(val.size())) break;
                 } else {
                     int next = is.peek();
                     if (next == EOF || next == delimiter || next == '\n' || next == '\r') {
                         inQuotes = false;
                     } else {
                         val += c;
+                        if (exceedsFieldBytes(val.size())) break;
                     }
                 }
             } else {
                 val += c;
+                if (exceedsFieldBytes(val.size())) break;
                 hasRecordData = true;
             }
         } else if (c == delimiter && !inQuotes) {
-            row.push_back(currentFieldQuoted ? val : trimUnquotedField(val));
-            fieldQuoted.push_back(static_cast<uint8_t>(currentFieldQuoted ? 1 : 0));
+            pushField();
+            if (limitExceeded && *limitExceeded) break;
             val.clear();
             currentFieldQuoted = false;
             hadDelimiter = true;
@@ -71,22 +117,43 @@ std::vector<std::string> parseCSVLine(std::istream& is, char delimiter, bool* ma
         } else if (c == '\r') {
             if (is.peek() == '\n') is.get();
             if (consumedLines) ++(*consumedLines);
+            recordHadAnyNewline = true;
+            if (inQuotes) {
+                ++physicalLineCount;
+                if (limits.maxPhysicalLinesPerRecord > 0 && physicalLineCount > limits.maxPhysicalLinesPerRecord) {
+                    markLimitExceeded();
+                    break;
+                }
+            }
             if (inQuotes) {
                 val += '\n';
+                if (exceedsFieldBytes(val.size())) break;
             } else {
                 break;
             }
         } else if (c == '\n') {
             if (consumedLines) ++(*consumedLines);
+            recordHadAnyNewline = true;
+            if (inQuotes) {
+                ++physicalLineCount;
+                if (limits.maxPhysicalLinesPerRecord > 0 && physicalLineCount > limits.maxPhysicalLinesPerRecord) {
+                    markLimitExceeded();
+                    break;
+                }
+            }
             if (inQuotes) {
                 val += '\n';
+                if (exceedsFieldBytes(val.size())) break;
             } else {
                 break;
             }
         } else {
             val += c;
+            if (exceedsFieldBytes(val.size())) break;
             hasRecordData = true;
         }
+
+        if (limitExceeded && *limitExceeded) break;
     }
 
     if (inQuotes && malformed) {
@@ -94,11 +161,10 @@ std::vector<std::string> parseCSVLine(std::istream& is, char delimiter, bool* ma
     }
 
     if (hasRecordData || hadDelimiter || !val.empty()) {
-        row.push_back(currentFieldQuoted ? val : trimUnquotedField(val));
-        fieldQuoted.push_back(static_cast<uint8_t>(currentFieldQuoted ? 1 : 0));
+        pushField();
     }
 
-    if (row.size() == 1 && row[0].empty() && fieldQuoted[0] == 0 && !hadDelimiter) {
+    if (row.size() == 1 && row[0].empty() && !lastPushedFieldQuoted && !hadDelimiter && recordHadAnyNewline) {
         return {};
     }
 

@@ -7,7 +7,7 @@
 
 enum class ColumnType { NUMERIC, CATEGORICAL, DATETIME };
 using ColumnStorage = std::variant<std::vector<double>, std::vector<std::string>, std::vector<int64_t>>;
-using MissingMask = std::vector<uint8_t>;
+using MissingMask = std::vector<bool>;
 
 struct TypedColumn {
     std::string name;
@@ -67,6 +67,14 @@ public:
      * @throws Seldon::DatasetException when mask size mismatches row count.
      */
     void removeRows(const MissingMask& keepMask);
+
+    /**
+     * @brief Removes columns where keepMask is false.
+     * @pre keepMask.size() == colCount().
+     * @post Remaining columns preserve row alignment and order.
+     * @throws Seldon::DatasetException when mask size mismatches column count.
+     */
+    void removeColumns(const std::vector<bool>& keepMask);
 
 private:
     std::string filename_;

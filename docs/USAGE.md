@@ -25,6 +25,15 @@ cmake -DSELDON_ENABLE_OPENMP=ON ..
 cmake --build . -j
 ```
 
+Float32 neural tensors (reduced memory):
+
+```bash
+mkdir -p build
+cd build
+cmake -DSELDON_ENABLE_OPENMP=ON -DSELDON_NEURAL_FLOAT32=ON ..
+cmake --build . -j
+```
+
 ### 1.2 Direct Run
 
 ```bash
@@ -42,6 +51,17 @@ cmake --build . -j
 ```bash
 ./seldon --interactive
 ```
+
+### 1.5 Massif Memory Profiling
+
+```bash
+valgrind --tool=massif --massif-out-file=massif.out \
+  ./seldon /absolute/path/to/data.csv --low-memory true --neural-streaming-mode true
+
+ms_print massif.out > massif_report.txt
+```
+
+If `valgrind` is unavailable, install it first (distribution package name is usually `valgrind`).
 
 ---
 
@@ -104,11 +124,23 @@ Examples:
 - `--delimiter <char>`
 - `--output-dir <path>`
 - `--profile <auto|quick|thorough|minimal>`
+- `--low-memory <true|false>` (enables memory-safe defaults for large datasets)
 
 ### 4.2 Parsing Hints
 
 - `--datetime-locale-hint <auto|dmy|mdy>`
 - `--numeric-locale-hint <auto|us|eu>`
+
+### 4.2.1 Pre-Flight Data Hygiene (Default)
+
+Before preprocessing and univariate profiling, Seldon now performs a pre-flight sparse-column cull:
+
+- Any column with more than 95% missingness is removed.
+- If `--target` is explicitly provided, the target column is protected from this auto-cull.
+
+Missing-token detection also treats common unknown placeholders as missing values, including:
+
+- `unknown`, `unk`, `?`, `-`, `--`, `tbd`
 
 ### 4.3 Plot Controls
 

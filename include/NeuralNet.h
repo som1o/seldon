@@ -8,6 +8,7 @@
 // Advanced, dependency-free Dense Feed-Forward Neural Network
 class NeuralNet {
 public:
+    using Scalar = NeuralScalar;
     using Activation = NeuralActivation;
     enum class LossFunction { MSE, CROSS_ENTROPY };
     using Optimizer = NeuralOptimizer;
@@ -63,6 +64,14 @@ public:
         double labelSmoothing = 0.02;
         size_t gradientAccumulationSteps = 2;
         bool incrementalMode = false;
+        bool useDiskStreaming = false;
+        std::string inputBinaryPath;
+        std::string targetBinaryPath;
+        size_t streamingRows = 0;
+        size_t streamingInputDim = 0;
+        size_t streamingOutputDim = 0;
+        bool useMemoryMappedInput = true;
+        size_t streamingChunkRows = 2048;
         size_t importanceMaxRows = 5000;
         bool importanceParallel = true;
         uint32_t seed = 1337;
@@ -91,6 +100,16 @@ public:
                           size_t chunkRows,
                           const std::vector<ScaleInfo>& inputScales = {},
                           const std::vector<ScaleInfo>& outputScales = {});
+    void trainIncrementalFromBinary(const std::string& inputBinaryPath,
+                                    const std::string& targetBinaryPath,
+                                    size_t rows,
+                                    size_t inputDim,
+                                    size_t outputDim,
+                                    const Hyperparameters& hp,
+                                    size_t chunkRows,
+                                    bool useMemoryMap,
+                                    const std::vector<ScaleInfo>& inputScales = {},
+                                    const std::vector<ScaleInfo>& outputScales = {});
 
     // Forward pass prediction (handles internal scaling if scales are loaded)
     std::vector<double> predict(const std::vector<double>& inputValues);
@@ -126,6 +145,7 @@ public:
     void loadModelBinary(const std::string& filename);
 
 private:
+    void ensureBatchWorkspace();
     void feedForward(const std::vector<double>& inputValues, bool isTraining, double dropoutRate = 0.0);
     void backpropagate(const std::vector<double>& targetValues, const Hyperparameters& hp, size_t t_step);
     
@@ -163,13 +183,18 @@ private:
     bool m_useLayerNorm = true;
     double m_layerNormEpsilon = 1e-5;
     bool m_lookaheadInitialized = false;
-    std::vector<std::vector<double>> m_lookaheadSlowWeights;
-    std::vector<std::vector<double>> m_lookaheadSlowBiases;
+    std::vector<std::vector<Scalar>> m_lookaheadSlowWeights;
+    std::vector<std::vector<Scalar>> m_lookaheadSlowBiases;
     bool m_emaInitialized = false;
-    std::vector<std::vector<double>> m_emaWeights;
-    std::vector<std::vector<double>> m_emaBiases;
+    std::vector<std::vector<Scalar>> m_emaWeights;
+    std::vector<std::vector<Scalar>> m_emaBiases;
     double m_runningGradNormEma = 0.0;
     bool m_runningGradNormReady = false;
+    std::vector<std::vector<Scalar>> m_gradBAccumWorkspace;
+    std::vector<std::vector<Scalar>> m_gradWAccumWorkspace;
+    std::vector<std::vector<Scalar>> m_gradBWorkWorkspace;
+    std::vector<std::vector<Scalar>> m_gradWWorkWorkspace;
+    std::vector<double> m_targetWork;
 
     // Persistent RNG for performance and consistency
     std::mt19937 rng;
