@@ -247,6 +247,8 @@ void applyLowMemoryDefaults(AutoConfig& config) {
 
     config.featureEngineeringEnablePoly = false;
     config.featureEngineeringEnableLog = false;
+    config.featureEngineeringEnableRatioProductDiscovery = false;
+    config.featureEngineeringMaxPairwiseDiscovery = std::min<size_t>(config.featureEngineeringMaxPairwiseDiscovery, 8);
     config.featureEngineeringMaxGeneratedColumns = std::min<size_t>(config.featureEngineeringMaxGeneratedColumns, 64);
 
     config.plotUnivariate = false;
@@ -423,6 +425,7 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_importance_parallel", &AutoConfig::neuralImportanceParallel},
         {"feature_engineering_enable_poly", &AutoConfig::featureEngineeringEnablePoly},
         {"feature_engineering_enable_log", &AutoConfig::featureEngineeringEnableLog},
+        {"feature_engineering_enable_ratio_product_discovery", &AutoConfig::featureEngineeringEnableRatioProductDiscovery},
         {"store_outlier_flags_in_report", &AutoConfig::storeOutlierFlagsInReport}
     };
     static const std::unordered_map<std::string, uint32_t AutoConfig::*> uintFields = {
@@ -455,6 +458,7 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_importance_max_rows", {&AutoConfig::neuralImportanceMaxRows, 128}},
         {"neural_importance_trials", {&AutoConfig::neuralImportanceTrials, 0}},
         {"feature_engineering_max_base", {&AutoConfig::featureEngineeringMaxBase, 2}},
+        {"feature_engineering_max_pairwise_discovery", {&AutoConfig::featureEngineeringMaxPairwiseDiscovery, 2}},
         {"neural_max_one_hot_per_column", {&AutoConfig::neuralMaxOneHotPerColumn, 1}},
         {"neural_max_topology_nodes", {&AutoConfig::neuralMaxTopologyNodes, 16}},
         {"neural_max_trainable_params", {&AutoConfig::neuralMaxTrainableParams, 1024}},
@@ -513,6 +517,7 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"numeric_epsilon", {&HeuristicTuningConfig::numericEpsilon, 0.0}},
         {"beta_fallback_tolerance", {&HeuristicTuningConfig::betaFallbackTolerance, 0.0}},
         {"bivariate_selection_quantile", {&HeuristicTuningConfig::bivariateSelectionQuantileOverride, -1.0}},
+        {"bivariate_tier3_fallback_aggressiveness", {&HeuristicTuningConfig::bivariateTier3FallbackAggressiveness, 0.0}},
         {"box_plot_min_iqr", {&HeuristicTuningConfig::boxPlotMinIqr, 0.0}},
         {"pie_max_dominance_ratio", {&HeuristicTuningConfig::pieMaxDominanceRatio, 0.0}},
         {"scatter_fit_min_abs_corr", {&HeuristicTuningConfig::scatterFitMinAbsCorr, 0.0}},
@@ -606,7 +611,7 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     }
 
     if (argc < 2) {
-        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--plot-theme auto|light|dark] [--plot-grid true|false] [--plot-point-size >0] [--plot-line-width >0] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--neural-optimizer sgd|adam|lookahead] [--neural-lookahead-fast-optimizer sgd|adam] [--neural-lookahead-sync-period N] [--neural-lookahead-alpha 0..1] [--neural-use-batch-norm true|false] [--neural-batch-norm-momentum 0..1) [--neural-batch-norm-epsilon >0] [--neural-use-layer-norm true|false] [--neural-layer-norm-epsilon >0] [--neural-lr-decay 0..1] [--neural-lr-plateau-patience N] [--neural-lr-cooldown-epochs N] [--neural-max-lr-reductions N] [--neural-min-learning-rate >=0] [--neural-use-validation-loss-ema true|false] [--neural-validation-loss-ema-beta 0..1] [--neural-categorical-input-l2-boost >=0] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1] [--ogive-min-points N] [--ogive-min-unique N] [--box-min-points N] [--box-min-iqr >=0] [--pie-min-categories N] [--pie-max-categories N] [--pie-max-dominance 0..1] [--fit-min-corr 0..1] [--fit-min-samples N] [--gantt-auto true|false] [--gantt-min-tasks N] [--gantt-max-tasks N] [--gantt-duration-hours-threshold >0]");
+        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--plot-theme auto|light|dark] [--plot-grid true|false] [--plot-point-size >0] [--plot-line-width >0] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--neural-optimizer sgd|adam|lookahead] [--neural-lookahead-fast-optimizer sgd|adam] [--neural-lookahead-sync-period N] [--neural-lookahead-alpha 0..1] [--neural-use-batch-norm true|false] [--neural-batch-norm-momentum 0..1) [--neural-batch-norm-epsilon >0] [--neural-use-layer-norm true|false] [--neural-layer-norm-epsilon >0] [--neural-lr-decay 0..1] [--neural-lr-plateau-patience N] [--neural-lr-cooldown-epochs N] [--neural-max-lr-reductions N] [--neural-min-learning-rate >=0] [--neural-use-validation-loss-ema true|false] [--neural-validation-loss-ema-beta 0..1] [--neural-categorical-input-l2-boost >=0] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1] [--tier3-fallback-aggressiveness 0..3] [--ogive-min-points N] [--ogive-min-unique N] [--box-min-points N] [--box-min-iqr >=0] [--pie-min-categories N] [--pie-max-categories N] [--pie-max-dominance 0..1] [--fit-min-corr 0..1] [--fit-min-samples N] [--gantt-auto true|false] [--gantt-min-tasks N] [--gantt-max-tasks N] [--gantt-duration-hours-threshold >0]");
     }
 
     AutoConfig config;
@@ -772,10 +777,14 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.featureEngineeringEnablePoly = parseBoolStrict(argv[++i], "--feature-engineering-enable-poly");
         } else if (arg == "--feature-engineering-enable-log" && i + 1 < argc) {
             config.featureEngineeringEnableLog = parseBoolStrict(argv[++i], "--feature-engineering-enable-log");
+        } else if (arg == "--feature-engineering-enable-ratio-product-discovery" && i + 1 < argc) {
+            config.featureEngineeringEnableRatioProductDiscovery = parseBoolStrict(argv[++i], "--feature-engineering-enable-ratio-product-discovery");
         } else if (arg == "--feature-engineering-degree" && i + 1 < argc) {
             config.featureEngineeringDegree = parseIntStrict(argv[++i], "--feature-engineering-degree", 1);
         } else if (arg == "--feature-engineering-max-base" && i + 1 < argc) {
             config.featureEngineeringMaxBase = static_cast<size_t>(parseIntStrict(argv[++i], "--feature-engineering-max-base", 2));
+        } else if (arg == "--feature-engineering-max-pairwise-discovery" && i + 1 < argc) {
+            config.featureEngineeringMaxPairwiseDiscovery = static_cast<size_t>(parseIntStrict(argv[++i], "--feature-engineering-max-pairwise-discovery", 2));
         } else if (arg == "--feature-engineering-max-generated-columns" && i + 1 < argc) {
             config.featureEngineeringMaxGeneratedColumns = static_cast<size_t>(parseIntStrict(argv[++i], "--feature-engineering-max-generated-columns", 16));
         } else if (arg == "--type" && i + 1 < argc) {
@@ -823,6 +832,8 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.tuning.featureLeakageCorrThreshold = parseDoubleStrict(argv[++i], "--feature-leakage-corr-threshold", 0.0);
         } else if (arg == "--bivariate-selection-quantile" && i + 1 < argc) {
             config.tuning.bivariateSelectionQuantileOverride = parseDoubleStrict(argv[++i], "--bivariate-selection-quantile", -1.0);
+        } else if (arg == "--tier3-fallback-aggressiveness" && i + 1 < argc) {
+            config.tuning.bivariateTier3FallbackAggressiveness = parseDoubleStrict(argv[++i], "--tier3-fallback-aggressiveness", 0.0);
         } else if (arg == "--overall-corr-heatmap-max-columns" && i + 1 < argc) {
             config.tuning.overallCorrHeatmapMaxColumns = static_cast<size_t>(parseIntStrict(argv[++i], "--overall-corr-heatmap-max-columns", 2));
         } else if (arg == "--ogive-min-points" && i + 1 < argc) {
@@ -945,6 +956,9 @@ void HeuristicTuningConfig::validate() const {
     if (bivariateSelectionQuantileOverride != -1.0 &&
         (bivariateSelectionQuantileOverride < 0.0 || bivariateSelectionQuantileOverride > 1.0)) {
         throw Seldon::ConfigurationException("bivariate_selection_quantile must be -1 or within [0,1]");
+    }
+    if (bivariateTier3FallbackAggressiveness < 0.0 || bivariateTier3FallbackAggressiveness > 3.0) {
+        throw Seldon::ConfigurationException("bivariate_tier3_fallback_aggressiveness must be within [0,3]");
     }
     if (coherenceWeightMin > coherenceWeightMax) {
         throw Seldon::ConfigurationException("coherence_weight_min must be <= coherence_weight_max");
@@ -1125,6 +1139,9 @@ void AutoConfig::validate() const {
     }
     if (featureEngineeringMaxBase < 2) {
         throw Seldon::ConfigurationException("feature_engineering_max_base must be >= 2");
+    }
+    if (featureEngineeringMaxPairwiseDiscovery < 2) {
+        throw Seldon::ConfigurationException("feature_engineering_max_pairwise_discovery must be >= 2");
     }
     if (featureEngineeringMaxGeneratedColumns < 16) {
         throw Seldon::ConfigurationException("feature_engineering_max_generated_columns must be >= 16");

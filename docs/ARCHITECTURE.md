@@ -273,7 +273,12 @@ Seldon enforces:
 
 This cap is applied while generating polynomial,
 log,
-and interaction features.
+interaction,
+and ratio features.
+
+Pairwise discovery is additionally bounded by:
+
+- `featureEngineeringMaxPairwiseDiscovery`.
 
 ---
 

@@ -270,19 +270,19 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
     auto numericIdx = data.numericColumnIndices();
     if (numericIdx.empty()) return;
 
-    const size_t maxBase = std::min<size_t>(numericIdx.size(), std::max<size_t>(2, config.featureEngineeringMaxBase));
-    std::vector<size_t> base(numericIdx.begin(), numericIdx.begin() + maxBase);
-
-    std::vector<TypedColumn> engineered;
-    engineered.reserve(maxBase * (1 + static_cast<size_t>(std::max(1, config.featureEngineeringDegree))));
-    const size_t maxGenerated = std::max<size_t>(16, config.featureEngineeringMaxGeneratedColumns);
-    bool capReached = false;
-
     const int targetIdx = config.targetColumn.empty() ? -1 : data.findColumnIndex(config.targetColumn);
     const bool hasNumericTarget =
         targetIdx >= 0 &&
         static_cast<size_t>(targetIdx) < data.columns().size() &&
         data.columns()[static_cast<size_t>(targetIdx)].type == ColumnType::NUMERIC;
+
+    std::vector<size_t> candidates;
+    candidates.reserve(numericIdx.size());
+    for (size_t idx : numericIdx) {
+        if (hasNumericTarget && static_cast<int>(idx) == targetIdx) continue;
+        candidates.push_back(idx);
+    }
+    if (candidates.empty()) return;
 
     std::vector<double> targetVals;
     MissingMask targetMissing;
@@ -310,6 +310,46 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
         return std::abs(MathUtils::calculatePearson(cleanX, cleanY, sx, sy).value_or(0.0));
     };
 
+    auto varianceObserved = [&](const std::vector<double>& x, const MissingMask& xMissing) {
+        std::vector<double> clean;
+        clean.reserve(x.size());
+        for (size_t i = 0; i < x.size() && i < xMissing.size(); ++i) {
+            if (xMissing[i]) continue;
+            if (!std::isfinite(x[i])) continue;
+            clean.push_back(x[i]);
+        }
+        if (clean.size() < 3) return 0.0;
+        const ColumnStats s = Statistics::calculateStats(clean);
+        return std::max(0.0, s.variance);
+    };
+
+    std::vector<std::pair<size_t, double>> rankedBase;
+    rankedBase.reserve(candidates.size());
+    for (size_t idx : candidates) {
+        const auto& col = data.columns()[idx];
+        const auto& vals = std::get<NumVec>(col.values);
+        const double score = hasNumericTarget
+            ? absCorrWithTarget(vals, col.missing)
+            : std::sqrt(std::max(0.0, varianceObserved(vals, col.missing)));
+        rankedBase.push_back({idx, std::isfinite(score) ? score : 0.0});
+    }
+    std::sort(rankedBase.begin(), rankedBase.end(), [](const auto& a, const auto& b) {
+        if (a.second == b.second) return a.first < b.first;
+        return a.second > b.second;
+    });
+
+    const size_t maxBase = std::min<size_t>(rankedBase.size(), std::max<size_t>(2, config.featureEngineeringMaxBase));
+    std::vector<size_t> base;
+    base.reserve(maxBase);
+    for (size_t i = 0; i < maxBase; ++i) base.push_back(rankedBase[i].first);
+
+    const size_t maxPairwise = std::min<size_t>(base.size(), std::max<size_t>(2, config.featureEngineeringMaxPairwiseDiscovery));
+    std::vector<size_t> pairwiseBase(base.begin(), base.begin() + maxPairwise);
+
+    std::vector<TypedColumn> engineered;
+    engineered.reserve(maxBase * (2 + static_cast<size_t>(std::max(1, config.featureEngineeringDegree))));
+    const size_t maxGenerated = std::max<size_t>(16, config.featureEngineeringMaxGeneratedColumns);
+
     std::unordered_map<size_t, double> baseCorr;
     if (hasNumericTarget) {
         for (size_t idx : base) {
@@ -323,11 +363,27 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
         return engineered.size() < maxGenerated;
     };
 
+    auto shouldKeepDerived = [&](const std::vector<double>& x,
+                                 const MissingMask& xMissing,
+                                 size_t parentA,
+                                 size_t parentB) {
+        const double var = varianceObserved(x, xMissing);
+        if (var <= config.tuning.featureMinVariance) return false;
+        if (!hasNumericTarget) return true;
+
+        const double derivedCorr = absCorrWithTarget(x, xMissing);
+        const double baseA = baseCorr.count(parentA) ? baseCorr[parentA] : 0.0;
+        const double baseB = baseCorr.count(parentB) ? baseCorr[parentB] : 0.0;
+        const double baseBest = std::max(baseA, baseB);
+        const double minCorr = std::max(0.05, baseBest * 1.01);
+        const double minLift = 0.015;
+        return derivedCorr >= minCorr && (derivedCorr + minLift) >= baseBest;
+    };
+
     const int maxDegree = std::clamp(config.featureEngineeringDegree, 1, 4);
 
     for (size_t idx : base) {
         if (!canAddMore()) {
-            capReached = true;
             break;
         }
         const auto& col = data.columns()[idx];
@@ -336,7 +392,6 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
         if (config.featureEngineeringEnablePoly) {
             for (int p = 2; p <= maxDegree; ++p) {
                 if (!canAddMore()) {
-                    capReached = true;
                     break;
                 }
                 std::vector<double> poly(vals.size(), 0.0);
@@ -354,7 +409,6 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
 
         if (config.featureEngineeringEnableLog) {
             if (!canAddMore()) {
-                capReached = true;
                 break;
             }
             std::vector<double> logSigned(vals.size(), 0.0);
@@ -372,19 +426,19 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
         }
     }
 
-    if (config.featureEngineeringEnablePoly && !capReached) {
-        for (size_t i = 0; i < base.size(); ++i) {
+    if ((config.featureEngineeringEnablePoly || config.featureEngineeringEnableRatioProductDiscovery) && canAddMore()) {
+        for (size_t i = 0; i < pairwiseBase.size(); ++i) {
             if (!canAddMore()) {
-                capReached = true;
                 break;
             }
-            for (size_t j = i + 1; j < base.size(); ++j) {
+            for (size_t j = i + 1; j < pairwiseBase.size(); ++j) {
                 if (!canAddMore()) {
-                    capReached = true;
                     break;
                 }
-                const auto& a = data.columns()[base[i]];
-                const auto& b = data.columns()[base[j]];
+                const size_t idxA = pairwiseBase[i];
+                const size_t idxB = pairwiseBase[j];
+                const auto& a = data.columns()[idxA];
+                const auto& b = data.columns()[idxB];
                 const auto& av = std::get<NumVec>(a.values);
                 const auto& bv = std::get<NumVec>(b.values);
                 const size_t n = std::min(av.size(), bv.size());
@@ -398,27 +452,58 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
                     inter[r] = av[r] * bv[r];
                 }
 
-                TypedColumn c;
-                c.name = uniqueColumnName(data, a.name + "_x_" + b.name);
-                c.type = ColumnType::NUMERIC;
-                c.values = std::move(inter);
-                c.missing = std::move(miss);
-
-                if (hasNumericTarget) {
-                    const double interCorr = absCorrWithTarget(std::get<NumVec>(c.values), c.missing);
-                    const double baseA = baseCorr.count(base[i]) ? baseCorr[base[i]] : 0.0;
-                    const double baseB = baseCorr.count(base[j]) ? baseCorr[base[j]] : 0.0;
-                    const double baseBest = std::max(baseA, baseB);
-                    const double lift = interCorr - baseBest;
-                    const bool hasUsefulLift = (interCorr >= (baseBest * 1.05)) && (lift >= 0.03);
-                    if (!hasUsefulLift) {
-                        continue;
-                    }
+                if (shouldKeepDerived(inter, miss, idxA, idxB)) {
+                    TypedColumn c;
+                    c.name = uniqueColumnName(data, a.name + "_x_" + b.name);
+                    c.type = ColumnType::NUMERIC;
+                    c.values = std::move(inter);
+                    c.missing = std::move(miss);
+                    engineered.push_back(std::move(c));
                 }
 
-                engineered.push_back(std::move(c));
+                if (!config.featureEngineeringEnableRatioProductDiscovery) continue;
+                if (!canAddMore()) break;
+
+                const double denomEps = std::max(1e-9, config.tuning.numericEpsilon * 1000.0);
+
+                std::vector<double> ratioAB(n, 0.0);
+                MissingMask missAB(n, static_cast<uint8_t>(0));
+                for (size_t r = 0; r < n; ++r) {
+                    if (a.missing[r] || b.missing[r] || std::abs(bv[r]) <= denomEps) {
+                        missAB[r] = static_cast<uint8_t>(1);
+                        continue;
+                    }
+                    ratioAB[r] = av[r] / bv[r];
+                }
+                if (shouldKeepDerived(ratioAB, missAB, idxA, idxB)) {
+                    TypedColumn c;
+                    c.name = uniqueColumnName(data, a.name + "_div_" + b.name);
+                    c.type = ColumnType::NUMERIC;
+                    c.values = std::move(ratioAB);
+                    c.missing = std::move(missAB);
+                    engineered.push_back(std::move(c));
+                }
+
+                if (!canAddMore()) break;
+
+                std::vector<double> ratioBA(n, 0.0);
+                MissingMask missBA(n, static_cast<uint8_t>(0));
+                for (size_t r = 0; r < n; ++r) {
+                    if (a.missing[r] || b.missing[r] || std::abs(av[r]) <= denomEps) {
+                        missBA[r] = static_cast<uint8_t>(1);
+                        continue;
+                    }
+                    ratioBA[r] = bv[r] / av[r];
+                }
+                if (shouldKeepDerived(ratioBA, missBA, idxA, idxB)) {
+                    TypedColumn c;
+                    c.name = uniqueColumnName(data, b.name + "_div_" + a.name);
+                    c.type = ColumnType::NUMERIC;
+                    c.values = std::move(ratioBA);
+                    c.missing = std::move(missBA);
+                    engineered.push_back(std::move(c));
+                }
             }
-            if (capReached) break;
         }
     }
 

@@ -61,6 +61,8 @@ struct HeuristicTuningConfig {
 
     // Optional override for pair selection quantile (-1 means strategy default).
     double bivariateSelectionQuantileOverride = -1.0; // -1 => policy default
+    // Tier-3 fallback aggressiveness for sparse neural yield (0 disables fallback promotion).
+    double bivariateTier3FallbackAggressiveness = 1.0;
 
     // Coherent-importance blending heuristics.
     double coherenceWeightSmallDataset = 0.55;
@@ -264,8 +266,10 @@ struct AutoConfig {
     // Auto feature engineering controls
     bool featureEngineeringEnablePoly = true;
     bool featureEngineeringEnableLog = true;
+    bool featureEngineeringEnableRatioProductDiscovery = true;
     int featureEngineeringDegree = 2;
     size_t featureEngineeringMaxBase = 8;
+    size_t featureEngineeringMaxPairwiseDiscovery = 24;
     size_t featureEngineeringMaxGeneratedColumns = 512;
 
     bool storeOutlierFlagsInReport = false;

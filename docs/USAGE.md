@@ -266,11 +266,13 @@ Enable/disable:
 
 - `feature_engineering_enable_poly: true|false`
 - `feature_engineering_enable_log: true|false`
+- `feature_engineering_enable_ratio_product_discovery: true|false`
 
 Degree and base:
 
 - `feature_engineering_degree: <int>=1+`
 - `feature_engineering_max_base: <int>=2+`
+- `feature_engineering_max_pairwise_discovery: <int>=2+`
 
 Expansion cap:
 
@@ -281,8 +283,10 @@ Example:
 ```yaml
 feature_engineering_enable_poly: true
 feature_engineering_enable_log: true
+feature_engineering_enable_ratio_product_discovery: true
 feature_engineering_degree: 3
 feature_engineering_max_base: 10
+feature_engineering_max_pairwise_discovery: 24
 feature_engineering_max_generated_columns: 600
 ```
 
@@ -426,6 +430,7 @@ Selected heuristic tuning keys:
 - `feature_aggressive_delta`
 - `feature_lenient_delta`
 - `bivariate_selection_quantile`
+- `bivariate_tier3_fallback_aggressiveness`
 - `coherence_weight_small_dataset`
 - `coherence_weight_regular_dataset`
 - `coherence_overfit_penalty_train_ratio`
@@ -498,14 +503,17 @@ scaling: auto
 
 feature_engineering_enable_poly: true
 feature_engineering_enable_log: true
+feature_engineering_enable_ratio_product_discovery: true
 feature_engineering_degree: 2
 feature_engineering_max_base: 8
+feature_engineering_max_pairwise_discovery: 24
 feature_engineering_max_generated_columns: 512
 
 target_strategy: auto
 feature_strategy: auto
 neural_strategy: auto
 bivariate_strategy: auto
+bivariate_tier3_fallback_aggressiveness: 1.0
 
 fast_mode: false
 fast_max_bivariate_pairs: 2500

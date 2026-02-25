@@ -363,12 +363,14 @@ Binary targets are preserved safely when identified as binary series.
 Switches:
 
 - `feature_engineering_enable_poly`,
-- `feature_engineering_enable_log`.
+- `feature_engineering_enable_log`,
+- `feature_engineering_enable_ratio_product_discovery`.
 
 Degree and base limits:
 
 - `feature_engineering_degree`,
-- `feature_engineering_max_base`.
+- `feature_engineering_max_base`,
+- `feature_engineering_max_pairwise_discovery`.
 
 Expansion guard:
 
@@ -458,7 +460,8 @@ Bivariate significance selection combines:
 
 - statistical significance,
 - correlation strength,
-- neural relevance.
+- neural relevance,
+- bounded Tier-3 fallback promotion when neural yield is sparse.
 
 Supported strategy values:
 
@@ -469,6 +472,10 @@ Supported strategy values:
 
 For large datasets,
 fast mode can cap pairwise evaluation counts.
+
+Tier-3 aggressiveness is tunable using:
+
+- `bivariate_tier3_fallback_aggressiveness` (0..3).
 
 ---
 

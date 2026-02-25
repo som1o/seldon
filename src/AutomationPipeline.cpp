@@ -1065,6 +1065,8 @@ struct PairInsight {
     double effectSize = 0.0;
     double foldStability = 0.0;
     bool selected = false;
+    int significanceTier = 0;
+    std::string selectionReason;
     bool filteredAsRedundant = false;
     bool filteredAsStructural = false;
     bool leakageRisk = false;
@@ -3615,14 +3617,69 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     });
 
     std::unordered_set<size_t> finalSelected;
-    const size_t keepCount = std::min(selectedCandidateIdx.size(), maxSelectedPairs);
+    const size_t keepCap = std::max<size_t>(1, maxSelectedPairs);
+    const size_t keepCount = std::min(selectedCandidateIdx.size(), keepCap);
     for (size_t i = 0; i < keepCount; ++i) {
         finalSelected.insert(selectedCandidateIdx[i]);
+    }
+
+    std::vector<size_t> statOnlyIdx;
+    statOnlyIdx.reserve(pairs.size());
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        const auto& p = pairs[i];
+        if (p.leakageRisk) continue;
+        if (!p.statSignificant || finalSelected.count(i) > 0) continue;
+        statOnlyIdx.push_back(i);
+    }
+
+    std::sort(statOnlyIdx.begin(), statOnlyIdx.end(), [&](size_t lhs, size_t rhs) {
+        const auto& a = pairs[lhs];
+        const auto& b = pairs[rhs];
+        const double pa = std::clamp(-std::log10(std::max(1e-12, a.pValue)) / 12.0, 0.0, 1.0);
+        const double pb = std::clamp(-std::log10(std::max(1e-12, b.pValue)) / 12.0, 0.0, 1.0);
+        const double sa = 0.45 * a.effectSize + 0.25 * a.foldStability + 0.20 * pa + 0.10 * std::abs(a.r);
+        const double sb = 0.45 * b.effectSize + 0.25 * b.foldStability + 0.20 * pb + 0.10 * std::abs(b.r);
+        if (sa == sb) {
+            if (a.pValue == b.pValue) return a.neuralScore > b.neuralScore;
+            return a.pValue < b.pValue;
+        }
+        return sa > sb;
+    });
+
+    const double tier3Aggressiveness = std::clamp(tuning.bivariateTier3FallbackAggressiveness, 0.0, 3.0);
+    size_t minSelectedFloor = 0;
+    if (tier3Aggressiveness > 0.0) {
+        const size_t baseFloor = std::max<size_t>(3, std::min<size_t>(12, pairs.size() / 25 + 1));
+        const size_t scaledFloor = static_cast<size_t>(std::llround(static_cast<double>(baseFloor) * tier3Aggressiveness));
+        minSelectedFloor = std::min(keepCap, std::max<size_t>(1, scaledFloor));
+    }
+    if (finalSelected.size() < minSelectedFloor) {
+        const size_t deficit = minSelectedFloor - finalSelected.size();
+        const size_t promote = std::min(deficit, statOnlyIdx.size());
+        for (size_t i = 0; i < promote; ++i) {
+            finalSelected.insert(statOnlyIdx[i]);
+        }
     }
 
     for (size_t pairIdx = 0; pairIdx < pairs.size(); ++pairIdx) {
         auto& p = pairs[pairIdx];
         p.selected = finalSelected.find(pairIdx) != finalSelected.end();
+        if (!p.leakageRisk && p.statSignificant) {
+            p.significanceTier = 1;
+            p.selectionReason = "statistical";
+            if (p.neuralScore >= dynamicCutoff) {
+                p.significanceTier = 2;
+                p.selectionReason = "statistical+neural";
+            }
+            if (p.selected && p.significanceTier < 2) {
+                p.significanceTier = 3;
+                if (p.filteredAsRedundant || p.filteredAsStructural) {
+                    p.selectionReason = "statistical+identity_validation";
+                } else {
+                    p.selectionReason = "statistical+domain_fallback";
+                }
+            }
+        }
         if (p.selected && plotter) {
             const auto& va = std::get<std::vector<double>>(data.columns()[p.idxA].values);
             const auto& vb = std::get<std::vector<double>>(data.columns()[p.idxB].values);
@@ -3855,6 +3912,132 @@ std::vector<AnovaInsight> analyzeAnovaPairs(const TypedDataset& data) {
             if (out.size() >= 12) return out;
         }
     }
+    return out;
+}
+
+struct StratifiedPopulationInsight {
+    std::string segmentColumn;
+    std::string numericColumn;
+    size_t groups = 0;
+    size_t rows = 0;
+    double eta2 = 0.0;
+    double separation = 0.0;
+    std::string groupMeans;
+};
+
+std::vector<StratifiedPopulationInsight> detectStratifiedPopulations(const TypedDataset& data,
+                                                                     size_t maxInsights = 12) {
+    std::vector<StratifiedPopulationInsight> out;
+    const auto cats = data.categoricalColumnIndices();
+    const auto nums = data.numericColumnIndices();
+    if (cats.empty() || nums.empty()) return out;
+
+    for (size_t cidx : cats) {
+        const auto& cv = std::get<std::vector<std::string>>(data.columns()[cidx].values);
+        if (cv.empty()) continue;
+
+        std::unordered_map<std::string, size_t> labelCardinality;
+        for (size_t r = 0; r < cv.size() && r < data.rowCount(); ++r) {
+            if (data.columns()[cidx].missing[r]) continue;
+            if (cv[r].empty()) continue;
+            labelCardinality[cv[r]]++;
+        }
+        if (labelCardinality.size() < 2 || labelCardinality.size() > 8) continue;
+
+        for (size_t nidx : nums) {
+            const auto& nv = std::get<std::vector<double>>(data.columns()[nidx].values);
+            const size_t n = std::min(cv.size(), nv.size());
+            if (n < 30) continue;
+
+            struct GroupStats {
+                size_t count = 0;
+                double sum = 0.0;
+                double sumSq = 0.0;
+            };
+            std::map<std::string, GroupStats> groups;
+            for (size_t i = 0; i < n; ++i) {
+                if (data.columns()[cidx].missing[i] || data.columns()[nidx].missing[i]) continue;
+                if (!std::isfinite(nv[i])) continue;
+                const std::string& label = cv[i];
+                if (label.empty()) continue;
+                auto& g = groups[label];
+                g.count++;
+                g.sum += nv[i];
+                g.sumSq += nv[i] * nv[i];
+            }
+
+            size_t validRows = 0;
+            for (const auto& kv : groups) validRows += kv.second.count;
+            if (groups.size() < 2 || validRows < 30) continue;
+
+            const size_t minGroupRows = std::max<size_t>(3, validRows / 300);
+            size_t strongGroups = 0;
+            for (const auto& kv : groups) {
+                if (kv.second.count >= minGroupRows) strongGroups++;
+            }
+            if (strongGroups < 2) continue;
+
+            const double grand = [&]() {
+                double s = 0.0;
+                for (const auto& kv : groups) s += kv.second.sum;
+                return s / static_cast<double>(validRows);
+            }();
+
+            double ssb = 0.0;
+            double ssw = 0.0;
+            double minMean = std::numeric_limits<double>::infinity();
+            double maxMean = -std::numeric_limits<double>::infinity();
+            std::vector<std::pair<std::string, double>> means;
+            means.reserve(groups.size());
+            for (const auto& kv : groups) {
+                const auto& g = kv.second;
+                if (g.count == 0) continue;
+                const double mu = g.sum / static_cast<double>(g.count);
+                minMean = std::min(minMean, mu);
+                maxMean = std::max(maxMean, mu);
+                means.push_back({kv.first, mu});
+                const double dm = mu - grand;
+                ssb += static_cast<double>(g.count) * dm * dm;
+                const double within = std::max(0.0, g.sumSq - (g.sum * g.sum) / static_cast<double>(g.count));
+                ssw += within;
+            }
+            if (means.size() < 2) continue;
+
+            const double sst = ssb + ssw;
+            if (sst <= 1e-12) continue;
+            const double eta2 = ssb / sst;
+            const double pooledStd = std::sqrt(ssw / static_cast<double>(std::max<size_t>(1, validRows - means.size())));
+            const double separation = (pooledStd <= 1e-12) ? 0.0 : std::abs(maxMean - minMean) / pooledStd;
+
+            if (eta2 < 0.20 || separation < 0.75) continue;
+
+            std::sort(means.begin(), means.end(), [](const auto& a, const auto& b) {
+                return a.second > b.second;
+            });
+            std::ostringstream oss;
+            const size_t show = std::min<size_t>(4, means.size());
+            for (size_t i = 0; i < show; ++i) {
+                if (i > 0) oss << "; ";
+                oss << means[i].first << ": " << toFixed(means[i].second, 4);
+            }
+
+            out.push_back({
+                data.columns()[cidx].name,
+                data.columns()[nidx].name,
+                means.size(),
+                validRows,
+                eta2,
+                separation,
+                oss.str()
+            });
+        }
+    }
+
+    std::sort(out.begin(), out.end(), [](const StratifiedPopulationInsight& a, const StratifiedPopulationInsight& b) {
+        if (a.eta2 == b.eta2) return a.separation > b.separation;
+        return a.eta2 > b.eta2;
+    });
+    if (out.size() > maxInsights) out.resize(maxInsights);
     return out;
 }
 
@@ -4878,9 +5061,11 @@ int AutomationPipeline::run(const AutoConfig& config) {
     if (totalPossiblePairs > bivariatePairs.size()) {
         bivariate.addParagraph("Fast mode active: pair evaluation was capped for runtime safety. Results below cover the highest-priority numeric columns only.");
     } else {
-        bivariate.addParagraph("All numeric pair combinations are included below (nC2). Significant table is dynamically filtered using statistical significance, effect size, and fold-stability-weighted neural relevance.");
+        bivariate.addParagraph("All numeric pair combinations are included below (nC2). Significant table is dynamically filtered using a multi-tier gate: statistical significance, neural relevance, and a bounded fallback for high-effect stable pairs.");
     }
-    bivariate.addParagraph("Neural-lattice relevance score prioritizes practical effect size over raw p-value magnitude; only selected pairs are considered significant findings.");
+    bivariate.addParagraph("Neural-lattice relevance score prioritizes practical effect size over raw p-value magnitude; when neural filtering is too strict, statistically robust pairs can be promoted as Tier-3 domain findings.");
+
+    const auto stratifiedPopulations = detectStratifiedPopulations(data, 12);
 
     std::vector<std::vector<std::string>> allRows;
     std::vector<std::vector<std::string>> sigRows;
@@ -4906,6 +5091,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
                 toFixed(p.pValue, 6),
                 p.statSignificant ? "yes" : "no",
                 toFixed(p.neuralScore, 6),
+                std::to_string(p.significanceTier),
+                p.selectionReason.empty() ? "-" : p.selectionReason,
                 p.selected ? "yes" : "no",
                 p.filteredAsRedundant ? "yes" : "no",
                 p.filteredAsStructural ? "yes" : "no",
@@ -4939,6 +5126,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
                 toFixed(p.tStat, 6),
                 toFixed(p.pValue, 6),
                 toFixed(p.neuralScore, 6),
+                std::to_string(p.significanceTier),
+                p.selectionReason.empty() ? "-" : p.selectionReason,
                 p.relationLabel.empty() ? "-" : p.relationLabel,
                 p.fitLineAdded ? "yes" : "no",
                 p.confidenceBandAdded ? "yes" : "no",
@@ -5033,7 +5222,14 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     bivariate.addParagraph("Total pairs evaluated: " + std::to_string(bivariatePairs.size()));
     bivariate.addParagraph("Statistically significant pairs (p<" + toFixed(MathUtils::getSignificanceAlpha(), 4) + "): " + std::to_string(statSigCount));
-    bivariate.addParagraph("Final neural-selected significant pairs: " + std::to_string(sigRows.size()));
+    bivariate.addParagraph("Final selected significant pairs: " + std::to_string(sigRows.size()));
+    const size_t tier2Count = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) {
+        return p.selected && p.significanceTier == 2;
+    }));
+    const size_t tier3Count = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) {
+        return p.selected && p.significanceTier == 3;
+    }));
+    bivariate.addParagraph("Selection tiers: Tier-2(neural+stat)=" + std::to_string(tier2Count) + ", Tier-3(domain fallback)=" + std::to_string(tier3Count) + ".");
     const size_t redundantPairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.filteredAsRedundant; }));
     const size_t structuralPairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.filteredAsStructural; }));
     const size_t leakagePairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.leakageRisk; }));
@@ -5041,9 +5237,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
     if (compactBivariateRows) {
         bivariate.addParagraph("Low-memory mode: omitted full pair table and kept only selected + capped rejected samples for diagnostics.");
     } else {
-        bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "selected", "redundant", "structural", "leakage_risk", "cluster_rep", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, allRows);
+        bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "significance_tier", "selection_reason", "selected", "redundant", "structural", "leakage_risk", "cluster_rep", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, allRows);
     }
-    bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
+    bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "significance_tier", "selection_reason", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
 
     const auto contingency = analyzeContingencyPairs(data);
     if (!contingency.empty()) {
@@ -5063,6 +5259,23 @@ int AutomationPipeline::run(const AutoConfig& config) {
         bivariate.addTable("One-Way ANOVA (Categorical→Numeric)", {"Categorical", "Numeric", "F", "p_value", "eta_squared", "posthoc_tukey"}, rows);
     }
 
+    if (!stratifiedPopulations.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        rows.reserve(stratifiedPopulations.size());
+        for (const auto& s : stratifiedPopulations) {
+            rows.push_back({
+                s.segmentColumn,
+                s.numericColumn,
+                std::to_string(s.groups),
+                std::to_string(s.rows),
+                toFixed(s.eta2, 4),
+                toFixed(s.separation, 4),
+                s.groupMeans
+            });
+        }
+        bivariate.addTable("Automatic Stratified Population Signals", {"Segment Column", "Numeric Feature", "Groups", "Rows", "eta_squared", "separation", "group_means"}, rows);
+    }
+
     const DataHealthSummary dataHealth = computeDataHealthSummary(data,
                                                                   prep,
                                                                   neural,
@@ -5075,6 +5288,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     neuralReport.addTitle("Neural Synthesis");
     neuralReport.addParagraph("This synthesis captures detailed lattice training traces and how neural relevance influenced bivariate selection.");
     neuralReport.addParagraph(std::string("Task type inferred from target: ") + targetContext.semantics.inferredTask);
+    neuralReport.addParagraph("Bivariate significance now uses a three-tier gate: Tier-1 statistical evidence, Tier-2 neural confirmation, Tier-3 domain fallback for high-effect stable relationships when neural yield is sparse.");
     neuralReport.addTable("Auto Decision Log", {"Decision", "Value"}, {
         {"Target Selection", targetContext.userProvidedTarget ? "user-specified" : "auto"},
         {"Target Strategy", targetContext.choice.strategyUsed},
@@ -5091,7 +5305,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Neural Strategy", neural.policyUsed},
         {"Fast Mode", fastModeEnabled ? "enabled" : "disabled"},
         {"Neural Training Rows Used", std::to_string(neural.trainingRowsUsed) + " / " + std::to_string(neural.trainingRowsTotal)},
-        {"Bivariate Strategy", bivariatePolicy.name}
+        {"Bivariate Strategy", bivariatePolicy.name},
+        {"Tier-2 Pair Count", std::to_string(tier2Count)},
+        {"Tier-3 Pair Count", std::to_string(tier3Count)}
     });
     if (!selectedFeatures.droppedByMissingness.empty()) {
         neuralReport.addParagraph("Sparse numeric features dropped before modeling: " + std::to_string(selectedFeatures.droppedByMissingness.size()));
@@ -5139,6 +5355,23 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
     neuralReport.addTable("Feature Importance (Neural Explainability)", {"Feature", "Importance"}, fiRows);
 
+    if (!stratifiedPopulations.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        rows.reserve(stratifiedPopulations.size());
+        for (const auto& s : stratifiedPopulations) {
+            rows.push_back({
+                s.segmentColumn,
+                s.numericColumn,
+                std::to_string(s.groups),
+                std::to_string(s.rows),
+                toFixed(s.eta2, 4),
+                toFixed(s.separation, 4),
+                s.groupMeans
+            });
+        }
+        neuralReport.addTable("Automatic Segmented Population Signals", {"Segment Column", "Numeric Feature", "Groups", "Rows", "eta_squared", "separation", "group_means"}, rows);
+    }
+
     std::vector<std::vector<std::string>> lossRows;
     for (size_t e = 0; e < neural.trainLoss.size(); ++e) {
         double val = (e < neural.valLoss.size() ? neural.valLoss[e] : 0.0);
@@ -5177,7 +5410,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     ReportEngine finalAnalysis;
     finalAnalysis.addTitle("Final Analysis - Significant Findings Only");
-    finalAnalysis.addParagraph("This report contains only neural-net-approved significant findings (dynamic decision engine). Non-selected findings are excluded by design.");
+    finalAnalysis.addParagraph("This report contains statistically significant findings selected by a tiered engine: Tier-2 (statistical + neural) and Tier-3 fallback (statistical + domain effect). Non-selected findings are excluded by design.");
     finalAnalysis.addParagraph("Data Health Score: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + "). This score estimates discovered signal strength using completeness, retained feature coverage, significant-pair yield, selected-pair yield, and neural training stability.");
 
     if (!topTakeaways.empty()) {
@@ -5200,7 +5433,24 @@ int AutomationPipeline::run(const AutoConfig& config) {
         finalAnalysis.addTable("Redundancy Drop Recommendations", {"Action"}, dropRows);
     }
 
-    finalAnalysis.addTable("Neural-Selected Significant Bivariate Findings", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
+    if (!stratifiedPopulations.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        rows.reserve(stratifiedPopulations.size());
+        for (const auto& s : stratifiedPopulations) {
+            rows.push_back({
+                s.segmentColumn,
+                s.numericColumn,
+                std::to_string(s.groups),
+                std::to_string(s.rows),
+                toFixed(s.eta2, 4),
+                toFixed(s.separation, 4),
+                s.groupMeans
+            });
+        }
+        finalAnalysis.addTable("Segmented Population Findings", {"Segment Column", "Numeric Feature", "Groups", "Rows", "eta_squared", "separation", "group_means"}, rows);
+    }
+
+    finalAnalysis.addTable("Selected Significant Bivariate Findings", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "significance_tier", "selection_reason", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
 
     finalAnalysis.addTable("Data Health Signal Card", {"Component", "Value"}, {
         {"Score (0-100)", toFixed(dataHealth.score, 1)},
@@ -5209,7 +5459,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Numeric Coverage", toFixed(100.0 * dataHealth.numericCoverage, 1) + "%"},
         {"Feature Retention", toFixed(100.0 * dataHealth.featureRetention, 1) + "%"},
         {"Statistical Yield", toFixed(100.0 * dataHealth.statYield, 1) + "%"},
-        {"Neural-Selected Yield", toFixed(100.0 * dataHealth.selectedYield, 1) + "%"},
+        {"Selected Yield", toFixed(100.0 * dataHealth.selectedYield, 1) + "%"},
         {"Training Stability", toFixed(100.0 * dataHealth.trainingStability, 1) + "%"}
     });
 
@@ -5231,7 +5481,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Columns", std::to_string(data.colCount())},
         {"Pairs Evaluated", std::to_string(allRows.size())},
         {"Pairs Statistically Significant", std::to_string(statSigCount)},
-        {"Pairs Neural-Selected", std::to_string(sigRows.size())},
+        {"Pairs Selected", std::to_string(sigRows.size())},
         {"Training Epochs Executed", std::to_string(neural.trainLoss.size())},
         {"Data Health Score", toFixed(dataHealth.score, 1) + " (" + dataHealth.band + ")"}
     });
