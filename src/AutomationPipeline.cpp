@@ -4401,6 +4401,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         runCfg.neuralStrategy = "fast";
     }
 
+    const size_t rawColumnCount = data.colCount();
     PreprocessReport prep = Preprocessor::run(data, runCfg);
     advance("Preprocessed dataset");
     exportPreprocessedDatasetIfRequested(data, runCfg);
@@ -4415,7 +4416,14 @@ int AutomationPipeline::run(const AutoConfig& config) {
     ReportEngine univariate;
     univariate.addTitle("Univariate Analysis");
     univariate.addParagraph("Dataset: " + runCfg.datasetPath);
-    univariate.addParagraph("Rows: " + std::to_string(data.rowCount()) + " | Columns: " + std::to_string(data.colCount()));
+    const size_t totalAnalysisDimensions = data.colCount();
+    const size_t engineeredFeatureCount =
+        (totalAnalysisDimensions >= rawColumnCount) ? (totalAnalysisDimensions - rawColumnCount) : 0;
+    univariate.addParagraph("Dataset Stats:");
+    univariate.addParagraph("Rows: " + std::to_string(data.rowCount()));
+    univariate.addParagraph("Raw Columns: " + std::to_string(rawColumnCount));
+    univariate.addParagraph("Engineered Features: " + std::to_string(engineeredFeatureCount));
+    univariate.addParagraph("Total Analysis Dimensions: " + std::to_string(totalAnalysisDimensions));
     addUnivariateDetailedSection(univariate, data, prep, runCfg.verboseAnalysis, statsCache);
     advance("Built univariate tables");
 
