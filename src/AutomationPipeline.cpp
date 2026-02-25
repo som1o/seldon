@@ -2043,26 +2043,30 @@ void addUnivariateDetailedSection(ReportEngine& report,
             summaryRows.push_back({
                 col.name,
                 "datetime",
-                "-",
-                "-",
-                std::to_string(minTs),
-                std::to_string(maxTs),
-                std::to_string(maxTs - minTs),
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                std::to_string(vals.size()),
-                std::to_string(missing),
-                "-"
+                "-",                           // Mean
+                "-",                           // GeoMean
+                "-",                           // HarmonicMean
+                "-",                           // TrimmedMean
+                "-",                           // Mode
+                "-",                           // Median
+                std::to_string(minTs),         // Min
+                std::to_string(maxTs),         // Max
+                std::to_string(maxTs - minTs), // Range
+                "-",                           // Q1
+                "-",                           // Q3
+                "-",                           // IQR
+                "-",                           // P05
+                "-",                           // P95
+                "-",                           // MAD
+                "-",                           // Variance
+                "-",                           // StdDev
+                "-",                           // Skew
+                "-",                           // Kurtosis
+                "-",                           // CoeffVar
+                "-",                           // Sum
+                std::to_string(vals.size()),   // NonZero/Unique
+                std::to_string(missing),       // Missing
+                "-"                            // Outliers
             });
             logVerbose("[Seldon][Univariate] Datetime " + col.name
                        + " | min_ts=" + std::to_string(minTs)
@@ -5996,7 +6000,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     advance("Finished benchmarks");
 
     if (runCfg.verboseAnalysis) {
-        std::cout << "[Seldon][Neural] Starting neural lattice training with verbose trace...\n";
+        std::cout << "[Seldon][Neural] Starting neural network training with verbose trace...\n";
     }
     NeuralAnalysis neural = runNeuralAnalysis(data,
                                               targetIdx,
@@ -6074,7 +6078,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     } else {
         bivariate.addParagraph("All numeric pair combinations are included below (nC2). Significant table is dynamically filtered using a multi-tier gate: statistical significance, neural relevance, and a bounded fallback for high-effect stable pairs.");
     }
-    bivariate.addParagraph("Neural-lattice relevance score prioritizes practical effect size over raw p-value magnitude; when neural filtering is too strict, statistically robust pairs can be promoted as Tier-3 domain findings.");
+    bivariate.addParagraph("Neural relevance score prioritizes practical effect size over raw p-value magnitude; when neural filtering is too strict, statistically robust pairs can be promoted as Tier-3 domain findings.");
 
     const auto stratifiedPopulations = detectStratifiedPopulations(data, 12);
 
@@ -6340,7 +6344,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     ReportEngine neuralReport;
     neuralReport.addTitle("Neural Synthesis");
-    neuralReport.addParagraph("This synthesis captures detailed lattice training traces and how neural relevance influenced bivariate selection.");
+    neuralReport.addParagraph("This synthesis captures neural network training traces and how neural relevance influenced bivariate selection.");
     neuralReport.addParagraph(std::string("Task type inferred from target: ") + targetContext.semantics.inferredTask);
     neuralReport.addParagraph("Bivariate significance now uses a three-tier gate: Tier-1 statistical evidence, Tier-2 neural confirmation, Tier-3 domain fallback for high-effect stable relationships when neural yield is sparse.");
     neuralReport.addTable("Auto Decision Log", {"Decision", "Value"}, {
@@ -6442,7 +6446,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
             toFixed(val, 6)
         });
     }
-    neuralReport.addTable("Neural Lattice Training Trace", {"Epoch", "Train Loss", "Validation Loss"}, lossRows);
+    neuralReport.addTable("Neural Network Training Trace", {"Epoch", "Train Loss", "Validation Loss"}, lossRows);
 
     if (!neural.gradientNorm.empty() || !neural.weightStd.empty() || !neural.weightMeanAbs.empty()) {
         std::vector<std::vector<std::string>> dynRows;
@@ -6475,7 +6479,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     finalAnalysis.addParagraph("Data Health Score: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + "). This score estimates discovered signal strength using completeness, retained feature coverage, significant-pair yield, selected-pair yield, and neural training stability.");
 
     if (!advancedOutputs.orderedRows.empty()) {
-        finalAnalysis.addTable("Ordered Advanced Methods (Strict 1→11)", {"Step", "Method", "Result"}, advancedOutputs.orderedRows);
+        finalAnalysis.addTable("Ordered Methods", {"Step", "Method", "Result"}, advancedOutputs.orderedRows);
     }
 
     if (!advancedOutputs.mahalanobisRows.empty()) {
@@ -6626,7 +6630,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     std::string phase1Narrative = "Semantic filter excluded " + std::to_string(adminCount)
         + " administrative columns and marked " + std::to_string(lowSignalCount)
-        + " low-signal columns before lattice training.";
+        + " low-signal columns before model training.";
 
     std::string phase3Narrative = "Rows:Features=" + toFixed(deterministic.rowsToFeatures, 2)
         + "; strict pruning=" + std::string(neural.strictPruningApplied ? "on" : "off")
@@ -6646,7 +6650,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Outlier Context", "Explain anomaly relevance", "Contrastive z-score contextualization", "Outlier narratives now explain why flagged rows are unusual relative to the population."}
     });
 
-    heuristicsReport.addTable("Technical Lattice Tuning", {"Control", "Observed", "Action"}, {
+    heuristicsReport.addTable("Neural Network Tuning", {"Control", "Observed", "Action"}, {
         {"Training Stability", stabilityPct, stabilityGuardTriggered ? "Hidden nodes reduced automatically (<70% stability guard triggered)" : "Topology retained (stability guard not triggered)"},
         {"Target Diversity", targetContext.semantics.inferredTask, "Classification-like targets use cross-entropy path; continuous targets use MSE path"},
         {"Loss Function", neural.lossName, "Applied automatically from inferred target semantics"}
@@ -6677,11 +6681,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         std::vector<std::vector<std::string>> rows;
         rows.reserve(deterministic.badgeNarratives.size());
         for (const auto& line : deterministic.badgeNarratives) {
-            std::string clean = line;
-            clean = CommonUtils::trim(clean);
-            if (clean.rfind("[!!]", 0) == 0) clean = "Critical: " + CommonUtils::trim(clean.substr(4));
-            else if (clean.rfind("[*]", 0) == 0) clean = "Stable: " + CommonUtils::trim(clean.substr(3));
-            rows.push_back({clean});
+            rows.push_back({line});
         }
         heuristicsReport.addTable("Deterministic Narratives", {"Narrative"}, rows);
     }

@@ -285,15 +285,15 @@ Outcome runAllPhases(const TypedDataset& data,
         const bool admin = (uniq == data.rowCount()) && idLikeType;
 
         if (admin) {
-            out.excludedReasonLines.push_back(col.name + " [!!] CRITICAL ADMIN signal dropped");
+            out.excludedReasonLines.push_back(col.name + ": administrative column excluded from analysis");
             continue;
         }
         if (constant) {
-            out.excludedReasonLines.push_back(col.name + " [!!] CRITICAL constant variance=0 dropped");
+            out.excludedReasonLines.push_back(col.name + ": constant column excluded (zero variance)");
             continue;
         }
         if (nullRatio > 0.40) {
-            out.excludedReasonLines.push_back(col.name + " [*] STABLE low-signal (>40% missing) excluded from neural lattice");
+            out.excludedReasonLines.push_back(col.name + ": low-signal column excluded (>40% missing values)");
             continue;
         }
 
@@ -366,7 +366,7 @@ Outcome runAllPhases(const TypedDataset& data,
             }
 
             if (hiddenDriver >= 0 && hiddenCorr >= 0.25) {
-                out.residualNarrative = "[*] STABLE Hidden Driver: " +
+                out.residualNarrative = "Hidden Driver: " +
                     data.columns()[static_cast<size_t>(hiddenDriver)].name +
                     " explains residual error after primary predictor " +
                     data.columns()[static_cast<size_t>(bestFeature)].name +
@@ -376,17 +376,17 @@ Outcome runAllPhases(const TypedDataset& data,
     }
 
     if (out.lowRatioMode) {
-        out.badgeNarratives.push_back("[!!] CRITICAL Overfit Guardrail: Rows:Features=" +
+        out.badgeNarratives.push_back("Overfit Guardrail: Rows:Features=" +
                                       formatDouble(out.rowsToFeatures, 2) +
-                                      " (<10), forcing shallow lattice profile.");
+                                      " (<10); shallow network topology enforced.");
     } else if (out.highRatioMode) {
-        out.badgeNarratives.push_back("[*] STABLE Capacity Mode: Rows:Features=" +
+        out.badgeNarratives.push_back("Capacity Mode: Rows:Features=" +
                                       formatDouble(out.rowsToFeatures, 2) +
-                                      " (>100), expressive lattice profile allowed.");
+                                      " (>100); expressive network topology applied.");
     }
 
     if (out.lassoGateApplied) {
-        out.badgeNarratives.push_back("[*] STABLE Lasso Gate: features pruned to top " + std::to_string(out.lassoSelectedCount) + " weighted predictors.");
+        out.badgeNarratives.push_back("Lasso Gate: features pruned to top " + std::to_string(out.lassoSelectedCount) + " weighted predictors.");
     }
 
     if (!out.residualNarrative.empty()) {

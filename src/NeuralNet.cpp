@@ -765,7 +765,7 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
 
     for (size_t epoch = 0; epoch < hp.epochs; ++epoch) {
         if (hp.verbose && (epoch % std::max<size_t>(1, hp.epochs / 10) == 0)) {
-            std::cout << "\r[Agent] Training Neural Lattice: ["
+            std::cout << "\r[Seldon][Neural] Training: ["
                       << (epoch * 100 / std::max<size_t>(1, hp.epochs)) << "%] " << std::flush;
         }
 
@@ -816,8 +816,8 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
         valLossHistory.push_back(rawVal);
 
         if (hp.verbose) {
-            std::cout << "[Epoch " << (epoch + 1) << "/" << hp.epochs << "] Train Loss: "
-                      << trainLoss << " | Val Loss: " << rawVal << std::endl;
+            std::cout << "[Seldon][Neural] Epoch " << (epoch + 1) << "/" << hp.epochs
+                      << " | Train Loss: " << trainLoss << " | Val Loss: " << rawVal << std::endl;
         }
 
         if (valSize == 0) continue;
@@ -846,7 +846,7 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
                     lr = nextLr;
                     ++reductions;
                     if (hp.verbose) {
-                        std::cout << "[Agent] Plateau LR scheduler: reducing learning rate to " << lr << std::endl;
+                        std::cout << "[Seldon][Neural] Plateau detected: learning rate reduced to " << lr << std::endl;
                     }
                 }
                 plateau = 0;
@@ -855,7 +855,7 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
 
             if (patience >= hp.earlyStoppingPatience) {
                 if (hp.verbose) {
-                    std::cout << "\n[Agent] Early stopping triggered at epoch " << epoch << std::endl;
+                    std::cout << "\n[Seldon][Neural] Early stopping triggered at epoch " << epoch << std::endl;
                 }
                 break;
             }
@@ -873,7 +873,7 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
         applyEmaWeights();
     }
 
-    std::cout << "\r[Agent] Training Neural Lattice: [100%] Complete.          " << std::endl;
+    std::cout << "\r[Seldon][Neural] Training complete: [100%]                  " << std::endl;
 }
 
 void NeuralNet::trainIncremental(const std::vector<std::vector<double>>& X,
