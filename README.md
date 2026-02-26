@@ -103,7 +103,7 @@ Additional practical properties:
 - C++17 compiler,
 - CMake 3.16+.
 
-### 4.2 Optional but Recommended
+### 4.2 Runtime Packages (Recommended)
 
 - OpenMP runtime,
 - `gnuplot`,
@@ -112,6 +112,15 @@ Additional practical properties:
 - `xls2csv`,
 - `gzip`,
 - `unzip`.
+
+Ubuntu/Debian quick install:
+
+```bash
+sudo apt update
+sudo apt install -y gnuplot pandoc xlsx2csv catdoc gzip unzip
+```
+
+`xls2csv` is provided by `catdoc` on Debian/Ubuntu.
 
 ---
 
@@ -706,10 +715,6 @@ Detailed runtime usage:
 Internal architecture and module flow:
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-
-Excel conversion prerequisites:
-
-- [docs/ENABLE_EXCEL_IMPORT.md](docs/ENABLE_EXCEL_IMPORT.md)
 
 ---
 

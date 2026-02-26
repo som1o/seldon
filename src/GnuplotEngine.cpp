@@ -19,16 +19,90 @@
 #include <unordered_map>
 
 namespace {
-std::string normalizePlotLabel(const std::string& label, size_t maxLen = 28) {
+std::string trimAsciiSpaces(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) ++start;
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
+    return value.substr(start, end - start);
+}
+
+std::string humanizeTextToken(const std::string& text) {
     std::string out;
-    out.reserve(label.size());
-    for (unsigned char ch : label) {
-        if (ch >= 32 && ch <= 126) {
-            out.push_back(static_cast<char>(ch));
+    out.reserve(text.size() + 12);
+
+    auto isAlphaNum = [](char c) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        return std::isalnum(uc) != 0;
+    };
+
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char ch = text[i];
+        const char prevRaw = (i > 0) ? text[i - 1] : '\0';
+        const char nextRaw = (i + 1 < text.size()) ? text[i + 1] : '\0';
+
+        if (ch < 32 || ch > 126) {
+            if (!out.empty() && out.back() != ' ') out.push_back(' ');
+            continue;
+        }
+
+        if (ch == '_' || ch == '\t' || ch == '\r' || ch == '\n') {
+            if (!out.empty() && out.back() != ' ') out.push_back(' ');
+            continue;
+        }
+
+        if ((ch == ':' || ch == '|') && !out.empty()) {
+            if (out.back() == ' ') out.pop_back();
+            out.push_back(' ');
+            out.push_back(ch);
+            out.push_back(' ');
+            continue;
+        }
+
+        if ((ch == '-' || ch == '/' || ch == '+') && isAlphaNum(prevRaw) && isAlphaNum(nextRaw)) {
+            out.push_back(ch);
+            continue;
+        }
+        if (ch == '-' || ch == '/' || ch == '+') {
+            if (!out.empty() && out.back() != ' ') out.push_back(' ');
+            continue;
+        }
+
+        const bool isUpper = std::isupper(static_cast<unsigned char>(ch));
+        const bool isLower = std::islower(static_cast<unsigned char>(ch));
+        const bool isDigit = std::isdigit(static_cast<unsigned char>(ch));
+        const bool prevLower = !out.empty() && std::islower(static_cast<unsigned char>(out.back()));
+        const bool prevUpper = !out.empty() && std::isupper(static_cast<unsigned char>(out.back()));
+        const bool prevDigit = !out.empty() && std::isdigit(static_cast<unsigned char>(out.back()));
+        const bool nextLower = std::islower(static_cast<unsigned char>(nextRaw));
+
+        if (!out.empty()) {
+            const bool camelBoundary = isUpper && (prevLower || (prevUpper && nextLower));
+            const bool digitBoundary = (isDigit && !prevDigit) || (!isDigit && prevDigit && (isUpper || isLower));
+            if ((camelBoundary || digitBoundary) && out.back() != ' ') out.push_back(' ');
+        }
+
+        out.push_back(ch);
+    }
+
+    std::string collapsed;
+    collapsed.reserve(out.size());
+    bool inSpace = false;
+    for (char ch : out) {
+        if (ch == ' ') {
+            if (!inSpace) collapsed.push_back(' ');
+            inSpace = true;
         } else {
-            out.push_back('?');
+            collapsed.push_back(ch);
+            inSpace = false;
         }
     }
+    return trimAsciiSpaces(collapsed);
+}
+
+std::string normalizePlotLabel(const std::string& label, size_t maxLen = 28) {
+    std::string out = humanizeTextToken(label);
+    if (out.empty()) out = "Unnamed";
     if (out.size() > maxLen) {
         out = out.substr(0, maxLen - 3) + "...";
     }
@@ -36,116 +110,13 @@ std::string normalizePlotLabel(const std::string& label, size_t maxLen = 28) {
 }
 
 std::string normalizePlotTitle(const std::string& title,
-                               size_t wrapAt = 54,
+                               size_t wrapAt = 60,
                                size_t maxTotal = 140) {
-    std::string cleaned;
-    cleaned.reserve(title.size() + 16);
-
-    auto appendSpaceIfNeeded = [&]() {
-        if (!cleaned.empty() && cleaned.back() != ' ' && cleaned.back() != '\n') cleaned.push_back(' ');
-    };
-
-    auto isAlphaNum = [](char c) {
-        const unsigned char uc = static_cast<unsigned char>(c);
-        return std::isalnum(uc) != 0;
-    };
-
-    auto appendSeparator = [&](const std::string& sep) {
-        if (!cleaned.empty() && cleaned.back() == ' ') cleaned.pop_back();
-        if (!cleaned.empty() && cleaned.back() != '\n') cleaned.push_back(' ');
-        cleaned += sep;
-        cleaned.push_back(' ');
-    };
-
-    for (size_t i = 0; i < title.size(); ++i) {
-        const char ch = title[i];
-        const char prevRaw = (i > 0) ? title[i - 1] : '\0';
-        const char nextRaw = (i + 1 < title.size()) ? title[i + 1] : '\0';
-
-        if (ch == ':') {
-            appendSeparator("|");
-            continue;
-        }
-        if (ch == '|') {
-            appendSeparator("|");
-            continue;
-        }
-        if (ch == '-' && nextRaw == '>') {
-            appendSeparator("vs");
-            ++i;
-            continue;
-        }
-        if (ch == '<' && nextRaw == '-') {
-            appendSeparator("vs");
-            ++i;
-            continue;
-        }
-        if (ch == '-') {
-            const bool hyphenatedWord = isAlphaNum(prevRaw) && isAlphaNum(nextRaw);
-            if (hyphenatedWord) {
-                appendSpaceIfNeeded();
-            } else {
-                appendSeparator("|");
-            }
-            continue;
-        }
-        if (ch == '_') {
-            appendSpaceIfNeeded();
-            continue;
-        }
-        if (ch == '\n' || ch == '\t' || ch == '\r') {
-            appendSpaceIfNeeded();
-            continue;
-        }
-
-        const bool isUpper = std::isupper(static_cast<unsigned char>(ch));
-        const bool isDigit = std::isdigit(static_cast<unsigned char>(ch));
-        const bool prevLower = !cleaned.empty() && std::islower(static_cast<unsigned char>(cleaned.back()));
-        const bool prevDigit = !cleaned.empty() && std::isdigit(static_cast<unsigned char>(cleaned.back()));
-        if (!cleaned.empty() && ((isUpper && prevLower) || (isDigit && !prevDigit) || (!isDigit && prevDigit))) {
-            appendSpaceIfNeeded();
-        }
-
-        if (ch >= 32 && ch <= 126) {
-            cleaned.push_back(ch);
-        }
-    }
-
-    std::string collapsed;
-    collapsed.reserve(cleaned.size());
-    bool inSpace = false;
-    for (char ch : cleaned) {
-        if (ch == ' ') {
-            if (!inSpace) collapsed.push_back(ch);
-            inSpace = true;
-        } else {
-            collapsed.push_back(ch);
-            inSpace = false;
-        }
-    }
-    if (!collapsed.empty() && collapsed.front() == ' ') collapsed.erase(collapsed.begin());
-    while (!collapsed.empty() && collapsed.back() == ' ') collapsed.pop_back();
+    std::string collapsed = humanizeTextToken(title);
+    if (collapsed.empty()) collapsed = "Seldon Plot";
 
     if (collapsed.size() > maxTotal) {
         collapsed = collapsed.substr(0, maxTotal - 3) + "...";
-    }
-
-    std::string lower = collapsed;
-    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    const bool hasVs = lower.find(" vs ") != std::string::npos;
-    const bool hasPipe = collapsed.find('|') != std::string::npos;
-    if (!hasVs && !hasPipe) {
-        const size_t overPos = lower.find(" over ");
-        if (overPos != std::string::npos) {
-            collapsed.replace(overPos, 6, " vs ");
-        } else {
-            const size_t byPos = lower.find(" by ");
-            if (byPos != std::string::npos) {
-                collapsed.replace(byPos, 4, " | by ");
-            }
-        }
     }
 
     if (collapsed.size() <= wrapAt) return collapsed;
@@ -172,6 +143,84 @@ std::string normalizePlotTitle(const std::string& title,
     }
 
     return wrapped;
+}
+
+bool splitByKeyword(const std::string& text,
+                    const std::string& keyword,
+                    std::string& left,
+                    std::string& right) {
+    if (text.empty() || keyword.empty()) return false;
+    std::string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::string keyLower = keyword;
+    std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    const size_t pos = lower.find(keyLower);
+    if (pos == std::string::npos) return false;
+
+    left = trimAsciiSpaces(text.substr(0, pos));
+    right = trimAsciiSpaces(text.substr(pos + keyword.size()));
+    return !left.empty() && !right.empty();
+}
+
+struct AxisLabelGuess {
+    std::string xLabel;
+    std::string yLabel;
+    bool valid = false;
+};
+
+AxisLabelGuess inferAxisLabelsFromTitle(const std::string& rawTitle,
+                                        const std::string& defaultX,
+                                        const std::string& defaultY) {
+    AxisLabelGuess out;
+    out.xLabel = defaultX;
+    out.yLabel = defaultY;
+
+    const std::string title = humanizeTextToken(rawTitle);
+    if (title.empty()) return out;
+
+    std::string left;
+    std::string right;
+    if (splitByKeyword(title, " vs ", left, right) ||
+        splitByKeyword(title, " -> ", left, right)) {
+        out.xLabel = normalizePlotLabel(left, 32);
+        out.yLabel = normalizePlotLabel(right, 32);
+        out.valid = true;
+        return out;
+    }
+    if (splitByKeyword(title, " over ", left, right) ||
+        splitByKeyword(title, " by ", left, right)) {
+        out.yLabel = normalizePlotLabel(left, 32);
+        out.xLabel = normalizePlotLabel(right, 32);
+        out.valid = true;
+        return out;
+    }
+    return out;
+}
+
+bool appearsUnixTimeAxis(const std::vector<double>& x) {
+    if (x.size() < 4) return false;
+    double minV = std::numeric_limits<double>::infinity();
+    double maxV = -std::numeric_limits<double>::infinity();
+    size_t monotonic = 0;
+    size_t adjacent = 0;
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (!std::isfinite(x[i])) continue;
+        minV = std::min(minV, x[i]);
+        maxV = std::max(maxV, x[i]);
+        if (i > 0 && std::isfinite(x[i - 1])) {
+            ++adjacent;
+            if (x[i] >= x[i - 1]) ++monotonic;
+        }
+    }
+    if (!std::isfinite(minV) || !std::isfinite(maxV) || maxV <= minV) return false;
+    const bool plausibleEpoch = minV > 1e8 && maxV < 5e10;
+    const bool meaningfulSpan = (maxV - minV) >= 3600.0;
+    const bool mostlyMonotonic = adjacent == 0 || (static_cast<double>(monotonic) / static_cast<double>(adjacent)) >= 0.7;
+    return plausibleEpoch && meaningfulSpan && mostlyMonotonic;
 }
 
 std::string quoteForDatafileString(const std::string& value) {
@@ -278,7 +327,7 @@ void applyAxisFormatting(std::ostringstream& script, const char axis, const Axis
     if (maxAbs >= 1e6 || maxAbs <= 1e-5 || (maxAbs / span) >= 1e4) {
         script << "set format " << axis << " '%.3e'\n";
     } else {
-        script << "set format " << axis << " '%.6g'\n";
+        script << "set format " << axis << " '%.5g'\n";
     }
 }
 
@@ -640,17 +689,17 @@ std::string GnuplotEngine::styledHeader(const std::string& id, const std::string
     script << "set object 999 rect from graph 0,0 to graph 1,1 behind fc rgb " << quoteForGnuplot(bgColor) << " fs solid 1.0 noborder\n";
         script << "set title " << quoteForGnuplot(normalizePlotTitle(title))
             << " tc rgb " << quoteForGnuplot(titleColor)
-            << " font ',12'\n";
-    script << "set tmargin 2.5\nset bmargin 3.5\nset lmargin 7\nset rmargin 3\n";
+            << " font ',14'\n";
+    script << "set tmargin 3.4\nset bmargin 4.6\nset lmargin 8.6\nset rmargin 3.2\n";
     script << "set border linewidth " << cfg_.lineWidth << " lc rgb " << quoteForGnuplot(borderColor) << "\n";
-    script << "set tics textcolor rgb " << quoteForGnuplot(ticColor) << "\n";
+    script << "set tics textcolor rgb " << quoteForGnuplot(ticColor) << " font ',10'\n";
     script << "set tics out nomirror\nset mxtics 2\nset mytics 2\n";
     if (cfg_.showGrid) {
         script << "set grid back lc rgb " << quoteForGnuplot(gridColor) << " lw 1 dt 2\n";
     } else {
         script << "unset grid\n";
     }
-    script << "set key top left opaque box lc rgb " << quoteForGnuplot(borderColor) << "\n";
+    script << "set key top left opaque box lc rgb " << quoteForGnuplot(borderColor) << " font ',10'\n";
     script << "set style line 1 lc rgb '#2563eb' lw " << cfg_.lineWidth << " pt 7 ps " << cfg_.pointSize << "\n";
     script << "set style line 2 lc rgb '#dc2626' lw " << cfg_.lineWidth << "\n";
     script << "set style line 3 lc rgb '#059669' lw " << cfg_.lineWidth << "\n";
@@ -845,11 +894,12 @@ std::string GnuplotEngine::histogram(const std::string& id,
     }
 
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
     const AxisRange xAxis = robustAxisRange(vals, 0.06);
     std::ostringstream script;
     script << styledHeader(id, title + (useSturges ? " (Sturges grouped)" : ""));
-    script << "set xlabel 'Value' tc rgb '#374151'\n";
-    script << "set ylabel 'Frequency' tc rgb '#374151'\n";
+    script << "set xlabel 'Value' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    script << "set ylabel 'Frequency' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << "set yrange [0:*]\n";
     if (xAxis.valid) applyAxisFormatting(script, 'x', xAxis);
     script << "set boxwidth 0.9 relative\nset style fill solid 0.85 border lc rgb '#1d4ed8'\n";
@@ -889,14 +939,15 @@ std::string GnuplotEngine::bar(const std::string& id,
         if (i > 0) xtics << ", ";
         xtics << quoteForGnuplot(normalizePlotLabel(grouped.labels[i])) << " " << i;
     }
-    xtics << ") rotate by -25 font ',8'\n";
+    xtics << ") rotate by -25 font ',10'\n";
 
     std::ostringstream script;
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
     script << styledHeader(id, title + ((grouped.labels.size() < labels.size()) ? " (top categories)" : ""));
     script << "set style fill solid 0.85 border lc rgb '#1d4ed8'\n";
     script << "set boxwidth 0.8\nset yrange [0:" << (maxValue * 1.12) << "]\n";
-    script << "set xlabel ''\nset ylabel 'Count' tc rgb '#374151'\n";
+    script << "set xlabel ''\nset ylabel 'Count' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << xtics.str();
     script << "set xrange [-1:" << (grouped.labels.size()) << "]\n";
     script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat") << " using 1:2 with boxes ls 1 notitle\n";
@@ -933,14 +984,15 @@ std::string GnuplotEngine::stackedBar(const std::string& id,
 
     std::ostringstream script;
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
     script << styledHeader(id, title);
     script << "set style data histograms\n";
     script << "set style histogram rowstacked\n";
     script << "set style fill solid 0.88 border lc rgb '#ffffff'\n";
     script << "set boxwidth 0.82\n";
-    script << "set ylabel " << quoteForGnuplot(yLabel) << " tc rgb '#374151'\n";
+    script << "set ylabel " << quoteForGnuplot(yLabel) << " tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << "set yrange [0:" << (maxStack * 1.15) << "]\n";
-    script << "set xtics rotate by -25 font ',8'\n";
+    script << "set xtics rotate by -25 font ',10'\n";
     script << "set key top right\n";
     script << "plot ";
     for (size_t j = 0; j < s; ++j) {
@@ -1018,10 +1070,12 @@ std::string GnuplotEngine::scatter(const std::string& id,
     }
 
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
+    const AxisLabelGuess labels = inferAxisLabelsFromTitle(title, "X", "Y");
     std::ostringstream script;
     script << styledHeader(id, title + (downsampled ? " (downsampled)" : ""));
-    script << "set xlabel 'X' tc rgb '#374151'\n";
-    script << "set ylabel 'Y' tc rgb '#374151'\n";
+    script << "set xlabel " << quoteForGnuplot(labels.xLabel) << " tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    script << "set ylabel " << quoteForGnuplot(labels.yLabel) << " tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << "set key top left\n";
     std::vector<double> xv;
     std::vector<double> yv;
@@ -1066,10 +1120,11 @@ std::string GnuplotEngine::residual(const std::string& id,
     }
 
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
     std::ostringstream script;
     script << styledHeader(id, title);
-    script << "set xlabel 'Fitted value' tc rgb '#374151'\n";
-    script << "set ylabel 'Residual' tc rgb '#374151'\n";
+    script << "set xlabel 'Fitted value' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    script << "set ylabel 'Residual' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << "set key top left\n";
     script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
            << " using 1:2 with points ls 1 title 'Residuals', 0 with lines ls 2 title 'Zero line'\n";
@@ -1087,10 +1142,10 @@ std::string GnuplotEngine::line(const std::string& id,
     for (size_t i = 0; i < x.size() && i < y.size(); ++i) data << x[i] << " " << y[i] << "\n";
 
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
+    const AxisLabelGuess labels = inferAxisLabelsFromTitle(title, "Index", "Value");
     std::ostringstream script;
     script << styledHeader(id, title);
-    script << "set xlabel 'Epoch' tc rgb '#374151'\n";
-    script << "set ylabel 'Value' tc rgb '#374151'\n";
     std::vector<double> xv;
     std::vector<double> yv;
     for (size_t i = 0; i < x.size() && i < y.size(); ++i) {
@@ -1098,9 +1153,18 @@ std::string GnuplotEngine::line(const std::string& id,
         xv.push_back(x[i]);
         yv.push_back(y[i]);
     }
+    const bool xAsTime = appearsUnixTimeAxis(xv);
+    if (xAsTime) {
+        script << "set xdata time\nset timefmt '%s'\nset format x '%Y-%m-%d'\n";
+        script << "set xtics rotate by -25\n";
+        script << "set xlabel 'Time' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    } else {
+        script << "set xlabel " << quoteForGnuplot(labels.xLabel) << " tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    }
+    script << "set ylabel " << quoteForGnuplot(labels.yLabel) << " tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     const AxisRange xAxis = robustAxisRange(xv, 0.04);
     const AxisRange yAxis = robustAxisRange(yv, 0.08);
-    if (xAxis.valid) applyAxisFormatting(script, 'x', xAxis);
+    if (xAxis.valid && !xAsTime) applyAxisFormatting(script, 'x', xAxis);
     if (yAxis.valid) applyAxisFormatting(script, 'y', yAxis);
     script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat") << " using 1:2 with lines ls 1 title 'Series'\n";
     return runScript(id, data.str(), script.str());
@@ -1128,10 +1192,33 @@ std::string GnuplotEngine::multiLine(const std::string& id,
     }
 
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
+    const AxisLabelGuess axisLabels = inferAxisLabelsFromTitle(title, "Index", yLabel);
     std::ostringstream script;
     script << styledHeader(id, title);
-    script << "set xlabel 'Epoch' tc rgb '#374151'\n";
-    script << "set ylabel " << quoteForGnuplot(yLabel) << " tc rgb '#374151'\n";
+    std::vector<double> xv;
+    xv.reserve(n);
+    std::vector<double> yv;
+    yv.reserve(n * m);
+    for (size_t i = 0; i < n; ++i) {
+        if (std::isfinite(x[i])) xv.push_back(x[i]);
+        for (size_t j = 0; j < m; ++j) {
+            if (std::isfinite(series[j][i])) yv.push_back(series[j][i]);
+        }
+    }
+    const bool xAsTime = appearsUnixTimeAxis(xv);
+    if (xAsTime) {
+        script << "set xdata time\nset timefmt '%s'\nset format x '%Y-%m-%d'\n";
+        script << "set xtics rotate by -25\n";
+        script << "set xlabel 'Time' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    } else {
+        script << "set xlabel " << quoteForGnuplot(axisLabels.xLabel) << " tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    }
+    script << "set ylabel " << quoteForGnuplot(axisLabels.yLabel) << " tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    const AxisRange xAxis = robustAxisRange(xv, 0.05);
+    const AxisRange yAxis = robustAxisRange(yv, 0.08);
+    if (xAxis.valid && !xAsTime) applyAxisFormatting(script, 'x', xAxis);
+    if (yAxis.valid) applyAxisFormatting(script, 'y', yAxis);
     script << "set key top right\n";
     script << "plot ";
     for (size_t j = 0; j < m; ++j) {
@@ -1160,10 +1247,11 @@ std::string GnuplotEngine::ogive(const std::string& id,
     }
 
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
     std::ostringstream script;
     script << styledHeader(id, title);
-    script << "set xlabel 'Value' tc rgb '#374151'\n";
-    script << "set ylabel 'Cumulative %' tc rgb '#374151'\n";
+    script << "set xlabel 'Value' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    script << "set ylabel 'Cumulative %' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << "set yrange [0:100]\n";
     script << "set key top left\n";
     script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
@@ -1182,10 +1270,11 @@ std::string GnuplotEngine::box(const std::string& id,
     for (double v : vals) data << v << "\n";
 
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
     std::ostringstream script;
     script << styledHeader(id, title);
     script << "set xlabel ''\n";
-    script << "set ylabel 'Value' tc rgb '#374151'\n";
+    script << "set ylabel 'Value' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << "set style data boxplot\n";
     script << "set style boxplot outliers pointtype 7\n";
     script << "set style fill solid 0.45 border lc rgb '#1d4ed8'\n";
@@ -1231,15 +1320,16 @@ std::string GnuplotEngine::categoricalDistribution(const std::string& id,
     std::ostringstream data;
     std::ostringstream script;
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
     script << styledHeader(id, title + (useViolin ? " (violin mode)" : " (boxen mode)"));
-    script << "set ylabel 'Value' tc rgb '#374151'\n";
+    script << "set ylabel 'Value' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << "set xrange [0.5:" << (ordered.size() + 0.5) << "]\n";
     script << "set xtics (";
     for (size_t i = 0; i < ordered.size(); ++i) {
         if (i > 0) script << ", ";
         script << quoteForGnuplot(normalizePlotLabel(ordered[i].first, 16)) << " " << (i + 1);
     }
-    script << ") rotate by -25 font ',8'\n";
+    script << ") rotate by -25 font ',10'\n";
 
     if (useViolin) {
         for (size_t i = 0; i < ordered.size(); ++i) {
@@ -1402,9 +1492,10 @@ std::string GnuplotEngine::parallelCoordinates(const std::string& id,
     }
 
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
     std::ostringstream script;
     script << styledHeader(id, title);
-    script << "set ylabel 'Normalized value' tc rgb '#374151'\n";
+    script << "set ylabel 'Normalized value' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << "set yrange [0:1]\n";
     script << "set xrange [1:" << cols << "]\n";
     script << "set xtics (";
@@ -1412,7 +1503,7 @@ std::string GnuplotEngine::parallelCoordinates(const std::string& id,
         if (c > 0) script << ", ";
         script << quoteForGnuplot(normalizePlotLabel(axisLabels[c], 16)) << " " << (c + 1);
     }
-    script << ") rotate by -25 font ',8'\n";
+    script << ") rotate by -25 font ',10'\n";
     script << "unset key\n";
     script << "plot for [i=0:" << (rows.size() - 1) << "] "
            << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
@@ -1472,6 +1563,7 @@ std::string GnuplotEngine::timeSeriesTrend(const std::string& id,
     }
 
     const std::string safeId = sanitizeId(id);
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
     std::ostringstream script;
     script << styledHeader(id, title + " (" + label + ")");
     if (xIsUnixTime) {
@@ -1479,11 +1571,14 @@ std::string GnuplotEngine::timeSeriesTrend(const std::string& id,
         script << "set timefmt '%s'\n";
         script << "set format x '%Y-%m-%d'\n";
         script << "set xtics rotate by -25\n";
-        script << "set xlabel 'Time' tc rgb '#374151'\n";
+        script << "set xlabel 'Time' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     } else {
-        script << "set xlabel 'Time index' tc rgb '#374151'\n";
+        script << "set xlabel 'Time index' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     }
-    script << "set ylabel 'Value' tc rgb '#374151'\n";
+    AxisLabelGuess labels = inferAxisLabelsFromTitle(title, "Time", "Value");
+    script << "set ylabel " << quoteForGnuplot(labels.yLabel) << " tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    const AxisRange yAxis = robustAxisRange(yv, 0.08);
+    if (yAxis.valid) applyAxisFormatting(script, 'y', yAxis);
     script << "set key top left\n";
     script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
            << " using 1:2 with lines ls 1 title 'Series', "
@@ -1547,9 +1642,9 @@ std::string GnuplotEngine::pie(const std::string& id,
         const double lx = 1.12 * std::cos(mid);
         const double ly = 1.12 * std::sin(mid);
         const int pct = static_cast<int>(std::round(frac * 100.0));
-        script << "set label " << labelId++ << " "
+         script << "set label " << labelId++ << " "
              << quoteForGnuplot(normalizePlotLabel(grouped.labels[i], 20) + " (" + std::to_string(pct) + "%)")
-               << " at " << lx << "," << ly << " center tc rgb '#111827' font ',8'\n";
+             << " at " << lx << "," << ly << " center tc rgb '#111827' font ',10'\n";
 
         angleStart = angleEnd;
     }
@@ -1588,17 +1683,17 @@ std::string GnuplotEngine::gantt(const std::string& id,
     ytics << ")\n";
 
     std::ostringstream script;
+    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
     script << styledHeader(id, title);
     script << "set xdata time\n";
     script << "set timefmt '%s'\n";
     script << "set format x '%Y-%m-%d'\n";
     script << "set xtics rotate by -25\n";
-    script << "set xlabel 'Timeline' tc rgb '#374151'\n";
-    script << "set ylabel 'Task' tc rgb '#374151'\n";
+    script << "set xlabel 'Timeline' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
+    script << "set ylabel 'Task' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << "set yrange [0.5:" << (static_cast<double>(n) + 0.5) << "]\n";
     script << ytics.str();
-    script << "set xrange [" << quoteForGnuplot(std::to_string(minStart)) << ":"
-           << quoteForGnuplot(std::to_string(maxEnd + 86400)) << "]\n";
+    script << "set xrange [" << minStart << ":" << (maxEnd + 86400) << "]\n";
     script << "unset key\n";
 
     int objectId = 1;
@@ -1645,13 +1740,13 @@ std::string GnuplotEngine::heatmap(const std::string& id,
             if (i > 0) script << ", ";
             script << quoteForGnuplot(normalizePlotLabel(labels[i], 12)) << " " << i;
         }
-        script << ") rotate by -35 font ',7'\n";
+        script << ") rotate by -35 font ',9'\n";
         script << "set ytics (";
         for (size_t i = 0; i < labels.size(); ++i) {
             if (i > 0) script << ", ";
             script << quoteForGnuplot(normalizePlotLabel(labels[i], 12)) << " " << i;
         }
-        script << ") font ',7'\n";
+        script << ") font ',9'\n";
     }
     script << "unset grid\n";
     script << "splot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat") << " using 1:2:3 with pm3d\n";

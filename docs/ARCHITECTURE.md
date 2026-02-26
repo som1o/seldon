@@ -674,4 +674,3 @@ This separation helps maintain predictable behavior as data scale and schema com
 
 - [README](../README.md)
 - [USAGE](USAGE.md)
-- [ENABLE_EXCEL_IMPORT](ENABLE_EXCEL_IMPORT.md)

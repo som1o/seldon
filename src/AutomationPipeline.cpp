@@ -1900,6 +1900,33 @@ void cleanupOutputs(const AutoConfig& config) {
     fs::create_directories(config.assetsDir, ec);
 }
 
+void cleanupPlotCacheArtifacts(const AutoConfig& config) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (config.assetsDir.empty()) return;
+
+    const std::vector<std::string> candidateDirs = {
+        config.assetsDir,
+        plotSubdir(config, "univariate"),
+        plotSubdir(config, "bivariate"),
+        plotSubdir(config, "overall")
+    };
+
+    for (const auto& dir : candidateDirs) {
+        const fs::path cacheDir = fs::path(dir) / ".plot_cache";
+        if (!fs::exists(cacheDir, ec)) continue;
+
+        for (const auto& entry : fs::directory_iterator(cacheDir, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().extension() == ".hash") {
+                fs::remove(entry.path(), ec);
+            }
+        }
+        fs::remove(cacheDir, ec);
+    }
+}
+
 void validateExcludedColumns(const TypedDataset& data, const AutoConfig& config) {
     for (const auto& ex : config.excludedColumns) {
         if (data.findColumnIndex(ex) < 0) {
@@ -7333,6 +7360,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     saveGeneratedReports(runCfg, univariate, bivariate, neuralReport, finalAnalysis, heuristicsReport);
+    cleanupPlotCacheArtifacts(runCfg);
     advance("Saved reports");
     progress.done("Pipeline complete");
     printPipelineCompletion(runCfg);
