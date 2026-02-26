@@ -139,7 +139,8 @@ bool shouldOverlayFittedLine(double r,
     if (approximateUniqueCount(xValid) < minUniqueX) return false;
 
     const MathUtils::NumericSummary ySummary = MathUtils::summarizeNumeric(yValid);
-    if (!std::isfinite(ySummary.stddev) || ySummary.stddev <= tuning.numericEpsilon) return false;
+    const double yScale = std::abs(ySummary.stddev);
+    if (!std::isfinite(yScale) || yScale <= tuning.numericEpsilon) return false;
 
     const double explained = r * r;
     const double minExplained = (sampleSize < 40) ? 0.18 : 0.12;

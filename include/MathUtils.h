@@ -123,7 +123,7 @@ public:
         }
 
         void setInversionTolerance(double tolerance) noexcept {
-            inversionTolerance = tolerance;
+            inversionTolerance = std::max(0.0, tolerance);
         }
 
         double getInversionTolerance() const noexcept {
@@ -163,7 +163,7 @@ public:
         void qrDecomposition(Matrix& Q, Matrix& R) const;
 
     private:
-        double inversionTolerance = -1.0;
+        double inversionTolerance = 0.0;
     };
 
     /**

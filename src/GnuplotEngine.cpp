@@ -691,9 +691,29 @@ std::string GnuplotEngine::runScript(const std::string& id, const std::string& d
     {
         std::ifstream in(cacheHashFile);
         std::string existing;
+        std::string cachedMtimeRaw;
         if (in && std::getline(in, existing)) {
+            std::getline(in, cachedMtimeRaw);
             if (existing == cacheKey && std::filesystem::exists(outputFile)) {
-                return outputFile;
+                bool useCache = true;
+                if (!cachedMtimeRaw.empty()) {
+                    std::error_code ec;
+                    const auto currentTime = std::filesystem::last_write_time(outputFile, ec);
+                    if (!ec) {
+                        try {
+                            const auto cachedCount = static_cast<std::filesystem::file_time_type::rep>(std::stoll(cachedMtimeRaw));
+                            const auto currentCount = currentTime.time_since_epoch().count();
+                            if (currentCount != cachedCount) {
+                                useCache = false;
+                            }
+                        } catch (...) {
+                            useCache = false;
+                        }
+                    }
+                }
+                if (useCache) {
+                    return outputFile;
+                }
             }
         }
     }
@@ -742,6 +762,11 @@ std::string GnuplotEngine::runScript(const std::string& id, const std::string& d
     std::ofstream hout(cacheHashFile);
     if (hout) {
         hout << cacheKey;
+        std::error_code tec;
+        const auto outTime = std::filesystem::last_write_time(outputFile, tec);
+        if (!tec) {
+            hout << "\n" << outTime.time_since_epoch().count();
+        }
     }
 
     return outputFile;

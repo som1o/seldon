@@ -287,14 +287,16 @@ void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTrain
     }
     for (size_t l = 1; l < m_layers.size(); ++l) {
         const bool hidden = l + 1 < m_layers.size();
+        const bool applyBatchNorm = m_useBatchNorm && hidden;
+        const bool applyLayerNorm = m_useLayerNorm && hidden;
         m_layers[l].forward(
             m_layers[l - 1],
             isTraining && hidden,
             dropoutRate,
-            m_useBatchNorm && hidden,
+            applyBatchNorm,
             m_batchNormMomentum,
             m_batchNormEpsilon,
-            m_useLayerNorm && hidden,
+            applyLayerNorm,
             m_layerNormEpsilon,
             seedState,
             runCounter + l * 1315423911ULL);
@@ -581,21 +583,30 @@ double NeuralNet::runEpoch(const std::vector<std::vector<double>>& X,
                            const Hyperparameters& hp,
                            size_t& t_step) {
     double epochLoss = 0.0;
+    double gradNormAccum = 0.0;
+    size_t gradBatchCount = 0;
     for (size_t i = 0; i < trainSize; i += hp.batchSize) {
         const size_t end = std::min(i + hp.batchSize, trainSize);
         epochLoss += runBatch(X, Y, indices, i, end, hp, t_step);
+
+        double batchGradSq = 0.0;
+        size_t batchGradCount = 0;
+        for (size_t l = 1; l < m_layers.size(); ++l) {
+            for (double g : m_layers[l].gradients()) {
+                batchGradSq += g * g;
+                ++batchGradCount;
+            }
+        }
+        if (batchGradCount > 0) {
+            gradNormAccum += std::sqrt(batchGradSq / static_cast<double>(batchGradCount));
+            ++gradBatchCount;
+        }
     }
 
-    double gradNorm = 0.0;
     double wAbs = 0.0;
     double wSq = 0.0;
-    size_t gCount = 0;
     size_t wCount = 0;
     for (size_t l = 1; l < m_layers.size(); ++l) {
-        for (double g : m_layers[l].gradients()) {
-            gradNorm += g * g;
-            ++gCount;
-        }
         for (double w : m_layers[l].weights()) {
             wAbs += std::abs(w);
             wSq += w * w;
@@ -603,7 +614,7 @@ double NeuralNet::runEpoch(const std::vector<std::vector<double>>& X,
         }
     }
 
-    gradientNormHistory.push_back((gCount > 0) ? std::sqrt(gradNorm / static_cast<double>(gCount)) : 0.0);
+    gradientNormHistory.push_back((gradBatchCount > 0) ? (gradNormAccum / static_cast<double>(gradBatchCount)) : 0.0);
     weightMeanAbsHistory.push_back((wCount > 0) ? (wAbs / static_cast<double>(wCount)) : 0.0);
     weightStdHistory.push_back((wCount > 0) ? std::sqrt(wSq / static_cast<double>(wCount)) : 0.0);
 

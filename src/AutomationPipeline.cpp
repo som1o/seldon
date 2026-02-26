@@ -4669,6 +4669,9 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
         if (r.rfind("Insufficient", 0) == 0 || r.rfind("No ", 0) == 0) continue;
         filtered.push_back(row);
     }
+    for (size_t i = 0; i < filtered.size(); ++i) {
+        filtered[i][0] = std::to_string(i + 1);
+    }
     out.orderedRows = std::move(filtered);
 
     if (!out.priorityTakeaways.empty()) {
@@ -5915,6 +5918,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     if (data.colCount() == 0) {
         throw Seldon::DatasetException("All columns were removed by pre-flight missingness cull (>95% missing)");
     }
+    const size_t rawColumnsAfterPreflight = data.colCount();
     const TargetContext targetContext = resolveTargetContext(data, config, runCfg);
     const int targetIdx = targetContext.targetIdx;
     applyDynamicPlotDefaultsIfUnset(runCfg, data);
@@ -5944,7 +5948,6 @@ int AutomationPipeline::run(const AutoConfig& config) {
     univariate.addTitle("Univariate Analysis");
     univariate.addParagraph("Dataset: " + runCfg.datasetPath);
     const size_t totalAnalysisDimensions = data.colCount();
-    const size_t rawColumnsAfterPreflight = data.colCount();
     const size_t engineeredFeatureCount =
         (totalAnalysisDimensions >= rawColumnsAfterPreflight) ? (totalAnalysisDimensions - rawColumnsAfterPreflight) : 0;
     univariate.addParagraph("Dataset Stats:");

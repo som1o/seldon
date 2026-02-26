@@ -4,6 +4,23 @@
 #include <sstream>
 #include <algorithm>
 
+namespace {
+std::string escapeMarkdownTableCell(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (char ch : value) {
+        if (ch == '|') {
+            escaped += "\\|";
+        } else if (ch == '\n') {
+            escaped += "<br>";
+        } else if (ch != '\r') {
+            escaped.push_back(ch);
+        }
+    }
+    return escaped;
+}
+} // namespace
+
 void ReportEngine::addTitle(const std::string& title) {
     body_ += "# " + title + "\n\n";
 }
@@ -21,7 +38,7 @@ void ReportEngine::addTable(const std::string& title, const std::vector<std::str
 
     body_ += "|";
     for (const auto& h : headers) {
-        body_ += " " + h + " |";
+        body_ += " " + escapeMarkdownTableCell(h) + " |";
     }
     body_ += "\n|";
     for (size_t i = 0; i < headers.size(); ++i) {
@@ -32,7 +49,7 @@ void ReportEngine::addTable(const std::string& title, const std::vector<std::str
     for (const auto& row : rows) {
         body_ += "|";
         for (size_t i = 0; i < headers.size(); ++i) {
-            body_ += " " + (i < row.size() ? row[i] : "") + " |";
+            body_ += " " + escapeMarkdownTableCell(i < row.size() ? row[i] : "") + " |";
         }
         body_ += "\n";
     }

@@ -282,7 +282,7 @@ std::optional<double> MathUtils::calculatePearson(const std::vector<double>& x, 
     // Modern C++ algorithm replacing raw loops
     double covarianceSum = std::inner_product(x.begin(), x.end(), y.begin(), 0.0,
         std::plus<>(),
-        [statsX, statsY](double valX, double valY) {
+        [&statsX, &statsY](double valX, double valY) {
             return (valX - statsX.mean) * (valY - statsY.mean);
         });
     
@@ -395,8 +395,11 @@ std::optional<MathUtils::Matrix> MathUtils::Matrix::inverse() const {
     const size_t n = rows;
     Matrix work = *this;
     Matrix inv = Matrix::identity(n);
+    Matrix original = *this;
     std::vector<size_t> colPerm(n, 0);
+    std::vector<size_t> rowPerm(n, 0);
     std::iota(colPerm.begin(), colPerm.end(), 0);
+    std::iota(rowPerm.begin(), rowPerm.end(), 0);
 
     double scale = 0.0;
     for (size_t i = 0; i < n; ++i) {
@@ -430,6 +433,7 @@ std::optional<MathUtils::Matrix> MathUtils::Matrix::inverse() const {
         if (pivotRow != i) {
             std::swap(work.data[i], work.data[pivotRow]);
             std::swap(inv.data[i], inv.data[pivotRow]);
+            std::swap(rowPerm[i], rowPerm[pivotRow]);
         }
 
         if (pivotCol != i) {
@@ -464,7 +468,29 @@ std::optional<MathUtils::Matrix> MathUtils::Matrix::inverse() const {
     for (size_t i = 0; i < n; ++i) {
         result.data[colPerm[i]] = inv.data[i];
     }
-    return result;
+
+    auto residualError = [&](const Matrix& candidate) {
+        Matrix recon = original.multiply(candidate);
+        double maxAbsErr = 0.0;
+        for (size_t r = 0; r < n; ++r) {
+            for (size_t c = 0; c < n; ++c) {
+                const double expected = (r == c) ? 1.0 : 0.0;
+                maxAbsErr = std::max(maxAbsErr, std::abs(recon.at(r, c) - expected));
+            }
+        }
+        return maxAbsErr;
+    };
+
+    Matrix alt(n, n);
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            alt.at(colPerm[i], rowPerm[j]) = inv.at(i, j);
+        }
+    }
+
+    const double errPrimary = residualError(result);
+    const double errAlt = residualError(alt);
+    return (errAlt + pivotTolerance < errPrimary) ? alt : result;
 }
 
 MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>& values,

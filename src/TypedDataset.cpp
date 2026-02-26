@@ -801,7 +801,7 @@ void TypedDataset::load() {
             if (containsMetadataKeyword(cell)) return true;
         }
 
-        if (acceptedRows < 3 || runningSums.size() != header.size()) {
+        if (acceptedRows < 8 || runningSums.size() != header.size()) {
             return false;
         }
 
@@ -825,8 +825,9 @@ void TypedDataset::load() {
         }
 
         if (numericCells == 0) return false;
-        if (nonMissingCells > (header.size() / 2 + 1)) return false;
-        return sumAlignedCells >= 1 && (sumAlignedCells * 2 >= numericCells);
+        if (nonMissingCells > std::max<size_t>(3, header.size() / 3)) return false;
+        const bool mostlySummed = (sumAlignedCells >= 2) && (sumAlignedCells * 4 >= numericCells * 3);
+        return mostlySummed;
     };
 
     auto updateRunningSums = [&](const std::vector<std::string>& row, std::vector<double>& runningSums) {

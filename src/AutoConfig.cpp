@@ -931,7 +931,13 @@ AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig&
                     ": invalid imputation strategy '" + value +
                     "' (allowed: auto, mean, median, zero, mode, interpolate)");
             }
-            config.columnImputation[key.substr(7)] = normalized;
+            const std::string columnName = CommonUtils::trim(key.substr(7));
+            if (columnName.empty()) {
+                throw Seldon::ConfigurationException(
+                    "Config parse error at line " + std::to_string(lineNo) +
+                    ": impute.<column> requires a non-empty column name");
+            }
+            config.columnImputation[columnName] = normalized;
         }
         if (key.rfind("type.", 0) == 0) {
             const std::string normalized = CommonUtils::toLower(value);
@@ -964,6 +970,9 @@ void HeuristicTuningConfig::validate() const {
     }
     if (featureMissingAdaptiveMin > featureMissingAdaptiveMax) {
         throw Seldon::ConfigurationException("feature_missing_floor must be <= feature_missing_ceiling");
+    }
+    if (featureMissingQ3Offset < 0.0) {
+        throw Seldon::ConfigurationException("feature_missing_q3_offset must be >= 0");
     }
     if (bivariateSelectionQuantileOverride != -1.0 &&
         (bivariateSelectionQuantileOverride < 0.0 || bivariateSelectionQuantileOverride > 1.0)) {
@@ -1187,6 +1196,9 @@ void AutoConfig::validate() const {
     }
 
     for (const auto& kv : columnImputation) {
+        if (CommonUtils::trim(kv.first).empty()) {
+            throw Seldon::ConfigurationException("Invalid imputation override: column name cannot be empty");
+        }
         if (!isValidImputationStrategy(kv.second)) {
             throw Seldon::ConfigurationException(
                 "Invalid imputation strategy for column '" + kv.first +
