@@ -498,7 +498,16 @@ MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>&
     NumericSummary out;
     if (values.empty()) return out;
 
-    const ColumnStats stats = precomputedStats ? *precomputedStats : Statistics::calculateStats(values);
+    std::vector<double> finiteValues;
+    finiteValues.reserve(values.size());
+    for (double value : values) {
+        if (std::isfinite(value)) {
+            finiteValues.push_back(value);
+        }
+    }
+    if (finiteValues.empty()) return out;
+
+    const ColumnStats stats = precomputedStats ? *precomputedStats : Statistics::calculateStats(finiteValues);
     out.mean = stats.mean;
     const double trimQ = 0.10;
     out.median = stats.median;
@@ -507,18 +516,18 @@ MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>&
     out.skewness = stats.skewness;
     out.kurtosis = stats.kurtosis;
 
-    out.min = *std::min_element(values.begin(), values.end());
-    out.max = *std::max_element(values.begin(), values.end());
+    out.min = *std::min_element(finiteValues.begin(), finiteValues.end());
+    out.max = *std::max_element(finiteValues.begin(), finiteValues.end());
     out.range = out.max - out.min;
 
-    out.q1 = CommonUtils::quantileByNth(values, 0.25);
-    out.q3 = CommonUtils::quantileByNth(values, 0.75);
+    out.q1 = CommonUtils::quantileByNth(finiteValues, 0.25);
+    out.q3 = CommonUtils::quantileByNth(finiteValues, 0.75);
     out.iqr = out.q3 - out.q1;
-    out.p05 = CommonUtils::quantileByNth(values, 0.05);
-    out.p95 = CommonUtils::quantileByNth(values, 0.95);
+    out.p05 = CommonUtils::quantileByNth(finiteValues, 0.05);
+    out.p95 = CommonUtils::quantileByNth(finiteValues, 0.95);
 
-    std::vector<double> absDev(values.size(), 0.0);
-    std::vector<double> sorted = values;
+    std::vector<double> absDev(finiteValues.size(), 0.0);
+    std::vector<double> sorted = finiteValues;
     std::sort(sorted.begin(), sorted.end());
     const size_t trimN = static_cast<size_t>(std::floor(trimQ * static_cast<double>(sorted.size())));
     const size_t keepStart = std::min(trimN, sorted.size());
@@ -535,7 +544,7 @@ MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>&
         std::unordered_map<long long, size_t> freq;
         size_t best = 0;
         long long bestKey = 0;
-        for (double v : values) {
+        for (double v : finiteValues) {
             const long long q = static_cast<long long>(std::llround(v * 1e6));
             size_t c = ++freq[q];
             if (c > best) {
@@ -546,24 +555,35 @@ MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>&
         out.mode = static_cast<double>(bestKey) / 1e6;
     }
 
-    bool allPositive = true;
+    bool hasNegative = false;
+    size_t zeroCount = 0;
+    size_t positiveCount = 0;
     double logSum = 0.0;
     double invSum = 0.0;
-    for (size_t i = 0; i < values.size(); ++i) {
-        absDev[i] = std::abs(values[i] - out.median);
-        out.sum += values[i];
-        if (std::abs(values[i]) > 1e-12) out.nonZero++;
-        if (values[i] <= 0.0) {
-            allPositive = false;
+    for (size_t i = 0; i < finiteValues.size(); ++i) {
+        absDev[i] = std::abs(finiteValues[i] - out.median);
+        out.sum += finiteValues[i];
+        if (std::abs(finiteValues[i]) > 1e-12) out.nonZero++;
+        if (finiteValues[i] < 0.0) {
+            hasNegative = true;
+        } else if (std::abs(finiteValues[i]) <= 1e-12) {
+            ++zeroCount;
         } else {
-            logSum += std::log(values[i]);
-            invSum += 1.0 / values[i];
+            ++positiveCount;
+            logSum += std::log(finiteValues[i]);
+            invSum += 1.0 / finiteValues[i];
         }
     }
     out.mad = CommonUtils::quantileByNth(absDev, 0.5);
-    if (allPositive && !values.empty()) {
-        out.geometricMean = std::exp(logSum / static_cast<double>(values.size()));
-        out.harmonicMean = static_cast<double>(values.size()) / std::max(invSum, 1e-12);
+    if (hasNegative) {
+        out.geometricMean = 0.0;
+        out.harmonicMean = 0.0;
+    } else if (zeroCount > 0) {
+        out.geometricMean = 0.0;
+        out.harmonicMean = 0.0;
+    } else if (positiveCount > 0) {
+        out.geometricMean = std::exp(logSum / static_cast<double>(positiveCount));
+        out.harmonicMean = static_cast<double>(positiveCount) / std::max(invSum, 1e-12);
     } else {
         out.geometricMean = 0.0;
         out.harmonicMean = 0.0;

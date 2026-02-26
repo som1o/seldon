@@ -91,6 +91,9 @@ int spawnProcessSilenced(const std::string& executable, const std::vector<std::s
 }
 
 std::string toFixed(double v, int prec = 4) {
+    if (!std::isfinite(v)) return "n/a";
+    const double zeroSnap = 0.5 * std::pow(10.0, -std::max(0, prec));
+    if (std::abs(v) < zeroSnap) v = 0.0;
     std::ostringstream os;
     os << std::fixed << std::setprecision(prec) << v;
     return os.str();
@@ -149,6 +152,38 @@ bool isEngineeredFeatureName(const std::string& name) {
         || lower.find("_log1p_abs") != std::string::npos
         || lower.find("_x_") != std::string::npos
         || lower.find("_div_") != std::string::npos;
+}
+
+std::string canonicalEngineeredBaseName(const std::string& name) {
+    const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
+    if (lower.empty()) return lower;
+
+    auto stripSuffix = [&](const std::string& token) {
+        const size_t pos = lower.find(token);
+        if (pos == std::string::npos || pos == 0) return std::string();
+        return CommonUtils::trim(lower.substr(0, pos));
+    };
+
+    if (const std::string base = stripSuffix("_pow"); !base.empty()) return base;
+    if (const std::string base = stripSuffix("_log1p_abs"); !base.empty()) return base;
+    if (const std::string base = stripSuffix("_x_"); !base.empty()) return base;
+    if (const std::string base = stripSuffix("_div_"); !base.empty()) return base;
+    return lower;
+}
+
+bool isEngineeredLineagePair(const std::string& a, const std::string& b) {
+    const std::string la = CommonUtils::toLower(CommonUtils::trim(a));
+    const std::string lb = CommonUtils::toLower(CommonUtils::trim(b));
+    if (la.empty() || lb.empty()) return false;
+
+    const std::string baseA = canonicalEngineeredBaseName(la);
+    const std::string baseB = canonicalEngineeredBaseName(lb);
+    const bool engineeredA = isEngineeredFeatureName(la);
+    const bool engineeredB = isEngineeredFeatureName(lb);
+
+    if (engineeredA && baseA == lb) return true;
+    if (engineeredB && baseB == la) return true;
+    return (engineeredA || engineeredB) && !baseA.empty() && !baseB.empty() && baseA == baseB;
 }
 
 bool shouldAddOgive(const std::vector<double>& values, const HeuristicTuningConfig& tuning) {
@@ -685,8 +720,9 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
         if (idx < 0) {
             throw Seldon::ConfigurationException("Target column not found: " + config.targetColumn);
         }
-        if (data.columns()[idx].type != ColumnType::NUMERIC) {
-            throw Seldon::ConfigurationException("Target column must be numeric: " + config.targetColumn);
+        if (data.columns()[idx].type != ColumnType::NUMERIC &&
+            data.columns()[idx].type != ColumnType::CATEGORICAL) {
+            throw Seldon::ConfigurationException("Target column must be numeric or categorical: " + config.targetColumn);
         }
         choice.index = idx;
         choice.strategyUsed = "user";
@@ -694,13 +730,48 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
     }
 
     auto numeric = data.numericColumnIndices();
-    if (numeric.empty()) {
-        throw Seldon::ConfigurationException("Could not resolve a numeric target column");
+    auto categorical = data.categoricalColumnIndices();
+    if (numeric.empty() && categorical.empty()) {
+        throw Seldon::ConfigurationException("Could not resolve a target column");
     }
+
+    auto columnProfile = [&](size_t idx) {
+        struct Profile {
+            size_t finiteCount = 0;
+            size_t uniqueCount = 0;
+            double cardRatio = 1.0;
+            bool classLike = false;
+            bool adminName = false;
+            bool targetHint = false;
+        };
+
+        Profile p;
+        const auto& col = data.columns()[idx];
+        const auto& values = std::get<std::vector<double>>(col.values);
+        std::unordered_set<double> uniqueValues;
+        uniqueValues.reserve(values.size());
+        for (double v : values) {
+            if (!std::isfinite(v)) continue;
+            ++p.finiteCount;
+            uniqueValues.insert(v);
+        }
+        p.uniqueCount = uniqueValues.size();
+        p.cardRatio = static_cast<double>(p.uniqueCount) / static_cast<double>(std::max<size_t>(1, p.finiteCount));
+
+        std::string lname = CommonUtils::toLower(col.name);
+        p.adminName = isAdministrativeColumnName(lname);
+        p.targetHint = isTargetCandidateColumnName(lname);
+        p.classLike =
+            p.uniqueCount <= std::max<size_t>(8, p.finiteCount / 20) ||
+            (p.uniqueCount <= 16 && p.cardRatio <= 0.06) ||
+            (p.uniqueCount <= 24 && p.cardRatio <= 0.03);
+        return p;
+    };
 
     auto scoreColumnQuality = [&](size_t idx) {
         const auto& col = data.columns()[idx];
         const auto& values = std::get<std::vector<double>>(col.values);
+        const auto profile = columnProfile(idx);
         size_t finiteCount = 0;
         size_t nonZero = 0;
         double mean = 0.0;
@@ -726,8 +797,8 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
 
         std::string lname = col.name;
         std::transform(lname.begin(), lname.end(), lname.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        const bool adminName = isAdministrativeColumnName(lname);
-        const bool targetHint = isTargetCandidateColumnName(lname);
+        const bool adminName = profile.adminName;
+        const bool targetHint = profile.targetHint;
         double namePenalty = adminName ? 0.70 : ((lname.find("id") != std::string::npos || lname.find("index") != std::string::npos) ? 0.25 : 0.0);
         double nameBonus = targetHint ? 0.20 : 0.0;
         if (containsToken(lname, {"timestamp", "created", "updated", "time", "date"})) {
@@ -735,6 +806,14 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
         }
         const double cardRatio = static_cast<double>(roundedCardinality.size()) / static_cast<double>(std::max<size_t>(1, finiteCount));
         if (cardRatio > 0.95) namePenalty += 0.20;
+        if (cardRatio > 0.98) namePenalty += 0.15;
+        if (cardRatio > 0.35 && roundedCardinality.size() > 32) namePenalty += 0.08;
+
+        const bool classLikeCardinality = profile.classLike;
+        const double classLikeBonus = classLikeCardinality ? 0.24 : 0.0;
+        const double positionBonus =
+            (idx + 1 == data.colCount()) ? 0.14 :
+            (idx == 0 ? 0.05 : 0.0);
 
         double varianceScore = std::clamp(std::log1p(std::max(0.0, var)) / 4.0, 0.0, 1.0);
         const double entropyScore = safeEntropyFromCounts(roundedCardinality, finiteCount);
@@ -743,7 +822,110 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
              + 0.15 * nonZeroRatio
              + 0.30 * entropyScore
              - namePenalty
-             + nameBonus;
+             + nameBonus
+             + classLikeBonus
+             + positionBonus;
+    };
+
+    auto scoreCategoricalQuality = [&](size_t idx) {
+        const auto& col = data.columns()[idx];
+        const auto& values = std::get<std::vector<std::string>>(col.values);
+
+        std::unordered_map<std::string, size_t> counts;
+        counts.reserve(values.size());
+        size_t nonMissing = 0;
+        for (size_t r = 0; r < values.size() && r < col.missing.size(); ++r) {
+            if (col.missing[r]) continue;
+            const std::string token = CommonUtils::trim(values[r]);
+            if (token.empty()) continue;
+            counts[token]++;
+            ++nonMissing;
+        }
+
+        if (nonMissing < 8 || counts.size() < 2) return -1e9;
+
+        const double missingRatio = 1.0 - (static_cast<double>(nonMissing) / static_cast<double>(std::max<size_t>(1, data.rowCount())));
+        const double cardRatio = static_cast<double>(counts.size()) / static_cast<double>(nonMissing);
+        const bool binaryLike = counts.size() == 2;
+        const bool lowCard = counts.size() <= 24 && cardRatio <= 0.20;
+        if (!lowCard && !binaryLike) return -1e9;
+
+        std::string lname = CommonUtils::toLower(col.name);
+        const bool adminName = isAdministrativeColumnName(lname);
+        const bool targetHint = isTargetCandidateColumnName(lname);
+
+        double namePenalty = adminName ? 0.80 : 0.0;
+        if (lname.find("id") != std::string::npos || lname.find("uuid") != std::string::npos || lname.find("index") != std::string::npos) {
+            namePenalty += 0.35;
+        }
+        if (containsToken(lname, {"timestamp", "created", "updated", "time", "date"})) {
+            namePenalty += 0.15;
+        }
+
+        double entropy = 0.0;
+        for (const auto& kv : counts) {
+            const double p = static_cast<double>(kv.second) / static_cast<double>(nonMissing);
+            if (p > 0.0) entropy -= p * std::log2(p);
+        }
+        const double maxEntropy = std::log2(static_cast<double>(std::max<size_t>(2, counts.size())));
+        const double entropyScore = (maxEntropy > 1e-12) ? std::clamp(entropy / maxEntropy, 0.0, 1.0) : 0.0;
+        const double compactnessScore = 1.0 - std::clamp(cardRatio * 2.0, 0.0, 1.0);
+
+        const double positionBonus =
+            (idx + 1 == data.colCount()) ? 0.12 :
+            (idx == 0 ? 0.04 : 0.0);
+        const double classBonus = binaryLike ? 0.24 : (lowCard ? 0.12 : 0.0);
+        const double hintBonus = targetHint ? 0.28 : 0.0;
+
+        return 0.38 * (1.0 - missingRatio)
+             + 0.22 * entropyScore
+             + 0.26 * compactnessScore
+             - namePenalty
+             + classBonus
+             + hintBonus
+             + positionBonus;
+    };
+
+    auto pickBestCategorical = [&]() -> std::optional<std::pair<size_t, double>> {
+        if (categorical.empty()) return std::nullopt;
+        size_t best = static_cast<size_t>(-1);
+        double bestScore = -1e9;
+        for (size_t idx : categorical) {
+            const double s = scoreCategoricalQuality(idx);
+            if (s > bestScore) {
+                bestScore = s;
+                best = idx;
+            }
+        }
+        if (best == static_cast<size_t>(-1) || bestScore <= -1e8) return std::nullopt;
+        return std::make_pair(best, bestScore);
+    };
+
+    if (numeric.empty()) {
+        if (auto cat = pickBestCategorical(); cat.has_value()) {
+            choice.index = static_cast<int>(cat->first);
+            choice.strategyUsed = "categorical_quality_fallback";
+            return choice;
+        }
+        throw Seldon::ConfigurationException("Could not resolve a target column");
+    }
+
+    auto pickClassLikeCandidate = [&]() -> std::optional<size_t> {
+        size_t best = static_cast<size_t>(-1);
+        double bestScore = -1e9;
+        for (size_t idx : numeric) {
+            const auto profile = columnProfile(idx);
+            if (!profile.classLike) continue;
+            if (profile.adminName) continue;
+            if (profile.finiteCount < 8) continue;
+            const double s = scoreColumnQuality(idx) + (profile.targetHint ? 0.20 : 0.0);
+            if (s > bestScore) {
+                bestScore = s;
+                best = idx;
+            }
+        }
+        if (best == static_cast<size_t>(-1)) return std::nullopt;
+        return best;
     };
 
     auto pickBySemanticTargetHint = [&]() -> std::optional<size_t> {
@@ -754,11 +936,18 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
             if (isAdministrativeColumnName(lname)) continue;
             if (isTargetCandidateColumnName(lname)) hinted.push_back(idx);
         }
+        for (size_t idx : categorical) {
+            const std::string lname = CommonUtils::toLower(data.columns()[idx].name);
+            if (isAdministrativeColumnName(lname)) continue;
+            if (isTargetCandidateColumnName(lname)) hinted.push_back(idx);
+        }
         if (hinted.empty()) return std::nullopt;
         size_t best = hinted.front();
         double bestScore = -1e9;
         for (size_t idx : hinted) {
-            const double s = scoreColumnQuality(idx);
+            const double s = (data.columns()[idx].type == ColumnType::NUMERIC)
+                ? scoreColumnQuality(idx)
+                : scoreCategoricalQuality(idx);
             if (s > bestScore) {
                 bestScore = s;
                 best = idx;
@@ -798,16 +987,39 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
 
     std::string mode = CommonUtils::toLower(config.targetStrategy);
     if (mode == "quality") {
-        choice.index = static_cast<int>(pickByQuality());
-        choice.strategyUsed = "quality";
+        const size_t numericBest = pickByQuality();
+        const double numericScore = scoreColumnQuality(numericBest);
+        if (auto cat = pickBestCategorical(); cat.has_value() && cat->second >= numericScore - 0.05) {
+            choice.index = static_cast<int>(cat->first);
+            choice.strategyUsed = "quality_categorical";
+            return choice;
+        }
+        choice.index = static_cast<int>(numericBest);
+        choice.strategyUsed = "quality_numeric";
         return choice;
     }
     if (mode == "max_variance") {
+        if (numeric.empty()) {
+            if (auto cat = pickBestCategorical(); cat.has_value()) {
+                choice.index = static_cast<int>(cat->first);
+                choice.strategyUsed = "max_variance_categorical_fallback";
+                return choice;
+            }
+            throw Seldon::ConfigurationException("target_strategy=max_variance requires numeric target candidates");
+        }
         choice.index = static_cast<int>(pickByVariance());
         choice.strategyUsed = "max_variance";
         return choice;
     }
     if (mode == "last_numeric") {
+        if (numeric.empty()) {
+            if (auto cat = pickBestCategorical(); cat.has_value()) {
+                choice.index = static_cast<int>(cat->first);
+                choice.strategyUsed = "last_numeric_categorical_fallback";
+                return choice;
+            }
+            throw Seldon::ConfigurationException("target_strategy=last_numeric requires numeric target candidates");
+        }
         choice.index = static_cast<int>(pickLastNumeric());
         choice.strategyUsed = "last_numeric";
         return choice;
@@ -819,7 +1031,32 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
         return choice;
     }
 
-    std::vector<size_t> votes = {pickByQuality(), pickByVariance(), pickLastNumeric()};
+    const size_t qualityPick = pickByQuality();
+    if (auto cat = pickBestCategorical(); cat.has_value()) {
+        const double numericScore = scoreColumnQuality(qualityPick);
+        if (cat->second >= numericScore + 0.04) {
+            choice.index = static_cast<int>(cat->first);
+            choice.strategyUsed = "categorical_override";
+            return choice;
+        }
+    }
+    if (auto classLikePick = pickClassLikeCandidate(); classLikePick.has_value()) {
+        const double qualityScore = scoreColumnQuality(qualityPick);
+        const double classLikeScore = scoreColumnQuality(*classLikePick);
+        if (classLikeScore >= qualityScore - 0.10) {
+            choice.index = static_cast<int>(*classLikePick);
+            choice.strategyUsed = "classlike_override";
+            return choice;
+        }
+    }
+
+    std::vector<size_t> votes = {qualityPick, pickByVariance(), pickLastNumeric()};
+    if (auto classLikePick = pickClassLikeCandidate(); classLikePick.has_value()) {
+        votes.push_back(*classLikePick);
+    }
+    if (auto cat = pickBestCategorical(); cat.has_value()) {
+        votes.push_back(cat->first);
+    }
     std::unordered_map<size_t, int> count;
     for (size_t v : votes) count[v]++;
 
@@ -827,7 +1064,9 @@ TargetChoice resolveTargetChoice(const TypedDataset& data, const AutoConfig& con
     int bestVotes = -1;
     double bestScore = -1e9;
     for (const auto& kv : count) {
-        double s = scoreColumnQuality(kv.first);
+        double s = (data.columns()[kv.first].type == ColumnType::NUMERIC)
+            ? scoreColumnQuality(kv.first)
+            : scoreCategoricalQuality(kv.first);
         if (kv.second > bestVotes || (kv.second == bestVotes && s > bestScore)) {
             bestVotes = kv.second;
             bestScore = s;
@@ -869,10 +1108,12 @@ TargetSemantics inferTargetSemanticsRaw(const TypedDataset& ds, int targetIdx) {
 
     const auto& y = std::get<std::vector<double>>(ds.columns()[targetIdx].values);
     std::set<double> uniq;
+    std::vector<double> finite;
+    finite.reserve(y.size());
     for (double v : y) {
         if (!std::isfinite(v)) continue;
+        finite.push_back(v);
         uniq.insert(v);
-        if (uniq.size() > 12) break;
     }
     out.cardinality = uniq.size();
     if (uniq.empty()) return out;
@@ -903,8 +1144,103 @@ TargetSemantics inferTargetSemanticsRaw(const TypedDataset& ds, int targetIdx) {
         return out;
     }
 
+    const size_t finiteCount = finite.size();
+    if (finiteCount > 0) {
+        const double cardinalityRatio = static_cast<double>(out.cardinality) / static_cast<double>(finiteCount);
+        if ((out.cardinality <= 12 && cardinalityRatio <= 0.06) ||
+            (out.cardinality <= 20 && cardinalityRatio <= 0.03)) {
+            out.isOrdinal = true;
+            out.lowLabel = *uniq.begin();
+            out.highLabel = *uniq.rbegin();
+            out.inferredTask = "ordinal_classification";
+            return out;
+        }
+    }
+
     out.inferredTask = "regression";
     return out;
+}
+
+std::optional<double> parseBooleanLikeCategoryValue(const std::string& value) {
+    const std::string token = CommonUtils::toLower(CommonUtils::trim(value));
+    if (token.empty()) return std::nullopt;
+    if (token == "1" || token == "true" || token == "yes" || token == "y" || token == "t" || token == "on") {
+        return 1.0;
+    }
+    if (token == "0" || token == "false" || token == "no" || token == "n" || token == "f" || token == "off") {
+        return 0.0;
+    }
+    return std::nullopt;
+}
+
+size_t encodeCategoricalTargetColumn(TypedDataset& data, int targetIdx) {
+    if (targetIdx < 0 || static_cast<size_t>(targetIdx) >= data.columns().size()) return 0;
+    auto& targetCol = data.columns()[static_cast<size_t>(targetIdx)];
+    if (targetCol.type != ColumnType::CATEGORICAL) return 0;
+
+    const auto& raw = std::get<std::vector<std::string>>(targetCol.values);
+    std::vector<double> encoded(raw.size(), std::numeric_limits<double>::quiet_NaN());
+
+    bool allBooleanLike = true;
+    for (size_t r = 0; r < raw.size() && r < targetCol.missing.size(); ++r) {
+        if (targetCol.missing[r]) continue;
+        if (!parseBooleanLikeCategoryValue(raw[r]).has_value()) {
+            allBooleanLike = false;
+            break;
+        }
+    }
+
+    if (allBooleanLike) {
+        size_t classes = 0;
+        bool seenZero = false;
+        bool seenOne = false;
+        for (size_t r = 0; r < raw.size() && r < targetCol.missing.size(); ++r) {
+            if (targetCol.missing[r]) continue;
+            const auto parsed = parseBooleanLikeCategoryValue(raw[r]);
+            if (!parsed.has_value()) continue;
+            encoded[r] = *parsed;
+            if (*parsed < 0.5) seenZero = true;
+            else seenOne = true;
+        }
+        classes = static_cast<size_t>(seenZero) + static_cast<size_t>(seenOne);
+        targetCol.values = std::move(encoded);
+        targetCol.type = ColumnType::NUMERIC;
+        return classes;
+    }
+
+    std::unordered_map<std::string, size_t> frequency;
+    frequency.reserve(raw.size());
+    for (size_t r = 0; r < raw.size() && r < targetCol.missing.size(); ++r) {
+        if (targetCol.missing[r]) continue;
+        const std::string token = CommonUtils::trim(raw[r]);
+        if (token.empty()) continue;
+        frequency[token]++;
+    }
+
+    std::vector<std::pair<std::string, size_t>> labels(frequency.begin(), frequency.end());
+    std::sort(labels.begin(), labels.end(), [](const auto& a, const auto& b) {
+        if (a.second == b.second) return a.first < b.first;
+        return a.second > b.second;
+    });
+
+    std::unordered_map<std::string, double> labelToValue;
+    labelToValue.reserve(labels.size());
+    for (size_t i = 0; i < labels.size(); ++i) {
+        labelToValue[labels[i].first] = static_cast<double>(i);
+    }
+
+    for (size_t r = 0; r < raw.size() && r < targetCol.missing.size(); ++r) {
+        if (targetCol.missing[r]) continue;
+        const std::string token = CommonUtils::trim(raw[r]);
+        auto it = labelToValue.find(token);
+        if (it != labelToValue.end()) {
+            encoded[r] = it->second;
+        }
+    }
+
+    targetCol.values = std::move(encoded);
+    targetCol.type = ColumnType::NUMERIC;
+    return labels.size();
 }
 
 struct FeatureSelectionResult {
@@ -1631,13 +1967,20 @@ struct TargetContext {
     TargetChoice choice;
     int targetIdx = -1;
     TargetSemantics semantics;
+    bool encodedFromCategorical = false;
+    size_t encodedCardinality = 0;
 };
 
-TargetContext resolveTargetContext(const TypedDataset& data, const AutoConfig& config, AutoConfig& runCfg) {
+TargetContext resolveTargetContext(TypedDataset& data, const AutoConfig& config, AutoConfig& runCfg) {
     TargetContext context;
     context.userProvidedTarget = !config.targetColumn.empty();
     context.choice = resolveTargetChoice(data, config);
     context.targetIdx = context.choice.index;
+    if (context.targetIdx >= 0 && data.columns()[context.targetIdx].type == ColumnType::CATEGORICAL) {
+        context.encodedCardinality = encodeCategoricalTargetColumn(data, context.targetIdx);
+        context.encodedFromCategorical = true;
+        context.choice.strategyUsed += "+categorical_encoded";
+    }
     context.semantics = inferTargetSemanticsRaw(data, context.targetIdx);
     runCfg.targetColumn = data.columns()[context.targetIdx].name;
 
@@ -1647,7 +1990,11 @@ TargetContext resolveTargetContext(const TypedDataset& data, const AutoConfig& c
                   << runCfg.targetColumn
                   << " (strategy=" << context.choice.strategyUsed
                   << ", task=" << context.semantics.inferredTask
-                  << ", cardinality=" << context.semantics.cardinality << ")\n";
+                  << ", cardinality=" << context.semantics.cardinality;
+        if (context.encodedFromCategorical) {
+            std::cout << ", encoded_from=categorical(classes=" << context.encodedCardinality << ")";
+        }
+        std::cout << ")\n";
     }
 
     return context;
@@ -1913,6 +2260,7 @@ void addUnivariateDetailedSection(ReportEngine& report,
                                   const NumericStatsCache& statsCache) {
     std::vector<std::vector<std::string>> summaryRows;
     std::vector<std::vector<std::string>> categoricalRows;
+    std::vector<std::pair<size_t, double>> surpriseRows;
     std::unordered_map<size_t, NumericDetailedStats> summaryCache;
     summaryCache.reserve(data.numericColumnIndices().size());
     summaryRows.reserve(data.colCount());
@@ -1926,11 +2274,54 @@ void addUnivariateDetailedSection(ReportEngine& report,
     };
 
     for (const auto& col : data.columns()) {
-        const size_t missing = prep.missingCounts.count(col.name) ? prep.missingCounts.at(col.name) : 0;
+        const bool adminLike = isAdministrativeColumnName(col.name);
+        const size_t fallbackMissing = static_cast<size_t>(std::count(col.missing.begin(), col.missing.end(), static_cast<uint8_t>(1)));
+        const size_t missing = prep.missingCounts.count(col.name) ? prep.missingCounts.at(col.name) : fallbackMissing;
         const size_t outliers = prep.outlierCounts.count(col.name) ? prep.outlierCounts.at(col.name) : 0;
 
         if (col.type == ColumnType::NUMERIC) {
             const auto& vals = std::get<std::vector<double>>(col.values);
+            if (adminLike) {
+                std::unordered_set<long long> uniq;
+                uniq.reserve(vals.size());
+                for (double v : vals) {
+                    if (!std::isfinite(v)) continue;
+                    uniq.insert(static_cast<long long>(std::llround(v * 1e6)));
+                }
+                summaryRows.push_back({
+                    col.name,
+                    "metadata",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    std::to_string(uniq.size()),
+                    std::to_string(missing),
+                    "-"
+                });
+                logVerbose("[Seldon][Univariate] Metadata " + col.name
+                           + " | unique=" + std::to_string(uniq.size())
+                           + " missing=" + std::to_string(missing));
+                continue;
+            }
+
             int idx = data.findColumnIndex(col.name);
             const auto it = (idx >= 0) ? statsCache.find(static_cast<size_t>(idx)) : statsCache.end();
             const ColumnStats* precomputed = (it != statsCache.end()) ? &it->second : nullptr;
@@ -1976,6 +2367,15 @@ void addUnivariateDetailedSection(ReportEngine& report,
                 std::to_string(missing),
                 std::to_string(outliers)
             });
+
+            const double outlierRate = vals.empty() ? 0.0 : (static_cast<double>(outliers) / static_cast<double>(vals.size()));
+            const double surprise =
+                0.45 * std::abs(st.skewness) +
+                0.25 * std::log1p(std::abs(st.kurtosis)) +
+                0.20 * std::log1p(std::abs(st.stddev)) +
+                0.10 * (10.0 * outlierRate);
+            surpriseRows.push_back({summaryRows.size() - 1, surprise});
+
             logVerbose("[Seldon][Univariate] Numeric " + col.name
                        + " | n=" + std::to_string(vals.size())
                        + " mean=" + toFixed(st.mean)
@@ -2075,16 +2475,63 @@ void addUnivariateDetailedSection(ReportEngine& report,
         }
     }
 
-    report.addTable("Column Statistical Super-Summary", {
+    const std::vector<std::string> summaryHeaders = {
         "Column", "Type", "Mean", "GeoMean", "HarmonicMean", "TrimmedMean", "Mode", "Median", "Min", "Max", "Range", "Q1", "Q3", "IQR",
         "P05", "P95", "MAD", "Variance", "StdDev", "Skew", "Kurtosis", "CoeffVar", "Sum", "NonZero/Unique", "Missing", "Outliers"
-    }, summaryRows);
+    };
+
+    if (summaryRows.size() > 16 && !surpriseRows.empty()) {
+        std::sort(surpriseRows.begin(), surpriseRows.end(), [](const auto& a, const auto& b) {
+            if (a.second == b.second) return a.first < b.first;
+            return a.second > b.second;
+        });
+
+        const size_t topK = std::min<size_t>(10, std::max<size_t>(6, static_cast<size_t>(std::sqrt(static_cast<double>(summaryRows.size())))));
+        std::unordered_set<size_t> keep;
+        keep.reserve(topK * 2);
+        for (size_t i = 0; i < std::min(topK, surpriseRows.size()); ++i) keep.insert(surpriseRows[i].first);
+
+        std::vector<std::vector<std::string>> topRows;
+        std::vector<std::vector<std::string>> restRows;
+        for (size_t i = 0; i < summaryRows.size(); ++i) {
+            if (keep.count(i)) topRows.push_back(summaryRows[i]);
+            else restRows.push_back(summaryRows[i]);
+        }
+
+        report.addTable("Column Statistical Super-Summary (Top Surprising)", summaryHeaders, topRows);
+
+        size_t restNumeric = 0;
+        size_t restCategorical = 0;
+        size_t restDatetime = 0;
+        size_t restMetadata = 0;
+        for (const auto& row : restRows) {
+            if (row.size() < 2) continue;
+            const std::string t = row[1];
+            if (t == "numeric") ++restNumeric;
+            else if (t == "categorical") ++restCategorical;
+            else if (t == "datetime") ++restDatetime;
+            else if (t == "metadata") ++restMetadata;
+        }
+        report.addTable("General Population Summary", {"Metric", "Value"}, {
+            {"Columns outside Top set", std::to_string(restRows.size())},
+            {"Numeric (outside Top)", std::to_string(restNumeric)},
+            {"Categorical (outside Top)", std::to_string(restCategorical)},
+            {"Datetime (outside Top)", std::to_string(restDatetime)},
+            {"Metadata/Admin (outside Top)", std::to_string(restMetadata)}
+        });
+    } else {
+        report.addTable("Column Statistical Super-Summary", summaryHeaders, summaryRows);
+    }
 
     std::vector<std::vector<std::string>> qualityRows;
+    std::vector<std::vector<std::string>> metadataRows;
     for (const auto& col : data.columns()) {
-        const size_t missing = prep.missingCounts.count(col.name) ? prep.missingCounts.at(col.name) : 0;
+        const size_t fallbackMissing = static_cast<size_t>(std::count(col.missing.begin(), col.missing.end(), static_cast<uint8_t>(1)));
+        const size_t missing = prep.missingCounts.count(col.name) ? prep.missingCounts.at(col.name) : fallbackMissing;
         const size_t outliers = prep.outlierCounts.count(col.name) ? prep.outlierCounts.at(col.name) : 0;
-        const std::string type = (col.type == ColumnType::NUMERIC) ? "numeric" : (col.type == ColumnType::CATEGORICAL ? "categorical" : "datetime");
+        const bool adminLike = isAdministrativeColumnName(col.name);
+        const std::string baseType = (col.type == ColumnType::NUMERIC) ? "numeric" : (col.type == ColumnType::CATEGORICAL ? "categorical" : "datetime");
+        const std::string type = adminLike ? "metadata" : baseType;
         size_t unique = 0;
         if (col.type == ColumnType::NUMERIC) {
             const auto& v = std::get<std::vector<double>>(col.values);
@@ -2100,9 +2547,16 @@ void addUnivariateDetailedSection(ReportEngine& report,
             std::unordered_set<int64_t> s(v.begin(), v.end());
             unique = s.size();
         }
-        qualityRows.push_back({col.name, type, std::to_string(unique), std::to_string(missing), std::to_string(outliers)});
+        qualityRows.push_back({col.name, type, std::to_string(unique), std::to_string(missing), adminLike ? "-" : std::to_string(outliers)});
+        if (adminLike) {
+            metadataRows.push_back({col.name, baseType, std::to_string(unique), std::to_string(missing), "admin-pattern"});
+        }
     }
     report.addTable("Data Quality Report", {"Column", "Type", "Unique", "Missing", "Outliers"}, qualityRows);
+
+    if (!metadataRows.empty()) {
+        report.addTable("Metadata / Integrity Columns", {"Column", "Original Type", "Unique", "Missing", "Tag"}, metadataRows);
+    }
 
     if (!categoricalRows.empty()) {
         report.addTable("Categorical Top Frequencies", {"Column", "Category", "Count", "Share"}, categoricalRows);
@@ -3696,6 +4150,12 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                 p.relationLabel = nearIdentity ? "Near-identical signal" : "Monotonic transform proxy";
             }
 
+            if (!p.filteredAsRedundant && isEngineeredLineagePair(p.featureA, p.featureB) && std::abs(p.r) >= 0.98) {
+                p.filteredAsRedundant = true;
+                p.relationLabel = "Engineered lineage duplicate";
+                p.redundancyGroup = canonicalEngineeredBaseName(p.featureA);
+            }
+
             const size_t repA = representativeByFeature.count(ia) ? representativeByFeature.at(ia) : ia;
             const size_t repB = representativeByFeature.count(ib) ? representativeByFeature.at(ib) : ib;
             if (repA == repB) {
@@ -4462,9 +4922,12 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
                     const double beta = diag.coefficients[3];
                     const std::string effectDir = beta >= 0.0 ? "synergistic" : "antagonistic";
                     const std::string strength = (pVal < 1e-4) ? "very strong" : ((pVal < 0.01) ? "strong" : ((pVal < 0.05) ? "moderate" : "weak"));
+                    const std::string implication = (strength == "weak")
+                        ? ("indicating a tentative " + effectDir + " interaction pattern")
+                        : ("indicating a " + effectDir + " joint effect");
                     interactionMsg = data.columns()[igA].name + "×" + data.columns()[igB].name +
                         " interaction is " + strength + " (t=" + toFixed(tVal, 4) + ", p=" + toFixed(pVal, 6) +
-                        "), indicating a " + effectDir + " joint effect on " + data.columns()[static_cast<size_t>(targetIdx)].name + ".";
+                        "), " + implication + " on " + data.columns()[static_cast<size_t>(targetIdx)].name + ".";
                     out.interactionEvidence = interactionMsg;
                     out.priorityTakeaways.push_back(interactionMsg);
                 }
@@ -5421,6 +5884,7 @@ void addOverallSections(ReportEngine& report,
         {
             std::vector<std::vector<std::string>> bootRows;
             for (size_t idx : data.numericColumnIndices()) {
+                if (isAdministrativeColumnName(data.columns()[idx].name)) continue;
                 const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
                 if (vals.size() < 20) continue;
                 auto [lo, hi] = bootstrapCI(vals,
@@ -5446,7 +5910,12 @@ void addOverallSections(ReportEngine& report,
                 bootRows.push_back({"benchmark_rmse", toFixed(mu, 6), toFixed(lo, 6), toFixed(hi, 6)});
             }
 
-            const auto nums = data.numericColumnIndices();
+            std::vector<size_t> nums;
+            nums.reserve(data.numericColumnIndices().size());
+            for (size_t idx : data.numericColumnIndices()) {
+                if (isAdministrativeColumnName(data.columns()[idx].name)) continue;
+                nums.push_back(idx);
+            }
             if (nums.size() >= 2) {
                 const auto& x = std::get<std::vector<double>>(data.columns()[nums[0]].values);
                 const auto& y = std::get<std::vector<double>>(data.columns()[nums[1]].values);
@@ -5720,6 +6189,52 @@ std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset
         statsByName[col.name] = Statistics::calculateStats(std::get<std::vector<double>>(col.values));
     }
 
+    std::string segmentColumnName;
+    std::vector<std::string> segmentByRow(data.rowCount());
+    std::unordered_map<std::string, std::unordered_map<std::string, ColumnStats>> conditionalStats;
+    {
+        const auto cats = data.categoricalColumnIndices();
+        for (size_t cidx : cats) {
+            const auto& ccol = data.columns()[cidx];
+            const auto& vals = std::get<std::vector<std::string>>(ccol.values);
+            std::unordered_map<std::string, size_t> freq;
+            for (size_t r = 0; r < vals.size() && r < ccol.missing.size(); ++r) {
+                if (ccol.missing[r]) continue;
+                const std::string key = CommonUtils::trim(vals[r]);
+                if (!key.empty()) freq[key]++;
+            }
+            if (freq.size() < 2 || freq.size() > 8) continue;
+
+            size_t minGroup = std::numeric_limits<size_t>::max();
+            for (const auto& kv : freq) minGroup = std::min(minGroup, kv.second);
+            if (minGroup < 12) continue;
+
+            segmentColumnName = ccol.name;
+            for (size_t r = 0; r < data.rowCount() && r < vals.size() && r < ccol.missing.size(); ++r) {
+                if (ccol.missing[r]) continue;
+                segmentByRow[r] = CommonUtils::trim(vals[r]);
+            }
+            break;
+        }
+
+        if (!segmentColumnName.empty()) {
+            for (size_t idx : numericIdx) {
+                const auto& col = data.columns()[idx];
+                const auto& vals = std::get<std::vector<double>>(col.values);
+                std::unordered_map<std::string, std::vector<double>> byGroup;
+                for (size_t r = 0; r < data.rowCount() && r < vals.size() && r < col.missing.size(); ++r) {
+                    if (col.missing[r] || !std::isfinite(vals[r])) continue;
+                    if (segmentByRow[r].empty()) continue;
+                    byGroup[segmentByRow[r]].push_back(vals[r]);
+                }
+                for (auto& kv : byGroup) {
+                    if (kv.second.size() < 12) continue;
+                    conditionalStats[col.name][kv.first] = Statistics::calculateStats(kv.second);
+                }
+            }
+        }
+    }
+
     for (size_t row = 0; row < data.rowCount() && rows.size() < maxRows; ++row) {
         const size_t rowId = row + 1;
         const auto mit = mahalByRow.find(rowId);
@@ -5730,6 +6245,7 @@ std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset
 
         for (size_t idx : numericIdx) {
             const auto& col = data.columns()[idx];
+            if (isAdministrativeColumnName(col.name)) continue;
             auto fit = prep.outlierFlags.find(col.name);
             if (fit == prep.outlierFlags.end()) continue;
             if (row >= fit->second.size()) continue;
@@ -5740,7 +6256,22 @@ std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset
             if (row >= vals.size() || !std::isfinite(vals[row])) continue;
             const auto sit = statsByName.find(col.name);
             if (sit == statsByName.end()) continue;
-            const double z = (sit->second.stddev > 1e-12) ? std::abs((vals[row] - sit->second.mean) / sit->second.stddev) : 0.0;
+
+            double z = 0.0;
+            bool usedConditional = false;
+            if (!segmentColumnName.empty() && row < segmentByRow.size() && !segmentByRow[row].empty()) {
+                auto cit = conditionalStats.find(col.name);
+                if (cit != conditionalStats.end()) {
+                    auto git = cit->second.find(segmentByRow[row]);
+                    if (git != cit->second.end() && git->second.stddev > 1e-12) {
+                        z = std::abs((vals[row] - git->second.mean) / git->second.stddev);
+                        usedConditional = true;
+                    }
+                }
+            }
+            if (!usedConditional) {
+                z = (sit->second.stddev > 1e-12) ? std::abs((vals[row] - sit->second.mean) / sit->second.stddev) : 0.0;
+            }
             if (!hasOutlier || z > primaryAbsZ) {
                 hasOutlier = true;
                 primaryAbsZ = z;
@@ -5753,6 +6284,7 @@ std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset
         if (primaryCol == static_cast<size_t>(-1)) {
             for (size_t idx : numericIdx) {
                 const auto& col = data.columns()[idx];
+                if (isAdministrativeColumnName(col.name)) continue;
                 if (row >= col.missing.size() || col.missing[row]) continue;
                 const auto& vals = std::get<std::vector<double>>(col.values);
                 if (row >= vals.size() || !std::isfinite(vals[row])) continue;
@@ -5773,12 +6305,28 @@ std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset
         for (size_t idx : numericIdx) {
             if (idx == primaryCol) continue;
             const auto& col = data.columns()[idx];
+            if (isAdministrativeColumnName(col.name)) continue;
             if (row >= col.missing.size() || col.missing[row]) continue;
             const auto& vals = std::get<std::vector<double>>(col.values);
             if (row >= vals.size() || !std::isfinite(vals[row])) continue;
             const auto sit = statsByName.find(col.name);
             if (sit == statsByName.end() || sit->second.stddev <= 1e-12) continue;
-            const double z = (vals[row] - sit->second.mean) / sit->second.stddev;
+
+            double z = 0.0;
+            bool usedConditional = false;
+            if (!segmentColumnName.empty() && row < segmentByRow.size() && !segmentByRow[row].empty()) {
+                auto cit = conditionalStats.find(col.name);
+                if (cit != conditionalStats.end()) {
+                    auto git = cit->second.find(segmentByRow[row]);
+                    if (git != cit->second.end() && git->second.stddev > 1e-12) {
+                        z = (vals[row] - git->second.mean) / git->second.stddev;
+                        usedConditional = true;
+                    }
+                }
+            }
+            if (!usedConditional) {
+                z = (vals[row] - sit->second.mean) / sit->second.stddev;
+            }
             if (std::abs(z) >= 1.5) context.push_back({col.name, z});
         }
         std::sort(context.begin(), context.end(), [](const auto& a, const auto& b) {
@@ -5801,6 +6349,13 @@ std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset
                 reason += ", threshold=" + toFixed(mahalThreshold, 3);
             }
             reason += ")";
+            if (primaryAbsZ < 2.5) {
+                reason += "; univariate z is moderate, but combined multivariate profile is unusual";
+            }
+        }
+        if (!segmentColumnName.empty() && row < segmentByRow.size() && !segmentByRow[row].empty()) {
+            if (!reason.empty()) reason += "; ";
+            reason += "within " + segmentColumnName + "=" + segmentByRow[row];
         }
 
         rows.push_back({
@@ -5919,6 +6474,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         throw Seldon::DatasetException("All columns were removed by pre-flight missingness cull (>95% missing)");
     }
     const size_t rawColumnsAfterPreflight = data.colCount();
+    const TypedDataset reportingData = data;
     const TargetContext targetContext = resolveTargetContext(data, config, runCfg);
     const int targetIdx = targetContext.targetIdx;
     applyDynamicPlotDefaultsIfUnset(runCfg, data);
@@ -5938,6 +6494,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     exportPreprocessedDatasetIfRequested(data, runCfg);
     normalizeBinaryTarget(data, targetIdx, targetContext.semantics);
     const NumericStatsCache statsCache = buildNumericStatsCache(data);
+    const NumericStatsCache rawStatsCache = buildNumericStatsCache(reportingData);
     advance("Prepared stats cache");
 
     if (runCfg.verboseAnalysis) {
@@ -5947,9 +6504,12 @@ int AutomationPipeline::run(const AutoConfig& config) {
     ReportEngine univariate;
     univariate.addTitle("Univariate Analysis");
     univariate.addParagraph("Dataset: " + runCfg.datasetPath);
+    univariate.addParagraph("Bi-temporal mode: raw-state statistics are reported in original units; transformed-state features are used for neural modeling and ranking.");
     const size_t totalAnalysisDimensions = data.colCount();
     const size_t engineeredFeatureCount =
         (totalAnalysisDimensions >= rawColumnsAfterPreflight) ? (totalAnalysisDimensions - rawColumnsAfterPreflight) : 0;
+    const bool strictFeatureReporting = engineeredFeatureCount >= std::max<size_t>(8, rawColumnsAfterPreflight / 3);
+    const size_t reportedAnalysisDimensions = strictFeatureReporting ? rawColumnsAfterPreflight : totalAnalysisDimensions;
     univariate.addParagraph("Dataset Stats:");
     univariate.addParagraph("Rows: " + std::to_string(data.rowCount()));
     univariate.addParagraph("Raw Columns (loaded): " + std::to_string(loadedColumnCount));
@@ -5958,8 +6518,29 @@ int AutomationPipeline::run(const AutoConfig& config) {
         univariate.addParagraph("Pre-flight cull removed " + std::to_string(preflightCull.dropped) + " sparse columns (>" + toFixed(100.0 * preflightCull.threshold, 1) + "% missing) before univariate profiling.");
     }
     univariate.addParagraph("Engineered Features: " + std::to_string(engineeredFeatureCount));
-    univariate.addParagraph("Total Analysis Dimensions: " + std::to_string(totalAnalysisDimensions));
-    addUnivariateDetailedSection(univariate, data, prep, runCfg.verboseAnalysis, statsCache);
+    univariate.addParagraph("Total Analysis Dimensions: " + std::to_string(reportedAnalysisDimensions));
+    if (strictFeatureReporting) {
+        univariate.addParagraph("Strict feature-reporting mode enabled: engineered features are summarized, not expanded into full univariate/bivariate tables.");
+        std::unordered_set<std::string> engineeredFamilies;
+        std::vector<std::vector<std::string>> engineeredRows;
+        for (const auto& col : data.columns()) {
+            if (!isEngineeredFeatureName(col.name)) continue;
+            const std::string base = canonicalEngineeredBaseName(col.name);
+            if (!base.empty()) engineeredFamilies.insert(base);
+            if (engineeredRows.size() < 12) {
+                engineeredRows.push_back({col.name, base.empty() ? "-" : base});
+            }
+        }
+        univariate.addTable("Feature Engineering Insights", {"Metric", "Value"}, {
+            {"Engineered Features (suppressed from full tables)", std::to_string(engineeredFeatureCount)},
+            {"Engineered Feature Families", std::to_string(engineeredFamilies.size())},
+            {"Reporting Policy", "collapsed (strict mode)"}
+        });
+        if (!engineeredRows.empty()) {
+            univariate.addTable("Feature Engineering Sample", {"Engineered Feature", "Base Feature"}, engineeredRows);
+        }
+    }
+    addUnivariateDetailedSection(univariate, reportingData, prep, runCfg.verboseAnalysis, rawStatsCache);
     advance("Built univariate tables");
 
     GnuplotEngine plotterBivariate(plotSubdir(runCfg, "bivariate"), runCfg.plot);
@@ -6091,7 +6672,15 @@ int AutomationPipeline::run(const AutoConfig& config) {
     const size_t compactRejectedCap = 256;
     size_t compactRejectedCount = 0;
     size_t statSigCount = 0;
+    size_t strictSuppressedPairs = 0;
+    size_t strictSuppressedSelected = 0;
     for (const auto& p : bivariatePairs) {
+        const bool engineeredPair = isEngineeredFeatureName(p.featureA) || isEngineeredFeatureName(p.featureB);
+        if (strictFeatureReporting && engineeredPair) {
+            ++strictSuppressedPairs;
+            if (p.selected) ++strictSuppressedSelected;
+            continue;
+        }
         if (p.statSignificant) statSigCount++;
         if (!compactBivariateRows || p.selected || compactRejectedCount < compactRejectedCap) {
             allRows.push_back({
@@ -6286,6 +6875,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
     const size_t structuralPairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.filteredAsStructural; }));
     const size_t leakagePairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.leakageRisk; }));
     bivariate.addParagraph("Information-theoretic filtering: redundant=" + std::to_string(redundantPairs) + ", structural=" + std::to_string(structuralPairs) + ", leakage-risk=" + std::to_string(leakagePairs) + ".");
+    if (strictFeatureReporting) {
+        bivariate.addParagraph("Strict feature-reporting mode: suppressed " + std::to_string(strictSuppressedPairs) + " engineered-feature pairs (" + std::to_string(strictSuppressedSelected) + " were otherwise selected). See Univariate 'Feature Engineering Insights'.");
+    }
     if (compactBivariateRows) {
         bivariate.addParagraph("Low-memory mode: omitted full pair table and kept only selected + capped rejected samples for diagnostics.");
     } else {
@@ -6545,7 +7137,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         finalAnalysis.addTable("Narrative Insight Layer", {"#", "Insight"}, rows);
     }
 
-    const auto outlierContextRows = buildOutlierContextRows(data,
+    const auto outlierContextRows = buildOutlierContextRows(reportingData,
                                                             prep,
                                                             advancedOutputs.mahalanobisByRow,
                                                             advancedOutputs.mahalanobisThreshold);
@@ -6593,9 +7185,21 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     std::vector<std::vector<std::string>> topFeatures;
     std::vector<std::pair<std::string, double>> fiPairs;
+    std::unordered_map<std::string, size_t> deterministicFeatureHits;
+    for (const auto& pair : bivariatePairs) {
+        const bool deterministicRelation = (std::abs(pair.r) >= 0.999) || pair.filteredAsStructural;
+        if (!deterministicRelation) continue;
+        deterministicFeatureHits[pair.featureA]++;
+        deterministicFeatureHits[pair.featureB]++;
+    }
     for (size_t i = 0; i < featureIdx.size(); ++i) {
         const std::string name = data.columns()[featureIdx[i]].name;
         double imp = (i < neural.featureImportance.size()) ? neural.featureImportance[i] : 0.0;
+        auto hitIt = deterministicFeatureHits.find(name);
+        if (hitIt != deterministicFeatureHits.end() && hitIt->second > 0) {
+            const double penalty = std::max(0.35, std::pow(0.82, static_cast<double>(hitIt->second)));
+            imp *= penalty;
+        }
         fiPairs.push_back({name, imp});
     }
     std::sort(fiPairs.begin(), fiPairs.end(), [](const auto& a, const auto& b) { return a.second > b.second; });

@@ -544,6 +544,54 @@ bool containsMetadataKeyword(const std::string& token) {
            t.find("aggregate") != std::string::npos ||
            t.find("stop:") != std::string::npos;
 }
+
+bool containsWordToken(const std::string& text, const std::string& token) {
+    if (text.empty() || token.empty()) return false;
+    const std::string lowerText = CommonUtils::toLower(text);
+    const std::string lowerToken = CommonUtils::toLower(token);
+
+    size_t pos = lowerText.find(lowerToken);
+    while (pos != std::string::npos) {
+        const bool leftOk = (pos == 0) || !std::isalnum(static_cast<unsigned char>(lowerText[pos - 1]));
+        const size_t endPos = pos + lowerToken.size();
+        const bool rightOk = (endPos >= lowerText.size()) || !std::isalnum(static_cast<unsigned char>(lowerText[endPos]));
+        if (leftOk && rightOk) return true;
+        pos = lowerText.find(lowerToken, pos + 1);
+    }
+    return false;
+}
+
+bool isLikelyDatetimeHeader(const std::string& headerName) {
+    const std::string lower = CommonUtils::toLower(CommonUtils::trim(headerName));
+    if (lower.empty()) return false;
+
+    const bool hasDateToken =
+        containsWordToken(lower, "date") ||
+        containsWordToken(lower, "datetime") ||
+        containsWordToken(lower, "timestamp") ||
+        containsWordToken(lower, "created_at") ||
+        containsWordToken(lower, "updated_at") ||
+        containsWordToken(lower, "event_time") ||
+        containsWordToken(lower, "time");
+
+    if (!hasDateToken) return false;
+
+    const bool durationLike =
+        containsWordToken(lower, "runtime") ||
+        containsWordToken(lower, "duration") ||
+        containsWordToken(lower, "latency") ||
+        containsWordToken(lower, "uptime") ||
+        containsWordToken(lower, "minutes") ||
+        containsWordToken(lower, "minute") ||
+        containsWordToken(lower, "seconds") ||
+        containsWordToken(lower, "second") ||
+        containsWordToken(lower, "hours") ||
+        containsWordToken(lower, "hour") ||
+        containsWordToken(lower, "ms") ||
+        containsWordToken(lower, "millisecond");
+
+    return !durationLike;
+}
 }
 
 bool TypedDataset::parseDouble(const std::string& v, double& out) const {
@@ -667,10 +715,7 @@ void TypedDataset::load() {
     dateLikeHeaderIndices.reserve(header.size());
     std::vector<uint8_t> dateLikeHeaderMask(header.size(), static_cast<uint8_t>(0));
     for (size_t c = 0; c < header.size(); ++c) {
-        const std::string lower = CommonUtils::toLower(header[c]);
-        if (lower.find("date") != std::string::npos ||
-            lower.find("time") != std::string::npos ||
-            lower.find("timestamp") != std::string::npos) {
+        if (isLikelyDatetimeHeader(header[c])) {
             dateLikeHeaderIndices.push_back(c);
             dateLikeHeaderMask[c] = static_cast<uint8_t>(1);
         }
@@ -694,7 +739,7 @@ void TypedDataset::load() {
             const bool isTime = parseDateTime(t, tv);
 
             int score = 0;
-            const bool expectsTime = h.find("date") != std::string::npos || h.find("time") != std::string::npos || h.find("timestamp") != std::string::npos;
+            const bool expectsTime = isLikelyDatetimeHeader(h);
             const bool expectsNumeric = h.find("amount") != std::string::npos ||
                                         h.find("price") != std::string::npos ||
                                         h.find("cost") != std::string::npos ||
