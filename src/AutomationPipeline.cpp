@@ -1905,25 +1905,31 @@ void cleanupPlotCacheArtifacts(const AutoConfig& config) {
     std::error_code ec;
     if (config.assetsDir.empty()) return;
 
-    const std::vector<std::string> candidateDirs = {
-        config.assetsDir,
-        plotSubdir(config, "univariate"),
-        plotSubdir(config, "bivariate"),
-        plotSubdir(config, "overall")
-    };
+    const fs::path root(config.assetsDir);
+    if (!fs::exists(root, ec)) return;
 
-    for (const auto& dir : candidateDirs) {
-        const fs::path cacheDir = fs::path(dir) / ".plot_cache";
-        if (!fs::exists(cacheDir, ec)) continue;
+    std::vector<fs::path> cacheDirs;
+    cacheDirs.reserve(8);
+    const fs::path directCache = root / ".plot_cache";
+    if (fs::exists(directCache, ec)) {
+        cacheDirs.push_back(directCache);
+    }
 
-        for (const auto& entry : fs::directory_iterator(cacheDir, ec)) {
-            if (ec) break;
-            if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() == ".hash") {
-                fs::remove(entry.path(), ec);
-            }
+    for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_directory()) continue;
+        if (it->path().filename() == ".plot_cache") {
+            cacheDirs.push_back(it->path());
         }
-        fs::remove(cacheDir, ec);
+    }
+
+    std::sort(cacheDirs.begin(), cacheDirs.end());
+    cacheDirs.erase(std::unique(cacheDirs.begin(), cacheDirs.end()), cacheDirs.end());
+    std::sort(cacheDirs.begin(), cacheDirs.end(), [](const fs::path& a, const fs::path& b) {
+        return a.string().size() > b.string().size();
+    });
+
+    for (const auto& cacheDir : cacheDirs) {
+        fs::remove_all(cacheDir, ec);
     }
 }
 
@@ -2223,6 +2229,7 @@ void printPipelineCompletion(const AutoConfig& runCfg) {
               << plotSubdir(runCfg, "univariate") << ", "
               << plotSubdir(runCfg, "bivariate") << ", "
               << plotSubdir(runCfg, "overall") << "\n";
+    std::cout << "Seldon had great fun analysing the data you gave.\n";
 }
 
 void exportPreprocessedDatasetIfRequested(const TypedDataset& data, const AutoConfig& runCfg) {
