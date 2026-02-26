@@ -4923,11 +4923,11 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
                     const std::string effectDir = beta >= 0.0 ? "synergistic" : "antagonistic";
                     const std::string strength = (pVal < 1e-4) ? "very strong" : ((pVal < 0.01) ? "strong" : ((pVal < 0.05) ? "moderate" : "weak"));
                     const std::string implication = (strength == "weak")
-                        ? ("indicating a tentative " + effectDir + " interaction pattern")
-                        : ("indicating a " + effectDir + " joint effect");
+                        ? ("suggesting a tentative " + effectDir + " interaction pattern")
+                        : ("showing a " + effectDir + " interaction direction");
                     interactionMsg = data.columns()[igA].name + "×" + data.columns()[igB].name +
                         " interaction is " + strength + " (t=" + toFixed(tVal, 4) + ", p=" + toFixed(pVal, 6) +
-                        "), " + implication + " on " + data.columns()[static_cast<size_t>(targetIdx)].name + ".";
+                        "); " + implication + " for " + data.columns()[static_cast<size_t>(targetIdx)].name + ".";
                     out.interactionEvidence = interactionMsg;
                     out.priorityTakeaways.push_back(interactionMsg);
                 }
@@ -6333,29 +6333,40 @@ std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset
             return std::abs(a.second) > std::abs(b.second);
         });
 
-        std::string reason = "No dominant secondary deviations.";
+        std::vector<std::string> reasonParts;
         if (!context.empty()) {
-            reason = "Context: ";
+            std::string local = "Context";
+            local += ": ";
             const size_t keep = std::min<size_t>(2, context.size());
             for (size_t i = 0; i < keep; ++i) {
-                if (i > 0) reason += "; ";
-                reason += context[i].first + "=" + (context[i].second > 0.0 ? "high" : "low") + " (z=" + toFixed(context[i].second, 2) + ")";
+                if (i > 0) local += "; ";
+                local += context[i].first + "=" + (context[i].second > 0.0 ? "high" : "low") + " (z=" + toFixed(context[i].second, 2) + ")";
             }
+            reasonParts.push_back(local);
         }
         if (hasMahalanobis) {
-            if (!reason.empty()) reason += "; ";
-            reason += "Mahalanobis multivariate distance is elevated (d2=" + toFixed(mit->second, 3);
+            std::string mahal = "Mahalanobis multivariate distance is elevated (d2=" + toFixed(mit->second, 3);
             if (mahalThreshold > 0.0) {
-                reason += ", threshold=" + toFixed(mahalThreshold, 3);
+                mahal += ", threshold=" + toFixed(mahalThreshold, 3);
             }
-            reason += ")";
+            mahal += ")";
             if (primaryAbsZ < 2.5) {
-                reason += "; univariate z is moderate, but combined multivariate profile is unusual";
+                mahal += "; univariate z is moderate, but combined multivariate profile is unusual";
             }
+            reasonParts.push_back(mahal);
         }
         if (!segmentColumnName.empty() && row < segmentByRow.size() && !segmentByRow[row].empty()) {
-            if (!reason.empty()) reason += "; ";
-            reason += "within " + segmentColumnName + "=" + segmentByRow[row];
+            reasonParts.push_back("within " + segmentColumnName + "=" + segmentByRow[row]);
+        }
+
+        std::string reason;
+        if (reasonParts.empty()) {
+            reason = "No dominant secondary deviations.";
+        } else {
+            reason = reasonParts.front();
+            for (size_t i = 1; i < reasonParts.size(); ++i) {
+                reason += "; " + reasonParts[i];
+            }
         }
 
         rows.push_back({
@@ -6671,6 +6682,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     std::vector<std::vector<std::string>> allRows;
     std::vector<std::vector<std::string>> sigRows;
+    std::vector<std::vector<std::string>> structuralRows;
     const bool compactBivariateRows = runCfg.lowMemoryMode;
     const size_t compactRejectedCap = 256;
     size_t compactRejectedCount = 0;
@@ -6685,6 +6697,20 @@ int AutomationPipeline::run(const AutoConfig& config) {
             continue;
         }
         if (p.statSignificant) statSigCount++;
+        const bool deterministicPair = std::abs(p.r) >= 0.999;
+        if (p.filteredAsStructural || deterministicPair) {
+            structuralRows.push_back({
+                p.featureA,
+                p.featureB,
+                toFixed(p.r),
+                toFixed(p.pValue, 6),
+                p.filteredAsStructural ? "yes" : "no",
+                deterministicPair ? "yes" : "no",
+                p.relationLabel.empty() ? "-" : p.relationLabel,
+                p.selectionReason.empty() ? "-" : p.selectionReason
+            });
+            continue;
+        }
         if (!compactBivariateRows || p.selected || compactRejectedCount < compactRejectedCap) {
             allRows.push_back({
                 p.featureA,
@@ -6887,6 +6913,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
         bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "significance_tier", "selection_reason", "selected", "redundant", "structural", "leakage_risk", "cluster_rep", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, allRows);
     }
     bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "significance_tier", "selection_reason", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
+    if (!structuralRows.empty()) {
+        bivariate.addTable("Structural/Deterministic Pair Diagnostics", {"Feature A", "Feature B", "pearson_r", "p_value", "structural", "deterministic", "relation_label", "selection_reason"}, structuralRows);
+    }
 
     const auto contingency = analyzeContingencyPairs(data);
     if (!contingency.empty()) {
@@ -6996,6 +7025,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Hidden Activation", neural.hiddenActivation},
         {"Output Activation", neural.outputActivation}
     });
+    if (targetContext.semantics.inferredTask == "ordinal_classification" && neural.lossName == "mse") {
+        neuralReport.addParagraph("Ordinal target detected with MSE loss: this is intentional in the current engine because ordered class encodings preserve rank distance, so MSE penalizes larger ordinal mis-ranks more strongly.");
+    }
 
     if (!neural.uncertaintyStd.empty()) {
         std::vector<std::vector<std::string>> uncertaintyRows;
@@ -7214,7 +7246,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     finalAnalysis.addTable("Executive Statistics", {"Metric", "Value"}, {
         {"Rows", std::to_string(data.rowCount())},
         {"Columns", std::to_string(data.colCount())},
-        {"Pairs Evaluated", std::to_string(allRows.size())},
+        {"Pairs Evaluated", std::to_string(bivariatePairs.size())},
         {"Pairs Statistically Significant", std::to_string(statSigCount)},
         {"Pairs Selected", std::to_string(sigRows.size())},
         {"Training Epochs Executed", std::to_string(neural.trainLoss.size())},

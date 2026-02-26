@@ -380,7 +380,7 @@ Outcome runAllPhases(const TypedDataset& data,
                                       formatDouble(out.rowsToFeatures, 2) +
                                       " (<10); shallow network topology enforced.");
     } else if (out.highRatioMode) {
-        out.badgeNarratives.push_back("Capacity Mode: Rows:Features=" +
+        out.badgeNarratives.push_back("High-capacity mode: Rows:Features=" +
                                       formatDouble(out.rowsToFeatures, 2) +
                                       " (>100); expressive network topology applied.");
     }
