@@ -6509,7 +6509,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     const size_t engineeredFeatureCount =
         (totalAnalysisDimensions >= rawColumnsAfterPreflight) ? (totalAnalysisDimensions - rawColumnsAfterPreflight) : 0;
     const bool strictFeatureReporting = engineeredFeatureCount >= std::max<size_t>(8, rawColumnsAfterPreflight / 3);
-    const size_t reportedAnalysisDimensions = strictFeatureReporting ? rawColumnsAfterPreflight : totalAnalysisDimensions;
+    const size_t fullTableDimensions = strictFeatureReporting ? rawColumnsAfterPreflight : totalAnalysisDimensions;
     univariate.addParagraph("Dataset Stats:");
     univariate.addParagraph("Rows: " + std::to_string(data.rowCount()));
     univariate.addParagraph("Raw Columns (loaded): " + std::to_string(loadedColumnCount));
@@ -6518,7 +6518,10 @@ int AutomationPipeline::run(const AutoConfig& config) {
         univariate.addParagraph("Pre-flight cull removed " + std::to_string(preflightCull.dropped) + " sparse columns (>" + toFixed(100.0 * preflightCull.threshold, 1) + "% missing) before univariate profiling.");
     }
     univariate.addParagraph("Engineered Features: " + std::to_string(engineeredFeatureCount));
-    univariate.addParagraph("Total Analysis Dimensions: " + std::to_string(reportedAnalysisDimensions));
+    univariate.addParagraph("Total Analysis Dimensions: " + std::to_string(totalAnalysisDimensions));
+    if (strictFeatureReporting) {
+        univariate.addParagraph("Dimensions expanded in full univariate/bivariate tables: " + std::to_string(fullTableDimensions));
+    }
     if (strictFeatureReporting) {
         univariate.addParagraph("Strict feature-reporting mode enabled: engineered features are summarized, not expanded into full univariate/bivariate tables.");
         std::unordered_set<std::string> engineeredFamilies;
