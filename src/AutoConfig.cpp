@@ -400,6 +400,7 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_optimizer", &AutoConfig::neuralOptimizer},
         {"neural_lookahead_fast_optimizer", &AutoConfig::neuralLookaheadFastOptimizer},
         {"neural_explainability", &AutoConfig::neuralExplainability},
+        {"neural_ordinal_mode", &AutoConfig::neuralOrdinalMode},
         {"target_strategy", &AutoConfig::targetStrategy},
         {"feature_strategy", &AutoConfig::featureStrategy},
         {"neural_strategy", &AutoConfig::neuralStrategy},
@@ -767,6 +768,8 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.neuralMaxAuxTargets = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-max-aux-targets", 0));
         } else if (arg == "--neural-explainability" && i + 1 < argc) {
             config.neuralExplainability = CommonUtils::toLower(argv[++i]);
+        } else if (arg == "--neural-ordinal-mode" && i + 1 < argc) {
+            config.neuralOrdinalMode = CommonUtils::toLower(argv[++i]);
         } else if (arg == "--neural-integrated-grad-steps" && i + 1 < argc) {
             config.neuralIntegratedGradSteps = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-integrated-grad-steps", 4));
         } else if (arg == "--neural-uncertainty-samples" && i + 1 < argc) {
@@ -1123,6 +1126,9 @@ void AutoConfig::validate() const {
     }
     if (!isIn(neuralExplainability, {"permutation", "integrated_gradients", "hybrid"})) {
         throw Seldon::ConfigurationException("neural_explainability must be one of: permutation, integrated_gradients, hybrid");
+    }
+    if (!isIn(neuralOrdinalMode, {"rank_regression", "binary_cross_entropy_when_possible"})) {
+        throw Seldon::ConfigurationException("neural_ordinal_mode must be one of: rank_regression, binary_cross_entropy_when_possible");
     }
 
     if (neuralLookaheadAlpha < 0.0 || neuralLookaheadAlpha > 1.0) {

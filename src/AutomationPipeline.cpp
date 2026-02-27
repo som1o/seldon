@@ -1,6 +1,7 @@
 #include "AutomationPipeline.h"
 
 #include "BenchmarkEngine.h"
+#include "CausalDiscovery.h"
 #include "CommonUtils.h"
 #include "DeterministicHeuristics.h"
 #include "GnuplotEngine.h"
@@ -284,6 +285,70 @@ bool isAdministrativeColumnName(const std::string& name) {
     return containsToken(lower, {
         "meta", "metadata", "ingest", "ingestion", "audit", "rownum", "serial", "sequence", "record_id"
     });
+}
+
+struct DomainRuleBundle {
+    std::unordered_set<std::string> suppressCausalColumns;
+    std::unordered_set<std::string> downweightImportanceColumns;
+    std::vector<std::string> loadedFrom;
+};
+
+std::string normalizeRuleName(const std::string& value) {
+    return CommonUtils::toLower(CommonUtils::trim(value));
+}
+
+void appendRuleValues(const std::string& rhs, std::unordered_set<std::string>& out) {
+    std::stringstream ss(rhs);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        const std::string norm = normalizeRuleName(token);
+        if (!norm.empty()) out.insert(norm);
+    }
+}
+
+DomainRuleBundle loadDomainRules(const AutoConfig& config) {
+    DomainRuleBundle out;
+    std::vector<std::filesystem::path> candidates;
+    if (!config.datasetPath.empty()) {
+        const std::filesystem::path datasetPath(config.datasetPath);
+        candidates.push_back(datasetPath.parent_path() / "domain_rules.txt");
+        candidates.push_back(datasetPath.parent_path() / "seldon_domain_rules.txt");
+        candidates.push_back(datasetPath.string() + ".rules.txt");
+    }
+
+    for (const auto& path : candidates) {
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) || ec) continue;
+        std::ifstream in(path);
+        if (!in.good()) continue;
+
+        out.loadedFrom.push_back(path.string());
+        std::string line;
+        while (std::getline(in, line)) {
+            const std::string trimmed = CommonUtils::trim(line);
+            if (trimmed.empty() || trimmed[0] == '#') continue;
+            const size_t pos = trimmed.find(':');
+            if (pos == std::string::npos) continue;
+            const std::string key = normalizeRuleName(trimmed.substr(0, pos));
+            const std::string rhs = trimmed.substr(pos + 1);
+            if (key == "suppress_causal" || key == "non_causal" || key == "constructed_index" || key == "block_causal") {
+                appendRuleValues(rhs, out.suppressCausalColumns);
+            } else if (key == "downweight_importance" || key == "deprioritize") {
+                appendRuleValues(rhs, out.downweightImportanceColumns);
+            }
+        }
+    }
+    return out;
+}
+
+bool isCausalEdgeSuppressedByRule(const std::string& from,
+                                  const std::string& to,
+                                  const DomainRuleBundle& rules) {
+    if (rules.suppressCausalColumns.empty()) return false;
+    const std::string fromNorm = normalizeRuleName(from);
+    const std::string toNorm = normalizeRuleName(to);
+    return rules.suppressCausalColumns.count(fromNorm) > 0 ||
+           rules.suppressCausalColumns.count(toNorm) > 0;
 }
 
 bool isTargetCandidateColumnName(const std::string& name) {
@@ -2644,12 +2709,12 @@ void applyDynamicPlotDefaultsIfUnset(AutoConfig& runCfg, const TypedDataset& dat
 
 bool configurePlotAvailability(AutoConfig& runCfg, ReportEngine& univariate, const GnuplotEngine& plotterBivariate) {
     const bool canPlot = plotterBivariate.isAvailable();
-    univariate.addParagraph(canPlot ? "Gnuplot detected." : "Gnuplot not available: plot generation skipped.");
+    univariate.addParagraph(canPlot ? "Gnuplot detected." : "Gnuplot not available: visualizations were omitted for runtime/portability and analysis continues normally.");
     if (!canPlot && (runCfg.plotUnivariate || runCfg.plotOverall || runCfg.plotBivariateSignificant)) {
         runCfg.plotUnivariate = false;
         runCfg.plotOverall = false;
         runCfg.plotBivariateSignificant = false;
-        univariate.addParagraph("Requested plotting features were disabled because gnuplot is unavailable in PATH.");
+        univariate.addParagraph("Requested plotting features were disabled because gnuplot is unavailable in PATH; this is not a statistical failure.");
     }
     return canPlot;
 }
@@ -3276,6 +3341,8 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
                                  int targetIdx,
                                  const std::vector<int>& featureIdx,
                                  bool classificationTarget,
+                                 bool ordinalTarget,
+                                 size_t targetCardinality,
                                  bool verbose,
                                  const AutoConfig& config,
                                  bool fastModeEnabled,
@@ -3286,8 +3353,12 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     analysis.binaryTarget = classificationTarget;
     analysis.classificationTarget = classificationTarget;
     analysis.hiddenActivation = "n/a";
-    analysis.outputActivation = activationToString(classificationTarget ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR);
-    analysis.lossName = classificationTarget ? "cross_entropy" : "mse";
+    const bool ordinalNonBinary = ordinalTarget && targetCardinality > 2;
+    const bool ordinalBceMode = CommonUtils::toLower(config.neuralOrdinalMode) == "binary_cross_entropy_when_possible";
+    const bool useCrossEntropy = classificationTarget && !ordinalNonBinary &&
+                                 (ordinalBceMode || !ordinalTarget || targetCardinality <= 2);
+    analysis.outputActivation = activationToString(useCrossEntropy ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR);
+    analysis.lossName = useCrossEntropy ? "cross_entropy" : "mse";
     analysis.trainingRowsTotal = data.rowCount();
 
     if (featureIdx.empty()) {
@@ -3393,7 +3464,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         hp.l2Lambda = (data.rowCount() < 80) ? 0.010 : 0.001;
         hp.categoricalInputL2Boost = config.neuralCategoricalInputL2Boost;
         hp.activation = (inputNodes < 10) ? NeuralNet::Activation::TANH : NeuralNet::Activation::GELU;
-        hp.outputActivation = (outputNodes == 1 && classificationTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
+        hp.outputActivation = useCrossEntropy ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
         hp.useBatchNorm = config.neuralUseBatchNorm;
         hp.batchNormMomentum = config.neuralBatchNormMomentum;
         hp.batchNormEpsilon = config.neuralBatchNormEpsilon;
@@ -3403,7 +3474,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         hp.lookaheadFastOptimizer = toOptimizer(config.neuralLookaheadFastOptimizer);
         hp.lookaheadSyncPeriod = static_cast<size_t>(std::max(1, config.neuralLookaheadSyncPeriod));
         hp.lookaheadAlpha = config.neuralLookaheadAlpha;
-        hp.loss = (outputNodes == 1 && classificationTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
+        hp.loss = useCrossEntropy ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
         hp.importanceMaxRows = config.neuralImportanceMaxRows;
         hp.importanceParallel = config.neuralImportanceParallel;
         hp.verbose = verbose;
@@ -3939,8 +4010,8 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         probeHp.valSplit = 0.2;
         probeHp.earlyStoppingPatience = 6;
         probeHp.activation = NeuralNet::Activation::RELU;
-        probeHp.outputActivation = (outputNodes == 1 && classificationTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
-        probeHp.loss = (outputNodes == 1 && classificationTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
+        probeHp.outputActivation = useCrossEntropy ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
+        probeHp.loss = useCrossEntropy ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
         probeHp.verbose = false;
         probeHp.seed = config.neuralSeed + 17;
         probeHp.importanceMaxRows = std::min<size_t>(config.neuralImportanceMaxRows, 2000);
@@ -4168,7 +4239,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     if (policyName == "fast") hp.activation = NeuralNet::Activation::RELU;
     else if (policyName == "expressive") hp.activation = NeuralNet::Activation::GELU;
     else hp.activation = (inputNodes < 10) ? NeuralNet::Activation::TANH : NeuralNet::Activation::GELU;
-    hp.outputActivation = (outputNodes == 1 && classificationTarget) ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
+    hp.outputActivation = useCrossEntropy ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
     hp.useBatchNorm = config.neuralUseBatchNorm;
     hp.batchNormMomentum = config.neuralBatchNormMomentum;
     hp.batchNormEpsilon = config.neuralBatchNormEpsilon;
@@ -4178,7 +4249,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     hp.lookaheadFastOptimizer = toOptimizer(config.neuralLookaheadFastOptimizer);
     hp.lookaheadSyncPeriod = static_cast<size_t>(std::max(1, config.neuralLookaheadSyncPeriod));
     hp.lookaheadAlpha = config.neuralLookaheadAlpha;
-    hp.loss = (outputNodes == 1 && classificationTarget) ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
+    hp.loss = useCrossEntropy ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
     hp.importanceMaxRows = config.neuralImportanceMaxRows;
     hp.importanceParallel = config.neuralImportanceParallel;
     hp.verbose = verbose;
@@ -4988,6 +5059,17 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                 p.relationLabel = "Potential leakage proxy";
             }
 
+            if (p.relationLabel.empty()) {
+                const double ar = std::abs(p.r);
+                const std::string strength =
+                    (ar >= 0.85) ? "Very strong" :
+                    (ar >= 0.65) ? "Strong" :
+                    (ar >= 0.45) ? "Moderate" :
+                    (ar >= 0.25) ? "Weak" : "Very weak";
+                const std::string sign = (p.r >= 0.0) ? "positive" : "negative";
+                p.relationLabel = strength + " " + sign + " association";
+            }
+
             return p;
     };
 
@@ -5164,6 +5246,10 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                                           addBand,
                                           1.96,
                                           tuning.scatterDownsampleThreshold);
+            if (p.plotPath.empty()) {
+                p.fitLineAdded = false;
+                p.confidenceBandAdded = false;
+            }
 
             if (shouldAddResidualPlot(p.r, p.selected, sampleSize, tuning)) {
                 std::vector<double> fitted;
@@ -5424,6 +5510,13 @@ ConditionalDriftAssessment assessGlobalConditionalDrift(double globalR,
     else if (out.magnitudeCollapse) out.label = "magnitude-collapse";
     else out.label = "stable";
     return out;
+}
+
+std::string driftPatternLabel(const std::string& raw) {
+    if (raw == "flip+collapse") return "sign reversal + magnitude collapse";
+    if (raw == "sign-flip") return "sign reversal";
+    if (raw == "magnitude-collapse") return "magnitude collapse";
+    return raw;
 }
 
 std::string cramerStrengthLabel(double v) {
@@ -5932,7 +6025,7 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
                         toFixed(g, 4),
                         toFixed(p, 4),
                         toFixed(drift.collapseRatio, 3),
-                        drift.label,
+                        driftPatternLabel(drift.label),
                         interpretation
                     });
                 }
@@ -6003,255 +6096,36 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
     }
 
     {
-        struct CausalFeatureScore {
-            size_t idx = static_cast<size_t>(-1);
-            double rawAbs = 0.0;
-            double partialAbs = 0.0;
-            double retention = 0.0;
-            std::string role;
-        };
+        CausalDiscoveryOptions causalOptions;
+        causalOptions.maxFeatures = 8;
+        causalOptions.maxConditionSet = 2;
+        causalOptions.alpha = 0.05;
+        causalOptions.bootstrapSamples = 100;
+        causalOptions.randomSeed = 1337;
+        causalOptions.enableLiNGAM = true;
+        causalOptions.enableKernelCiFallback = true;
+        causalOptions.enableGrangerValidation = true;
+        causalOptions.enableIcpValidation = true;
 
-        struct CausalEdge {
-            std::string from;
-            std::string to;
-            double confidence = 0.0;
-            std::string evidence;
-            std::string interpretation;
-        };
+        const auto causal = CausalDiscovery::discover(data,
+                                                      numericFeatures,
+                                                      static_cast<size_t>(targetIdx),
+                                                      causalOptions);
 
-        auto pearsonAbsAligned = [&](size_t aIdx, size_t bIdx) -> double {
-            if (aIdx >= data.columns().size() || bIdx >= data.columns().size()) return 0.0;
-            if (data.columns()[aIdx].type != ColumnType::NUMERIC || data.columns()[bIdx].type != ColumnType::NUMERIC) return 0.0;
-            const auto& a = std::get<std::vector<double>>(data.columns()[aIdx].values);
-            const auto& b = std::get<std::vector<double>>(data.columns()[bIdx].values);
-            std::vector<double> xa;
-            std::vector<double> xb;
-            xa.reserve(std::min(a.size(), b.size()));
-            xb.reserve(std::min(a.size(), b.size()));
-            const size_t n = std::min(a.size(), b.size());
-            for (size_t r = 0; r < n; ++r) {
-                if (!std::isfinite(a[r]) || !std::isfinite(b[r])) continue;
-                if (r < data.columns()[aIdx].missing.size() && data.columns()[aIdx].missing[r]) continue;
-                if (r < data.columns()[bIdx].missing.size() && data.columns()[bIdx].missing[r]) continue;
-                xa.push_back(a[r]);
-                xb.push_back(b[r]);
-            }
-            if (xa.size() < 12) return 0.0;
-            const ColumnStats as = Statistics::calculateStats(xa);
-            const ColumnStats bs = Statistics::calculateStats(xb);
-            return std::abs(MathUtils::calculatePearson(xa, xb, as, bs).value_or(0.0));
-        };
-
-        auto partialAgainstControls = [&](size_t feature, const std::vector<size_t>& controls) -> double {
-            if (feature >= data.columns().size()) return 0.0;
-            const auto& xv = std::get<std::vector<double>>(data.columns()[feature].values);
-            std::vector<double> yVec;
-            std::vector<double> xVec;
-            std::vector<std::vector<double>> ctrlRows;
-            const size_t n = std::min(y.size(), xv.size());
-            for (size_t r = 0; r < n; ++r) {
-                if (!std::isfinite(y[r]) || !std::isfinite(xv[r])) continue;
-                if (r < data.columns()[static_cast<size_t>(targetIdx)].missing.size() && data.columns()[static_cast<size_t>(targetIdx)].missing[r]) continue;
-                if (r < data.columns()[feature].missing.size() && data.columns()[feature].missing[r]) continue;
-                std::vector<double> row;
-                row.reserve(controls.size() + 1);
-                row.push_back(1.0);
-                bool ok = true;
-                for (size_t cidx : controls) {
-                    const auto& cv = std::get<std::vector<double>>(data.columns()[cidx].values);
-                    if (r >= cv.size() || !std::isfinite(cv[r])) { ok = false; break; }
-                    if (r < data.columns()[cidx].missing.size() && data.columns()[cidx].missing[r]) { ok = false; break; }
-                    row.push_back(cv[r]);
-                }
-                if (!ok) continue;
-                ctrlRows.push_back(std::move(row));
-                yVec.push_back(y[r]);
-                xVec.push_back(xv[r]);
-            }
-            if (ctrlRows.size() < controls.size() + 10) return 0.0;
-            MathUtils::Matrix X(ctrlRows.size(), controls.size() + 1);
-            MathUtils::Matrix Yy(ctrlRows.size(), 1);
-            MathUtils::Matrix Yx(ctrlRows.size(), 1);
-            for (size_t i = 0; i < ctrlRows.size(); ++i) {
-                for (size_t c = 0; c < ctrlRows[i].size(); ++c) X.at(i, c) = ctrlRows[i][c];
-                Yy.at(i, 0) = yVec[i];
-                Yx.at(i, 0) = xVec[i];
-            }
-            const auto by = MathUtils::multipleLinearRegression(X, Yy);
-            const auto bx = MathUtils::multipleLinearRegression(X, Yx);
-            if (by.size() != controls.size() + 1 || bx.size() != controls.size() + 1) return 0.0;
-
-            std::vector<double> ry(ctrlRows.size(), 0.0);
-            std::vector<double> rx(ctrlRows.size(), 0.0);
-            for (size_t i = 0; i < ctrlRows.size(); ++i) {
-                double py = 0.0;
-                double px = 0.0;
-                for (size_t c = 0; c < ctrlRows[i].size(); ++c) {
-                    py += ctrlRows[i][c] * by[c];
-                    px += ctrlRows[i][c] * bx[c];
-                }
-                ry[i] = yVec[i] - py;
-                rx[i] = xVec[i] - px;
-            }
-            const ColumnStats sx = Statistics::calculateStats(rx);
-            const ColumnStats sy = Statistics::calculateStats(ry);
-            return std::abs(MathUtils::calculatePearson(rx, ry, sx, sy).value_or(0.0));
-        };
-
-        std::vector<CausalFeatureScore> featureScores;
-        featureScores.reserve(numericFeatures.size());
-        for (size_t idx : numericFeatures) {
-            const double raw = pearsonAbsAligned(idx, static_cast<size_t>(targetIdx));
-            featureScores.push_back({idx, raw, 0.0, 0.0, "uncertain"});
-        }
-        std::sort(featureScores.begin(), featureScores.end(), [](const auto& a, const auto& b) {
-            return a.rawAbs > b.rawAbs;
-        });
-
-        std::vector<size_t> ranking;
-        ranking.reserve(featureScores.size());
-        for (const auto& s : featureScores) ranking.push_back(s.idx);
-
-        std::vector<size_t> drivers;
-        std::vector<size_t> proxies;
-        for (auto& score : featureScores) {
-            std::vector<size_t> controls;
-            for (size_t idx : ranking) {
-                if (idx == score.idx) continue;
-                controls.push_back(idx);
-                if (controls.size() >= 2) break;
-            }
-            score.partialAbs = partialAgainstControls(score.idx, controls);
-            score.retention = (score.rawAbs > 1e-8) ? (score.partialAbs / score.rawAbs) : 0.0;
-
-            if (score.rawAbs >= 0.20 && score.partialAbs >= 0.12 && score.retention >= 0.55) {
-                score.role = "likely driver";
-                drivers.push_back(score.idx);
-            } else if (score.rawAbs >= 0.20 && score.retention <= 0.35) {
-                score.role = "likely proxy";
-                proxies.push_back(score.idx);
-            } else {
-                score.role = "uncertain";
-            }
-        }
-
-        std::vector<CausalEdge> edges;
-        const std::string targetName = data.columns()[static_cast<size_t>(targetIdx)].name;
-        for (const auto& score : featureScores) {
-            if (score.role != "likely driver") continue;
-            const double conf = std::clamp(0.35 + 0.45 * score.partialAbs + 0.20 * score.retention, 0.0, 0.99);
-            edges.push_back({
-                data.columns()[score.idx].name,
-                targetName,
-                conf,
-                "|r|=" + toFixed(score.rawAbs, 3) + ", partial|r|=" + toFixed(score.partialAbs, 3) + ", retention=" + toFixed(score.retention, 3),
-                "Signal remains after controlling top predictors; candidate driver for target."
+        for (const auto& edge : causal.edges) {
+            if (edge.fromIdx >= data.columns().size() || edge.toIdx >= data.columns().size()) continue;
+            std::string evidence = edge.evidence;
+            evidence += ", bootstrap=" + toFixed(100.0 * edge.bootstrapSupport, 1) + "%";
+            out.causalDagRows.push_back({
+                data.columns()[edge.fromIdx].name,
+                data.columns()[edge.toIdx].name,
+                toFixed(edge.confidence, 3),
+                evidence,
+                edge.interpretation
             });
         }
 
-        for (size_t proxyIdx : proxies) {
-            double bestLink = 0.0;
-            size_t bestDriver = static_cast<size_t>(-1);
-            for (size_t driverIdx : drivers) {
-                const double link = pearsonAbsAligned(proxyIdx, driverIdx);
-                if (link > bestLink) {
-                    bestLink = link;
-                    bestDriver = driverIdx;
-                }
-            }
-
-            if (bestDriver != static_cast<size_t>(-1) && bestLink >= 0.45) {
-                const double conf = std::clamp(0.25 + 0.55 * bestLink, 0.0, 0.95);
-                edges.push_back({
-                    data.columns()[bestDriver].name,
-                    data.columns()[proxyIdx].name,
-                    conf,
-                    "driver-proxy link |r|=" + toFixed(bestLink, 3),
-                    "Proxy candidate: correlation with target weakens strongly after controls."
-                });
-            } else {
-                const double raw = pearsonAbsAligned(proxyIdx, static_cast<size_t>(targetIdx));
-                edges.push_back({
-                    data.columns()[proxyIdx].name,
-                    targetName,
-                    std::clamp(0.15 + 0.40 * raw, 0.0, 0.75),
-                    "|r|=" + toFixed(raw, 3) + " with unresolved upstream driver",
-                    "Association detected; likely proxy path not fully resolved."
-                });
-            }
-        }
-
-        {
-            std::vector<size_t> dagNodes;
-            dagNodes.reserve(featureScores.size());
-            for (const auto& s : featureScores) {
-                dagNodes.push_back(s.idx);
-                if (dagNodes.size() >= 6) break;
-            }
-
-            for (size_t i = 0; i < dagNodes.size(); ++i) {
-                for (size_t j = i + 1; j < dagNodes.size(); ++j) {
-                    const size_t aIdx = dagNodes[i];
-                    const size_t bIdx = dagNodes[j];
-                    const auto& aVals = std::get<std::vector<double>>(data.columns()[aIdx].values);
-                    const auto& bVals = std::get<std::vector<double>>(data.columns()[bIdx].values);
-                    const auto direction = Statistics::asymmetricInformationGain(aVals, bVals, 8);
-                    if (std::abs(direction.asymmetry) < 0.015) continue;
-
-                    const bool aToB = direction.suggestedDirection == "x->y";
-                    const std::string from = aToB ? data.columns()[aIdx].name : data.columns()[bIdx].name;
-                    const std::string to = aToB ? data.columns()[bIdx].name : data.columns()[aIdx].name;
-                    const double pairCorr = pearsonAbsAligned(aIdx, bIdx);
-                    const double conf = std::clamp(0.20 + std::min(0.45, std::abs(direction.asymmetry) * 1.8) + 0.25 * pairCorr, 0.0, 0.93);
-
-                    edges.push_back({
-                        from,
-                        to,
-                        conf,
-                        "AIG(x→y)=" + toFixed(direction.xToY, 3) + ", AIG(y→x)=" + toFixed(direction.yToX, 3) + ", Δ=" + toFixed(direction.asymmetry, 3),
-                        "Directed by asymmetric information gain; treat as causal ordering hypothesis."
-                    });
-                }
-            }
-
-            if (drivers.size() >= 2) {
-                const size_t d1 = drivers[0];
-                const size_t d2 = drivers[1];
-                const double dd = pearsonAbsAligned(d1, d2);
-                const double dt1 = pearsonAbsAligned(d1, static_cast<size_t>(targetIdx));
-                const double dt2 = pearsonAbsAligned(d2, static_cast<size_t>(targetIdx));
-                if (dd <= 0.15 && dt1 >= 0.30 && dt2 >= 0.30) {
-                    edges.push_back({
-                        data.columns()[d1].name + " & " + data.columns()[d2].name,
-                        targetName,
-                        std::clamp(0.30 + 0.30 * (dt1 + dt2), 0.0, 0.95),
-                        "PC-style collider signal: parent-parent |r|=" + toFixed(dd, 3) + ", parent-target |r|=" + toFixed(dt1, 3) + "/" + toFixed(dt2, 3),
-                        "Potential collider around target consistent with Peter-Clark orientation logic."
-                    });
-                }
-            }
-        }
-
-        if (igA != static_cast<size_t>(-1) && igB != static_cast<size_t>(-1) && bestIgProxy >= 0.12) {
-            edges.push_back({
-                data.columns()[igA].name + " × " + data.columns()[igB].name,
-                targetName,
-                std::clamp(0.20 + 0.50 * bestIgProxy, 0.0, 0.90),
-                "interaction proxy=" + toFixed(bestIgProxy, 3),
-                "Pair interaction may carry directional effect beyond additive terms."
-            });
-        }
-
-        std::sort(edges.begin(), edges.end(), [](const auto& a, const auto& b) {
-            return a.confidence > b.confidence;
-        });
-        if (edges.size() > 10) edges.resize(10);
-
-        for (const auto& e : edges) {
-            out.causalDagRows.push_back({e.from, e.to, toFixed(e.confidence, 3), e.evidence, e.interpretation});
-        }
-
-        if (!edges.empty()) {
+        if (!causal.edges.empty()) {
             std::unordered_map<std::string, std::string> nodeIds;
             auto idFor = [&](const std::string& node) {
                 auto it = nodeIds.find(node);
@@ -6268,29 +6142,32 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
             std::ostringstream mermaid;
             mermaid << "```mermaid\n";
             mermaid << "flowchart LR\n";
-            for (const auto& e : edges) {
-                const std::string fromId = idFor(e.from);
-                const std::string toId = idFor(e.to);
-                mermaid << "    " << fromId << "[\"" << quoteSafe(e.from) << "\"] -->|"
-                        << toFixed(e.confidence, 2) << "| "
-                        << toId << "[\"" << quoteSafe(e.to) << "\"]\n";
+            for (const auto& edge : causal.edges) {
+                if (edge.fromIdx >= data.columns().size() || edge.toIdx >= data.columns().size()) continue;
+                const std::string from = data.columns()[edge.fromIdx].name;
+                const std::string to = data.columns()[edge.toIdx].name;
+                const std::string fromId = idFor(from);
+                const std::string toId = idFor(to);
+                mermaid << "    " << fromId << "[\"" << quoteSafe(from) << "\"] -->|"
+                        << toFixed(edge.bootstrapSupport, 2) << "| "
+                        << toId << "[\"" << quoteSafe(to) << "\"]\n";
             }
             mermaid << "```";
             out.causalDagMermaid = mermaid.str();
 
-            size_t driverEdges = 0;
-            size_t proxyEdges = 0;
-            for (const auto& e : edges) {
-                if (e.to == targetName) ++driverEdges;
-                if (e.interpretation.find("Proxy") != std::string::npos || e.interpretation.find("proxy") != std::string::npos) ++proxyEdges;
+            size_t targetInbound = 0;
+            for (const auto& edge : causal.edges) {
+                if (edge.toIdx == static_cast<size_t>(targetIdx)) ++targetInbound;
             }
-            const std::string summary = "Causal-lite DAG generated " + std::to_string(edges.size()) +
-                " directed candidates (to-target=" + std::to_string(driverEdges) +
-                ", proxy-path=" + std::to_string(proxyEdges) + ").";
-            out.priorityTakeaways.push_back(summary + " Treat these as directional hypotheses, not causal proof.");
-            out.orderedRows.push_back({"7", "Causal inference (lite) DAG", summary});
+            std::string summary = "Constraint-based causal DAG produced " + std::to_string(causal.edges.size()) +
+                " directed edges (incoming-to-target=" + std::to_string(targetInbound) +
+                ", bootstrap runs=" + std::to_string(causal.bootstrapRuns) + ").";
+            if (causal.usedLiNGAM) summary += " Non-Gaussian LiNGAM orientation applied.";
+            out.priorityTakeaways.push_back(summary);
+            for (const auto& note : causal.notes) out.priorityTakeaways.push_back(note);
+            out.orderedRows.push_back({"7", "Causal discovery DAG (PC + LiNGAM + bootstrap)", summary});
         } else {
-            out.orderedRows.push_back({"7", "Causal inference (lite) DAG", "No stable directed candidates; current significant findings are likely associative only."});
+            out.orderedRows.push_back({"7", "Causal discovery DAG (PC + LiNGAM + bootstrap)", "No stable directed edges after CI tests and bootstrap filtering."});
         }
     }
 
@@ -7608,11 +7485,11 @@ std::optional<std::string> buildResidualDiscoveryNarrative(const TypedDataset& d
     const auto drift = assessGlobalConditionalDrift(secondGlobalCorr, bestResidualCorr);
     std::string driftText;
     if (drift.label == "flip+collapse") {
-        driftText = " Drift check: sign-flip + magnitude-collapse versus global relationship.";
+        driftText = " Drift check: sign reversal + magnitude collapse versus global relationship.";
     } else if (drift.label == "sign-flip") {
-        driftText = " Drift check: sign-flip versus global relationship.";
+        driftText = " Drift check: sign reversal versus global relationship.";
     } else if (drift.label == "magnitude-collapse") {
-        driftText = " Drift check: magnitude-collapse after controlling primary driver.";
+        driftText = " Drift check: magnitude collapse after controlling primary driver.";
     }
 
     return "Residual discovery: " + data.columns()[static_cast<size_t>(bestIdx)].name +
@@ -8075,6 +7952,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                               targetIdx,
                                               featureIdx,
                                               targetContext.semantics.inferredTask != "regression",
+                                              targetContext.semantics.isOrdinal,
+                                              targetContext.semantics.cardinality,
                                               runCfg.verboseAnalysis,
                                               runCfg,
                                               fastModeEnabled,
@@ -8105,6 +7984,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
     importanceByIndex[static_cast<size_t>(targetIdx)] = fallbackImportance;
 
+    const DomainRuleBundle domainRules = loadDomainRules(runCfg);
+
     const auto numeric = data.numericColumnIndices();
     for (size_t idx : numeric) {
         if (importanceByIndex.find(idx) == importanceByIndex.end()) {
@@ -8116,6 +7997,17 @@ int AutomationPipeline::run(const AutoConfig& config) {
             const ColumnStats yStats = (yIt != statsCache.end()) ? yIt->second : Statistics::calculateStats(y);
             double corr = std::abs(MathUtils::calculatePearson(x, y, xStats, yStats).value_or(0.0));
             importanceByIndex[idx] = std::isfinite(corr) ? corr : fallbackImportance;
+        }
+    }
+
+    if (!domainRules.downweightImportanceColumns.empty()) {
+        for (size_t idx : numeric) {
+            if (idx >= data.columns().size()) continue;
+            const std::string norm = normalizeRuleName(data.columns()[idx].name);
+            if (domainRules.downweightImportanceColumns.count(norm) == 0) continue;
+            auto it = importanceByIndex.find(idx);
+            if (it == importanceByIndex.end()) continue;
+            it->second *= 0.25;
         }
     }
 
@@ -8160,6 +8052,12 @@ int AutomationPipeline::run(const AutoConfig& config) {
     size_t statSigCount = 0;
     size_t strictSuppressedPairs = 0;
     size_t strictSuppressedSelected = 0;
+    auto plotFlagText = [&](const PairInsight& p, bool enabled) {
+        if (!canPlot) return std::string("n/a");
+        if (!p.selected) return std::string("n/a");
+        if (p.plotPath.empty()) return std::string("n/a");
+        return enabled ? std::string("yes") : std::string("no");
+    };
     for (const auto& p : bivariatePairs) {
         const bool engineeredPair = isEngineeredFeatureName(p.featureA) || isEngineeredFeatureName(p.featureB);
         if (strictFeatureReporting && engineeredPair) {
@@ -8206,8 +8104,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
                 p.leakageRisk ? "yes" : "no",
                 p.redundancyGroup.empty() ? "-" : p.redundancyGroup,
                 p.relationLabel.empty() ? "-" : p.relationLabel,
-                p.fitLineAdded ? "yes" : "no",
-                p.confidenceBandAdded ? "yes" : "no",
+                plotFlagText(p, p.fitLineAdded),
+                plotFlagText(p, p.confidenceBandAdded),
                 p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
                 p.residualPlotPath.empty() ? "-" : p.residualPlotPath,
                 p.facetedPlotPath.empty() ? "-" : p.facetedPlotPath,
@@ -8236,8 +8134,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
                 std::to_string(p.significanceTier),
                 p.selectionReason.empty() ? "-" : p.selectionReason,
                 p.relationLabel.empty() ? "-" : p.relationLabel,
-                p.fitLineAdded ? "yes" : "no",
-                p.confidenceBandAdded ? "yes" : "no",
+                plotFlagText(p, p.fitLineAdded),
+                plotFlagText(p, p.confidenceBandAdded),
                 p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
                 p.residualPlotPath.empty() ? "-" : p.residualPlotPath,
                 p.facetedPlotPath.empty() ? "-" : p.facetedPlotPath,
@@ -8375,6 +8273,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
     const size_t structuralPairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.filteredAsStructural; }));
     const size_t leakagePairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.leakageRisk; }));
     bivariate.addParagraph("Information-theoretic filtering: redundant=" + std::to_string(redundantPairs) + ", structural=" + std::to_string(structuralPairs) + ", leakage-risk=" + std::to_string(leakagePairs) + ".");
+    if (!canPlot) {
+        bivariate.addParagraph("Plot columns are marked 'n/a' because visual generation is omitted (environment/runtime mode), not because relationships failed quality checks.");
+    }
     if (strictFeatureReporting) {
         bivariate.addParagraph("Strict feature-reporting mode: suppressed " + std::to_string(strictSuppressedPairs) + " engineered-feature pairs (" + std::to_string(strictSuppressedSelected) + " were otherwise selected). See Univariate 'Feature Engineering Insights'.");
     }
@@ -8397,12 +8298,85 @@ int AutomationPipeline::run(const AutoConfig& config) {
         },
         "Quick map of relationship strength before detailed pair evidence."
     );
+    bivariate.addTable("Metric Glossary", {"Metric", "Interpretation"}, {
+        {"neural_score", "Composite relevance score blending effect size, stability, modeled-feature coverage, and statistical reliability."},
+        {"fold_stability", "Cross-fold consistency of pairwise correlation (1.0 is highly stable; near 0 is unstable)."},
+        {"significance_tier", "Tier-2: statistical + neural confirmation; Tier-3: statistical + domain fallback promotion."},
+        {"relation_label", "Human-readable relationship descriptor derived from correlation direction/strength or deterministic relation checks."},
+        {"fit_line", "Whether a fitted linear overlay is rendered for the selected scatter plot (n/a when plotting is unavailable or pair not plotted)."},
+        {"confidence_band", "Whether confidence interval band is rendered around the fitted line for the selected scatter plot (n/a when unavailable)."},
+        {"scatter_plot", "Path to generated scatter visualization for selected pairs; '-' means no plot artifact for that row."}
+    });
+
+    {
+        std::vector<std::string> adminDominatedPairs;
+        bool targetAdminPredictable = false;
+        const size_t targetIdxU = static_cast<size_t>(targetIdx);
+        for (const auto& p : bivariatePairs) {
+            if (!p.selected) continue;
+            const bool adminA = isAdministrativeColumnName(p.featureA);
+            const bool adminB = isAdministrativeColumnName(p.featureB);
+            if (!adminA && !adminB) continue;
+            adminDominatedPairs.push_back(p.featureA + " vs " + p.featureB);
+            if ((p.idxA == targetIdxU && adminB) || (p.idxB == targetIdxU && adminA)) {
+                if (std::abs(p.r) >= 0.995) targetAdminPredictable = true;
+            }
+        }
+        if (!adminDominatedPairs.empty()) {
+            const size_t showN = std::min<size_t>(3, adminDominatedPairs.size());
+            std::string preview;
+            for (size_t i = 0; i < showN; ++i) {
+                if (i) preview += ", ";
+                preview += adminDominatedPairs[i];
+            }
+            bivariate.addParagraph("Footnote: Administrative/index-like columns appear in selected associations (e.g., " + preview + "). These often reflect row ordering or data collection mechanics, not actionable domain causality.");
+        }
+        if (targetAdminPredictable) {
+            bivariate.addParagraph("Warning: target appears near-perfectly predictable from an administrative/index-like column; treat downstream interpretations with caution.");
+        }
+    }
+
+    auto trimNonInformativeColumns = [](std::vector<std::string>& headers,
+                                        std::vector<std::vector<std::string>>& rows,
+                                        const std::vector<std::string>& candidates) {
+        auto isNonInformative = [](const std::string& v) {
+            const std::string t = CommonUtils::toLower(CommonUtils::trim(v));
+            return t.empty() || t == "-" || t == "no" || t == "n/a";
+        };
+
+        for (const auto& name : candidates) {
+            auto it = std::find(headers.begin(), headers.end(), name);
+            if (it == headers.end()) continue;
+            const size_t idx = static_cast<size_t>(std::distance(headers.begin(), it));
+
+            bool allNonInformative = true;
+            for (const auto& row : rows) {
+                if (idx < row.size() && !isNonInformative(row[idx])) {
+                    allNonInformative = false;
+                    break;
+                }
+            }
+            if (!allNonInformative) continue;
+
+            headers.erase(headers.begin() + static_cast<long>(idx));
+            for (auto& row : rows) {
+                if (idx < row.size()) row.erase(row.begin() + static_cast<long>(idx));
+            }
+        }
+    };
+
+    std::vector<std::string> allHeaders = {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "significance_tier", "selection_reason", "selected", "redundant", "structural", "leakage_risk", "cluster_rep", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"};
+    std::vector<std::string> sigHeaders = {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "significance_tier", "selection_reason", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"};
+    const std::vector<std::string> optionalColumns = {"fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"};
+    trimNonInformativeColumns(allHeaders, allRows, optionalColumns);
+    trimNonInformativeColumns(sigHeaders, sigRows, optionalColumns);
+
     if (compactBivariateRows) {
         bivariate.addParagraph("Low-memory mode: omitted full pair table and kept only selected + capped rejected samples for diagnostics.");
     } else {
-        bivariate.addTable("All Pairwise Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "significance_tier", "selection_reason", "selected", "redundant", "structural", "leakage_risk", "cluster_rep", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, allRows);
+        bivariate.addTable("All Pairwise Results", allHeaders, allRows);
     }
-    bivariate.addTable("Final Significant Results", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "significance_tier", "selection_reason", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
+    bivariate.addTable("Final Significant Results", sigHeaders, sigRows);
     if (!structuralRows.empty()) {
         bivariate.addTable("Structural/Deterministic Pair Diagnostics", {"Feature A", "Feature B", "pearson_r", "p_value", "structural", "deterministic", "relation_label", "selection_reason"}, structuralRows);
     }
@@ -8442,14 +8416,46 @@ int AutomationPipeline::run(const AutoConfig& config) {
         bivariate.addTable("Automatic Stratified Population Signals", {"Segment Column", "Numeric Feature", "Groups", "Rows", "eta_squared", "separation", "group_means"}, rows);
     }
 
-    const AdvancedAnalyticsOutputs advancedOutputs = buildAdvancedAnalyticsOutputs(data,
-                                                                                   targetIdx,
-                                                                                   featureIdx,
-                                                                                   neural.featureImportance,
-                                                                                   bivariatePairs,
-                                                                                   anovaRows,
-                                                                                   contingency,
-                                                                                   statsCache);
+    AdvancedAnalyticsOutputs advancedOutputs = buildAdvancedAnalyticsOutputs(data,
+                                                                             targetIdx,
+                                                                             featureIdx,
+                                                                             neural.featureImportance,
+                                                                             bivariatePairs,
+                                                                             anovaRows,
+                                                                             contingency,
+                                                                             statsCache);
+
+    size_t causalSuppressedByRules = 0;
+    if (!domainRules.suppressCausalColumns.empty() && !advancedOutputs.causalDagRows.empty()) {
+        std::vector<std::vector<std::string>> kept;
+        kept.reserve(advancedOutputs.causalDagRows.size());
+        for (const auto& row : advancedOutputs.causalDagRows) {
+            if (row.size() < 2) continue;
+            if (isCausalEdgeSuppressedByRule(row[0], row[1], domainRules)) {
+                ++causalSuppressedByRules;
+                continue;
+            }
+            kept.push_back(row);
+        }
+        advancedOutputs.causalDagRows = std::move(kept);
+        if (causalSuppressedByRules > 0) {
+            advancedOutputs.causalDagMermaid.reset();
+            advancedOutputs.priorityTakeaways.push_back(
+                "Domain rules suppressed " + std::to_string(causalSuppressedByRules) +
+                " causal edges tagged as non-causal/constructed indices.");
+            advancedOutputs.orderedRows.push_back({"99", "Domain-rule causal suppression",
+                "Suppressed " + std::to_string(causalSuppressedByRules) +
+                " causal edges using external domain rules."});
+        }
+    }
+
+    if (!domainRules.loadedFrom.empty()) {
+        std::string src = domainRules.loadedFrom.front();
+        if (domainRules.loadedFrom.size() > 1) {
+            src += " (and " + std::to_string(domainRules.loadedFrom.size() - 1) + " more)";
+        }
+        advancedOutputs.priorityTakeaways.push_back("Applied external domain metadata rules from: " + src + ".");
+    }
 
     const DataHealthSummary dataHealth = computeDataHealthSummary(data,
                                                                   prep,
@@ -8482,6 +8488,11 @@ int AutomationPipeline::run(const AutoConfig& config) {
         },
         "Fast leadership view of model behavior before detailed training diagnostics."
     );
+    neuralReport.addTable("Neural Metric Glossary", {"Metric", "Interpretation"}, {
+        {"Predictive Confidence", "Composite reliability score after uncertainty, ensemble disagreement, OOD rate, and drift penalties."},
+        {"OOD Rate", "Share of monitor-window rows with strongly atypical manifold distance."},
+        {"Drift PSI", "Population Stability Index between reference and monitor windows; larger values imply stronger distribution shift."}
+    });
     neuralReport.addTable("Auto Decision Log", {"Decision", "Value"}, {
         {"Target Selection", targetContext.userProvidedTarget ? "user-specified" : "auto"},
         {"Target Strategy", targetContext.choice.strategyUsed},
@@ -8496,6 +8507,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Sparse Features Dropped", std::to_string(selectedFeatures.droppedByMissingness.size())},
         {"Pre-Flight Sparse Columns Culled", std::to_string(preflightCull.dropped)},
         {"Neural Strategy", neural.policyUsed},
+        {"Ordinal Mode", runCfg.neuralOrdinalMode},
         {"Fast Mode", fastModeEnabled ? "enabled" : "disabled"},
         {"Neural Training Rows Used", std::to_string(neural.trainingRowsUsed) + " / " + std::to_string(neural.trainingRowsTotal)},
         {"Bivariate Strategy", bivariatePolicy.name},
@@ -8533,8 +8545,12 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Hidden Activation", neural.hiddenActivation},
         {"Output Activation", neural.outputActivation}
     });
-    if (targetContext.semantics.inferredTask == "ordinal_classification" && neural.lossName == "mse") {
-        neuralReport.addParagraph("Ordinal target detected with MSE loss: this is intentional in the current engine because ordered class encodings preserve rank distance, so MSE penalizes larger ordinal mis-ranks more strongly.");
+    if (targetContext.semantics.inferredTask == "ordinal_classification") {
+        if (neural.lossName == "mse") {
+            neuralReport.addParagraph("Ordinal modeling mode: rank-regression (MSE). This is intentional for multi-level ordinal targets because it preserves order distance and avoids forcing unordered class boundaries.");
+        } else {
+            neuralReport.addParagraph("Ordinal modeling mode used binary cross-entropy because target cardinality is binary-compatible under current ordinal settings.");
+        }
     }
 
     if (!neural.uncertaintyStd.empty()) {
@@ -8574,6 +8590,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     });
     if (neural.driftWarning) {
         neuralReport.addParagraph("⚠️ Data Drift Warning: monitor-window distribution diverges from the model reference window. Predictions may be less reliable until data quality or upstream process stability is reviewed.");
+        neuralReport.addParagraph("Recommended actions: retrain on recent data windows, validate upstream ingestion/transformation pipelines, and compare feature-level PSI contributors before deployment decisions.");
     }
 
     std::vector<std::vector<std::string>> fiRows;
@@ -8641,6 +8658,32 @@ int AutomationPipeline::run(const AutoConfig& config) {
     finalAnalysis.addTitle("Final Analysis - Significant Findings Only");
     finalAnalysis.addParagraph("This report contains statistically significant findings selected by a tiered engine: Tier-2 (statistical + neural) and Tier-3 fallback (statistical + domain effect). Non-selected findings are excluded by design.");
     finalAnalysis.addParagraph("Data Health Score: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + "). This score estimates discovered signal strength using completeness, retained feature coverage, significant-pair yield, selected-pair yield, and neural training stability.");
+
+    size_t adminSelectedCount = 0;
+    bool targetAdminPredictableExec = false;
+    const size_t targetIdxUExec = static_cast<size_t>(targetIdx);
+    for (const auto& p : bivariatePairs) {
+        if (!p.selected) continue;
+        const bool adminA = isAdministrativeColumnName(p.featureA);
+        const bool adminB = isAdministrativeColumnName(p.featureB);
+        if (!adminA && !adminB) continue;
+        ++adminSelectedCount;
+        if ((p.idxA == targetIdxUExec && adminB) || (p.idxB == targetIdxUExec && adminA)) {
+            if (std::abs(p.r) >= 0.995) targetAdminPredictableExec = true;
+        }
+    }
+
+    std::vector<std::string> execHighlights = {
+        "This top block is optimized for non-technical consumption.",
+        "Ordered methods, constraint-based causal discovery, and detailed evidence tables follow below."
+    };
+    if (adminSelectedCount > 0) {
+        execHighlights.push_back("Administrative/index-like columns appear in selected findings; interpret those as potential ordering artifacts.");
+    }
+    if (!domainRules.loadedFrom.empty()) {
+        execHighlights.push_back("External domain-rule metadata was applied to suppress non-causal/constructed-edge candidates.");
+    }
+
     addExecutiveDashboard(
         finalAnalysis,
         "Executive Dashboard",
@@ -8651,33 +8694,73 @@ int AutomationPipeline::run(const AutoConfig& config) {
             {"Rows", std::to_string(data.rowCount())},
             {"Columns", std::to_string(data.colCount())}
         },
-        {
-            "This top block is optimized for non-technical consumption.",
-            "Ordered methods, causal-lite checks, and detailed evidence tables follow below."
-        },
+        execHighlights,
         "Snapshot first; evidence next."
     );
+    if (targetAdminPredictableExec) {
+        finalAnalysis.addParagraph("Executive caution: target is near-perfectly predictable from an administrative/index-like column, which often reflects dataset ordering rather than a meaningful causal relationship.");
+    }
 
     if (!advancedOutputs.orderedRows.empty()) {
         finalAnalysis.addTable("Ordered Methods", {"Step", "Method", "Result"}, advancedOutputs.orderedRows);
     }
 
     if (!advancedOutputs.causalDagRows.empty()) {
-        finalAnalysis.addTable("Causal Inference (Lite) DAG Candidates",
+        finalAnalysis.addTable("Causal Discovery Graph Candidates",
                                {"From", "To", "Confidence", "Evidence", "Interpretation"},
                                advancedOutputs.causalDagRows);
+    }
+
+    finalAnalysis.addTable("Bivariate Metric Glossary", {"Metric", "Interpretation"}, {
+        {"neural_score", "Composite relevance score blending effect size, stability, modeled-feature coverage, and statistical reliability."},
+        {"fold_stability", "Cross-fold consistency of pairwise correlation (1.0 is highly stable; near 0 is unstable)."},
+        {"significance_tier", "Tier-2: statistical + neural confirmation; Tier-3: statistical + domain fallback promotion."},
+        {"relation_label", "Human-readable relationship descriptor derived from correlation direction/strength or deterministic relation checks."},
+        {"fit_line", "Whether a fitted linear overlay is rendered for the selected scatter plot (n/a when plotting is unavailable or pair not plotted)."},
+        {"confidence_band", "Whether confidence interval band is rendered around the fitted line for selected scatter plots (n/a when unavailable)."}
+    });
+
+    {
+        std::vector<std::string> adminDominatedPairs;
+        bool targetAdminPredictable = false;
+        const size_t targetIdxU = static_cast<size_t>(targetIdx);
+        for (const auto& p : bivariatePairs) {
+            if (!p.selected) continue;
+            const bool adminA = isAdministrativeColumnName(p.featureA);
+            const bool adminB = isAdministrativeColumnName(p.featureB);
+            if (!adminA && !adminB) continue;
+            adminDominatedPairs.push_back(p.featureA + " vs " + p.featureB);
+            if ((p.idxA == targetIdxU && adminB) || (p.idxB == targetIdxU && adminA)) {
+                if (std::abs(p.r) >= 0.995) targetAdminPredictable = true;
+            }
+        }
+
+        if (!adminDominatedPairs.empty()) {
+            const size_t showN = std::min<size_t>(3, adminDominatedPairs.size());
+            std::string preview;
+            for (size_t i = 0; i < showN; ++i) {
+                if (i) preview += ", ";
+                preview += adminDominatedPairs[i];
+            }
+            finalAnalysis.addParagraph("Context note: selected findings include administrative/index-like columns (e.g., " + preview + "), which commonly capture dataset ordering rather than meaningful domain mechanism.");
+        }
+        if (targetAdminPredictable) {
+            finalAnalysis.addParagraph("One-line caution: target is near-perfectly predictable from an administrative/index-like column; interpret significance as ordering artifact risk before acting on conclusions.");
+        }
     }
 
     if (!advancedOutputs.globalConditionalRows.empty()) {
         finalAnalysis.addTable("Global vs Conditional Relationship Drift",
                                {"Feature", "Global r", "Conditional r", "|conditional|/|global|", "Pattern", "Interpretation"},
                                advancedOutputs.globalConditionalRows);
+        finalAnalysis.addParagraph("Recommended action: review confounders for flagged rows, prioritize controlled feature checks, and re-evaluate decisions using conditional rather than global associations.");
     }
 
     if (!advancedOutputs.temporalDriftRows.empty()) {
         finalAnalysis.addTable("Temporal Drift Kernels (ADF-Style)",
                                {"Feature", "Axis", "Samples", "Gamma", "t-stat", "p-approx", "Drift Ratio", "Verdict"},
                                advancedOutputs.temporalDriftRows);
+        finalAnalysis.addParagraph("Recommended action: retrain on recent windows, verify upstream data pipeline changes, and consider differencing/time-aware transforms for non-stationary signals.");
     }
 
     if (!advancedOutputs.contextualDeadZoneRows.empty()) {
@@ -8687,8 +8770,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     if (advancedOutputs.causalDagMermaid.has_value()) {
-        finalAnalysis.addParagraph("Causal Inference (Lite) visual sketch (heuristic DAG):\n" + *advancedOutputs.causalDagMermaid);
-        finalAnalysis.addParagraph("Causal-lite guardrail: edges are directional hypotheses inferred from partial-correlation retention and proxy collapse, and do not establish intervention-level causality.");
+        finalAnalysis.addParagraph("Causal discovery visual sketch (PC/Meek/LiNGAM + bootstrap support):\n" + *advancedOutputs.causalDagMermaid);
+        finalAnalysis.addParagraph("Guardrail: graph edges are discovery hypotheses under CI assumptions and should be validated against interventions or external design constraints.");
     }
 
     if (!advancedOutputs.mahalanobisRows.empty()) {

@@ -265,6 +265,7 @@ struct AutoConfig {
     bool neuralMultiOutput = true;
     size_t neuralMaxAuxTargets = 2;
     std::string neuralExplainability = "hybrid"; // permutation|integrated_gradients|hybrid
+    std::string neuralOrdinalMode = "rank_regression"; // rank_regression|binary_cross_entropy_when_possible
     size_t neuralIntegratedGradSteps = 8;
     size_t neuralUncertaintySamples = 24;
     size_t neuralEnsembleMembers = 3;

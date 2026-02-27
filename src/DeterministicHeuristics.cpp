@@ -77,8 +77,14 @@ size_t uniqueCountForColumn(const TypedColumn& col) {
 }
 
 bool isMetadataName(const std::string& name) {
-    static const std::regex re("(id|date|time|coord|name|timestamp|lat|lon|lng)", std::regex::icase);
-    return std::regex_search(name, re);
+    static const std::regex strictAdminPattern(
+        R"((^id$)|(^idx$)|(^index$)|(_id$)|(^id_)|(_index$)|(_idx$)|(^row_?id$)|(^row_?num(ber)?$)|(^uuid$)|(_uuid$)|(^guid$)|(_guid$)|(^timestamp$)|(_timestamp$)|(^created(_at)?$)|(_created(_at)?$)|(^updated(_at)?$)|(_updated(_at)?$)|(^date$)|(_date$)|(^time$)|(_time$)|(^lat$)|(^latitude$)|(_lat$)|(^lon$)|(^lng$)|(_lon$)|(_lng$)|(^coord(inate)?s?$)|(_coord(inate)?s?$))",
+        std::regex::icase);
+    if (std::regex_search(name, strictAdminPattern)) return true;
+    const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
+    return lower.find("metadata") != std::string::npos ||
+           lower.find("audit") != std::string::npos ||
+           lower.find("ingest") != std::string::npos;
 }
 
 bool isTargetCandidateName(const std::string& name) {
