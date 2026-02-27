@@ -617,6 +617,8 @@ Primary markdown outputs:
 - `neural_synthesis.md`
 - `final_analysis.md`
 
+`final_analysis.md` now includes a **Causal Inference (Lite) DAG Candidates** section that ranks heuristic directed edges (likely drivers vs likely proxies) using partial-correlation retention and interaction proxy evidence.
+
 Assets:
 
 - `seldon_report_assets/univariate`

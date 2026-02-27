@@ -99,6 +99,41 @@ std::string toFixed(double v, int prec = 4) {
     return os.str();
 }
 
+std::string scoreBar100(double score) {
+    const double s = std::clamp(score, 0.0, 100.0);
+    const size_t filled = static_cast<size_t>(std::round((s / 100.0) * 10.0));
+    std::string out = "[";
+    for (size_t i = 0; i < 10; ++i) out += (i < filled ? "#" : "-");
+    out += "]";
+    return out;
+}
+
+void addExecutiveDashboard(ReportEngine& report,
+                           const std::string& title,
+                           const std::vector<std::pair<std::string, std::string>>& metrics,
+                           const std::vector<std::string>& highlights,
+                           const std::string& note = "") {
+    report.addParagraph("---");
+    report.addParagraph("## " + title);
+    if (!note.empty()) report.addParagraph(note);
+
+    if (!metrics.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        rows.reserve(metrics.size());
+        for (const auto& kv : metrics) rows.push_back({kv.first, kv.second});
+        report.addTable("Executive Snapshot", {"KPI", "Value"}, rows);
+    }
+
+    if (!highlights.empty()) {
+        std::string bulletBlock;
+        for (const auto& h : highlights) {
+            if (h.empty()) continue;
+            bulletBlock += "- " + h + "\n";
+        }
+        if (!bulletBlock.empty()) report.addParagraph("### Quick Highlights\n" + bulletBlock);
+    }
+}
+
 void printProgressBar(const std::string& label, size_t current, size_t total) {
     const size_t width = 24;
     const double ratio = (total == 0) ? 0.0 : std::clamp(static_cast<double>(current) / static_cast<double>(total), 0.0, 1.0);
@@ -4616,13 +4651,55 @@ struct AdvancedAnalyticsOutputs {
     std::vector<std::vector<std::string>> orderedRows;
     std::vector<std::vector<std::string>> mahalanobisRows;
     std::vector<std::vector<std::string>> pdpRows;
+    std::vector<std::vector<std::string>> causalDagRows;
+    std::vector<std::vector<std::string>> globalConditionalRows;
     std::vector<std::string> narrativeRows;
     std::vector<std::string> priorityTakeaways;
     std::optional<std::string> interactionEvidence;
+    std::optional<std::string> causalDagMermaid;
     std::unordered_map<size_t, double> mahalanobisByRow;
     double mahalanobisThreshold = 0.0;
     std::optional<std::string> executiveSummary;
 };
+
+struct ConditionalDriftAssessment {
+    bool signFlip = false;
+    bool magnitudeCollapse = false;
+    double collapseRatio = 1.0;
+    std::string label = "stable";
+};
+
+ConditionalDriftAssessment assessGlobalConditionalDrift(double globalR,
+                                                        double conditionalR,
+                                                        double minGlobalAbs = 0.15,
+                                                        double collapseRatioThreshold = 0.50,
+                                                        double collapseAbsDrop = 0.12) {
+    ConditionalDriftAssessment out;
+    if (!std::isfinite(globalR) || !std::isfinite(conditionalR)) {
+        out.label = "insufficient";
+        return out;
+    }
+
+    const double absGlobal = std::abs(globalR);
+    const double absConditional = std::abs(conditionalR);
+    out.collapseRatio = (absGlobal > 1e-12) ? (absConditional / absGlobal) : 1.0;
+
+    if (absGlobal < minGlobalAbs) {
+        out.label = "weak-global-signal";
+        return out;
+    }
+
+    out.signFlip = (globalR * conditionalR < 0.0) && (absConditional >= 0.05);
+    out.magnitudeCollapse =
+        (absConditional <= absGlobal * collapseRatioThreshold) &&
+        ((absGlobal - absConditional) >= collapseAbsDrop);
+
+    if (out.signFlip && out.magnitudeCollapse) out.label = "flip+collapse";
+    else if (out.signFlip) out.label = "sign-flip";
+    else if (out.magnitudeCollapse) out.label = "magnitude-collapse";
+    else out.label = "stable";
+    return out;
+}
 
 std::string cramerStrengthLabel(double v) {
     if (v >= 0.60) return "very strong";
@@ -4856,6 +4933,23 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
 
             const size_t controlCount = std::min<size_t>(stepwiseSelected.size(), 2);
             std::vector<size_t> controls(stepwiseSelected.begin(), stepwiseSelected.begin() + controlCount);
+            auto globalCorr = [&](size_t feature) {
+                std::vector<double> yVec;
+                std::vector<double> xVec;
+                const auto& xv = std::get<std::vector<double>>(data.columns()[feature].values);
+                for (size_t r = 0; r < y.size() && r < xv.size(); ++r) {
+                    if (!std::isfinite(y[r]) || !std::isfinite(xv[r])) continue;
+                    if (r < data.columns()[static_cast<size_t>(targetIdx)].missing.size() && data.columns()[static_cast<size_t>(targetIdx)].missing[r]) continue;
+                    if (r < data.columns()[feature].missing.size() && data.columns()[feature].missing[r]) continue;
+                    yVec.push_back(y[r]);
+                    xVec.push_back(xv[r]);
+                }
+                if (xVec.size() < 12) return 0.0;
+                const ColumnStats sx = Statistics::calculateStats(xVec);
+                const ColumnStats sy = Statistics::calculateStats(yVec);
+                return MathUtils::calculatePearson(xVec, yVec, sx, sy).value_or(0.0);
+            };
+
             auto partialCorr = [&](size_t feature) {
                 std::vector<double> yVec;
                 std::vector<double> xVec;
@@ -4910,15 +5004,49 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
 
             size_t bestPcIdx = static_cast<size_t>(-1);
             double bestPc = 0.0;
+            size_t signFlipCount = 0;
+            size_t collapseCount = 0;
             for (size_t idx : numericFeatures) {
                 if (std::find(controls.begin(), controls.end(), idx) != controls.end()) continue;
-                const double pc = std::abs(partialCorr(idx));
+                const double g = globalCorr(idx);
+                const double p = partialCorr(idx);
+                const double pc = std::abs(p);
+                const auto drift = assessGlobalConditionalDrift(g, p);
+                if (drift.signFlip || drift.magnitudeCollapse) {
+                    if (drift.signFlip) ++signFlipCount;
+                    if (drift.magnitudeCollapse) ++collapseCount;
+                    std::string interpretation;
+                    if (drift.label == "flip+collapse") {
+                        interpretation = "Direction reverses after controls and effect size shrinks materially; likely confounding/proxy pathway.";
+                    } else if (drift.label == "sign-flip") {
+                        interpretation = "Direction reverses after controls; relationship may be Simpson-type/confounded.";
+                    } else {
+                        interpretation = "Magnitude collapses after controls; global association likely proxy-driven.";
+                    }
+                    out.globalConditionalRows.push_back({
+                        data.columns()[idx].name,
+                        toFixed(g, 4),
+                        toFixed(p, 4),
+                        toFixed(drift.collapseRatio, 3),
+                        drift.label,
+                        interpretation
+                    });
+                }
+
                 if (pc > bestPc) {
                     bestPc = pc;
                     bestPcIdx = idx;
                 }
             }
             out.orderedRows.push_back({"5", "Partial correlation after control", (bestPcIdx == static_cast<size_t>(-1) ? "No stable partial-correlation signal." : (data.columns()[bestPcIdx].name + " retains independent signal after controlling for top predictors (partial |r|=" + toFixed(bestPc, 4) + ", controls=" + std::to_string(controls.size()) + ")"))});
+
+            if (!out.globalConditionalRows.empty()) {
+                const std::string driftMsg = "Detected " + std::to_string(out.globalConditionalRows.size()) +
+                    " global-vs-conditional drift patterns (sign flips=" + std::to_string(signFlipCount) +
+                    ", magnitude collapses=" + std::to_string(collapseCount) + ").";
+                out.orderedRows.push_back({"6", "Global vs conditional drift check", driftMsg});
+                out.priorityTakeaways.push_back(driftMsg);
+            }
         } else {
             out.orderedRows.push_back({"4", "Residual discovery via stepwise OLS", "No usable numeric predictors."});
             out.orderedRows.push_back({"5", "Partial correlation after control", "No usable numeric predictors."});
@@ -4968,6 +5096,247 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
             }
         }
         out.orderedRows.push_back({"6", "Linear interaction significance", interactionMsg});
+    }
+
+    {
+        struct CausalFeatureScore {
+            size_t idx = static_cast<size_t>(-1);
+            double rawAbs = 0.0;
+            double partialAbs = 0.0;
+            double retention = 0.0;
+            std::string role;
+        };
+
+        struct CausalEdge {
+            std::string from;
+            std::string to;
+            double confidence = 0.0;
+            std::string evidence;
+            std::string interpretation;
+        };
+
+        auto pearsonAbsAligned = [&](size_t aIdx, size_t bIdx) -> double {
+            if (aIdx >= data.columns().size() || bIdx >= data.columns().size()) return 0.0;
+            if (data.columns()[aIdx].type != ColumnType::NUMERIC || data.columns()[bIdx].type != ColumnType::NUMERIC) return 0.0;
+            const auto& a = std::get<std::vector<double>>(data.columns()[aIdx].values);
+            const auto& b = std::get<std::vector<double>>(data.columns()[bIdx].values);
+            std::vector<double> xa;
+            std::vector<double> xb;
+            xa.reserve(std::min(a.size(), b.size()));
+            xb.reserve(std::min(a.size(), b.size()));
+            const size_t n = std::min(a.size(), b.size());
+            for (size_t r = 0; r < n; ++r) {
+                if (!std::isfinite(a[r]) || !std::isfinite(b[r])) continue;
+                if (r < data.columns()[aIdx].missing.size() && data.columns()[aIdx].missing[r]) continue;
+                if (r < data.columns()[bIdx].missing.size() && data.columns()[bIdx].missing[r]) continue;
+                xa.push_back(a[r]);
+                xb.push_back(b[r]);
+            }
+            if (xa.size() < 12) return 0.0;
+            const ColumnStats as = Statistics::calculateStats(xa);
+            const ColumnStats bs = Statistics::calculateStats(xb);
+            return std::abs(MathUtils::calculatePearson(xa, xb, as, bs).value_or(0.0));
+        };
+
+        auto partialAgainstControls = [&](size_t feature, const std::vector<size_t>& controls) -> double {
+            if (feature >= data.columns().size()) return 0.0;
+            const auto& xv = std::get<std::vector<double>>(data.columns()[feature].values);
+            std::vector<double> yVec;
+            std::vector<double> xVec;
+            std::vector<std::vector<double>> ctrlRows;
+            const size_t n = std::min(y.size(), xv.size());
+            for (size_t r = 0; r < n; ++r) {
+                if (!std::isfinite(y[r]) || !std::isfinite(xv[r])) continue;
+                if (r < data.columns()[static_cast<size_t>(targetIdx)].missing.size() && data.columns()[static_cast<size_t>(targetIdx)].missing[r]) continue;
+                if (r < data.columns()[feature].missing.size() && data.columns()[feature].missing[r]) continue;
+                std::vector<double> row;
+                row.reserve(controls.size() + 1);
+                row.push_back(1.0);
+                bool ok = true;
+                for (size_t cidx : controls) {
+                    const auto& cv = std::get<std::vector<double>>(data.columns()[cidx].values);
+                    if (r >= cv.size() || !std::isfinite(cv[r])) { ok = false; break; }
+                    if (r < data.columns()[cidx].missing.size() && data.columns()[cidx].missing[r]) { ok = false; break; }
+                    row.push_back(cv[r]);
+                }
+                if (!ok) continue;
+                ctrlRows.push_back(std::move(row));
+                yVec.push_back(y[r]);
+                xVec.push_back(xv[r]);
+            }
+            if (ctrlRows.size() < controls.size() + 10) return 0.0;
+            MathUtils::Matrix X(ctrlRows.size(), controls.size() + 1);
+            MathUtils::Matrix Yy(ctrlRows.size(), 1);
+            MathUtils::Matrix Yx(ctrlRows.size(), 1);
+            for (size_t i = 0; i < ctrlRows.size(); ++i) {
+                for (size_t c = 0; c < ctrlRows[i].size(); ++c) X.at(i, c) = ctrlRows[i][c];
+                Yy.at(i, 0) = yVec[i];
+                Yx.at(i, 0) = xVec[i];
+            }
+            const auto by = MathUtils::multipleLinearRegression(X, Yy);
+            const auto bx = MathUtils::multipleLinearRegression(X, Yx);
+            if (by.size() != controls.size() + 1 || bx.size() != controls.size() + 1) return 0.0;
+
+            std::vector<double> ry(ctrlRows.size(), 0.0);
+            std::vector<double> rx(ctrlRows.size(), 0.0);
+            for (size_t i = 0; i < ctrlRows.size(); ++i) {
+                double py = 0.0;
+                double px = 0.0;
+                for (size_t c = 0; c < ctrlRows[i].size(); ++c) {
+                    py += ctrlRows[i][c] * by[c];
+                    px += ctrlRows[i][c] * bx[c];
+                }
+                ry[i] = yVec[i] - py;
+                rx[i] = xVec[i] - px;
+            }
+            const ColumnStats sx = Statistics::calculateStats(rx);
+            const ColumnStats sy = Statistics::calculateStats(ry);
+            return std::abs(MathUtils::calculatePearson(rx, ry, sx, sy).value_or(0.0));
+        };
+
+        std::vector<CausalFeatureScore> featureScores;
+        featureScores.reserve(numericFeatures.size());
+        for (size_t idx : numericFeatures) {
+            const double raw = pearsonAbsAligned(idx, static_cast<size_t>(targetIdx));
+            featureScores.push_back({idx, raw, 0.0, 0.0, "uncertain"});
+        }
+        std::sort(featureScores.begin(), featureScores.end(), [](const auto& a, const auto& b) {
+            return a.rawAbs > b.rawAbs;
+        });
+
+        std::vector<size_t> ranking;
+        ranking.reserve(featureScores.size());
+        for (const auto& s : featureScores) ranking.push_back(s.idx);
+
+        std::vector<size_t> drivers;
+        std::vector<size_t> proxies;
+        for (auto& score : featureScores) {
+            std::vector<size_t> controls;
+            for (size_t idx : ranking) {
+                if (idx == score.idx) continue;
+                controls.push_back(idx);
+                if (controls.size() >= 2) break;
+            }
+            score.partialAbs = partialAgainstControls(score.idx, controls);
+            score.retention = (score.rawAbs > 1e-8) ? (score.partialAbs / score.rawAbs) : 0.0;
+
+            if (score.rawAbs >= 0.20 && score.partialAbs >= 0.12 && score.retention >= 0.55) {
+                score.role = "likely driver";
+                drivers.push_back(score.idx);
+            } else if (score.rawAbs >= 0.20 && score.retention <= 0.35) {
+                score.role = "likely proxy";
+                proxies.push_back(score.idx);
+            } else {
+                score.role = "uncertain";
+            }
+        }
+
+        std::vector<CausalEdge> edges;
+        const std::string targetName = data.columns()[static_cast<size_t>(targetIdx)].name;
+        for (const auto& score : featureScores) {
+            if (score.role != "likely driver") continue;
+            const double conf = std::clamp(0.35 + 0.45 * score.partialAbs + 0.20 * score.retention, 0.0, 0.99);
+            edges.push_back({
+                data.columns()[score.idx].name,
+                targetName,
+                conf,
+                "|r|=" + toFixed(score.rawAbs, 3) + ", partial|r|=" + toFixed(score.partialAbs, 3) + ", retention=" + toFixed(score.retention, 3),
+                "Signal remains after controlling top predictors; candidate driver for target."
+            });
+        }
+
+        for (size_t proxyIdx : proxies) {
+            double bestLink = 0.0;
+            size_t bestDriver = static_cast<size_t>(-1);
+            for (size_t driverIdx : drivers) {
+                const double link = pearsonAbsAligned(proxyIdx, driverIdx);
+                if (link > bestLink) {
+                    bestLink = link;
+                    bestDriver = driverIdx;
+                }
+            }
+
+            if (bestDriver != static_cast<size_t>(-1) && bestLink >= 0.45) {
+                const double conf = std::clamp(0.25 + 0.55 * bestLink, 0.0, 0.95);
+                edges.push_back({
+                    data.columns()[bestDriver].name,
+                    data.columns()[proxyIdx].name,
+                    conf,
+                    "driver-proxy link |r|=" + toFixed(bestLink, 3),
+                    "Proxy candidate: correlation with target weakens strongly after controls."
+                });
+            } else {
+                const double raw = pearsonAbsAligned(proxyIdx, static_cast<size_t>(targetIdx));
+                edges.push_back({
+                    data.columns()[proxyIdx].name,
+                    targetName,
+                    std::clamp(0.15 + 0.40 * raw, 0.0, 0.75),
+                    "|r|=" + toFixed(raw, 3) + " with unresolved upstream driver",
+                    "Association detected; likely proxy path not fully resolved."
+                });
+            }
+        }
+
+        if (igA != static_cast<size_t>(-1) && igB != static_cast<size_t>(-1) && bestIgProxy >= 0.12) {
+            edges.push_back({
+                data.columns()[igA].name + " × " + data.columns()[igB].name,
+                targetName,
+                std::clamp(0.20 + 0.50 * bestIgProxy, 0.0, 0.90),
+                "interaction proxy=" + toFixed(bestIgProxy, 3),
+                "Pair interaction may carry directional effect beyond additive terms."
+            });
+        }
+
+        std::sort(edges.begin(), edges.end(), [](const auto& a, const auto& b) {
+            return a.confidence > b.confidence;
+        });
+        if (edges.size() > 10) edges.resize(10);
+
+        for (const auto& e : edges) {
+            out.causalDagRows.push_back({e.from, e.to, toFixed(e.confidence, 3), e.evidence, e.interpretation});
+        }
+
+        if (!edges.empty()) {
+            std::unordered_map<std::string, std::string> nodeIds;
+            auto idFor = [&](const std::string& node) {
+                auto it = nodeIds.find(node);
+                if (it != nodeIds.end()) return it->second;
+                const std::string id = "N" + std::to_string(nodeIds.size() + 1);
+                nodeIds[node] = id;
+                return id;
+            };
+            auto quoteSafe = [](std::string s) {
+                std::replace(s.begin(), s.end(), '"', '\'');
+                return s;
+            };
+
+            std::ostringstream mermaid;
+            mermaid << "```mermaid\n";
+            mermaid << "flowchart LR\n";
+            for (const auto& e : edges) {
+                const std::string fromId = idFor(e.from);
+                const std::string toId = idFor(e.to);
+                mermaid << "    " << fromId << "[\"" << quoteSafe(e.from) << "\"] -->|"
+                        << toFixed(e.confidence, 2) << "| "
+                        << toId << "[\"" << quoteSafe(e.to) << "\"]\n";
+            }
+            mermaid << "```";
+            out.causalDagMermaid = mermaid.str();
+
+            size_t driverEdges = 0;
+            size_t proxyEdges = 0;
+            for (const auto& e : edges) {
+                if (e.to == targetName) ++driverEdges;
+                if (e.interpretation.find("Proxy") != std::string::npos || e.interpretation.find("proxy") != std::string::npos) ++proxyEdges;
+            }
+            const std::string summary = "Causal-lite DAG generated " + std::to_string(edges.size()) +
+                " directed candidates (to-target=" + std::to_string(driverEdges) +
+                ", proxy-path=" + std::to_string(proxyEdges) + ").";
+            out.priorityTakeaways.push_back(summary + " Treat these as directional hypotheses, not causal proof.");
+            out.orderedRows.push_back({"7", "Causal inference (lite) DAG", summary});
+        } else {
+            out.orderedRows.push_back({"7", "Causal inference (lite) DAG", "No stable directed candidates; current significant findings are likely associative only."});
+        }
     }
 
     {
@@ -6181,6 +6550,7 @@ std::optional<std::string> buildResidualDiscoveryNarrative(const TypedDataset& d
 
     int secondIdx = -1;
     double bestResidualCorr = 0.0;
+    double secondGlobalCorr = 0.0;
     for (int idx : featureIdx) {
         if (idx < 0 || idx == targetIdx || idx == bestIdx) continue;
         if (static_cast<size_t>(idx) >= data.columns().size()) continue;
@@ -6191,19 +6561,32 @@ std::optional<std::string> buildResidualDiscoveryNarrative(const TypedDataset& d
         const ColumnStats xStats = statsCache.count(static_cast<size_t>(idx))
             ? statsCache.at(static_cast<size_t>(idx))
             : Statistics::calculateStats(x);
+        const double g = MathUtils::calculatePearson(x, y, xStats, yStats).value_or(0.0);
         const double rr = std::abs(MathUtils::calculatePearson(x, residual, xStats, residualStats).value_or(0.0));
         if (std::isfinite(rr) && rr > bestResidualCorr) {
             bestResidualCorr = rr;
             secondIdx = idx;
+            secondGlobalCorr = g;
         }
     }
     if (secondIdx < 0 || bestResidualCorr < 0.25) return std::nullopt;
+
+    const auto drift = assessGlobalConditionalDrift(secondGlobalCorr, bestResidualCorr);
+    std::string driftText;
+    if (drift.label == "flip+collapse") {
+        driftText = " Drift check: sign-flip + magnitude-collapse versus global relationship.";
+    } else if (drift.label == "sign-flip") {
+        driftText = " Drift check: sign-flip versus global relationship.";
+    } else if (drift.label == "magnitude-collapse") {
+        driftText = " Drift check: magnitude-collapse after controlling primary driver.";
+    }
 
     return "Residual discovery: " + data.columns()[static_cast<size_t>(bestIdx)].name +
            " is the primary driver of " + data.columns()[static_cast<size_t>(targetIdx)].name +
            " (|r|=" + toFixed(bestAbsCorr, 3) + "), while " +
            data.columns()[static_cast<size_t>(secondIdx)].name +
-           " best explains the remaining error signal (|r_residual|=" + toFixed(bestResidualCorr, 3) + ").";
+           " best explains the remaining error signal (|r_residual|=" + toFixed(bestResidualCorr, 3) +
+           ", global r=" + toFixed(secondGlobalCorr, 3) + ")." + driftText;
 }
 
 std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset& data,
@@ -6588,6 +6971,26 @@ int AutomationPipeline::run(const AutoConfig& config) {
             univariate.addTable("Feature Engineering Sample", {"Engineered Feature", "Base Feature"}, engineeredRows);
         }
     }
+    addExecutiveDashboard(
+        univariate,
+        "Executive Dashboard",
+        {
+            {"Rows", std::to_string(data.rowCount())},
+            {"Raw Columns", std::to_string(loadedColumnCount)},
+            {"Post-Cull Columns", std::to_string(rawColumnsAfterPreflight)},
+            {"Engineered Features", std::to_string(engineeredFeatureCount)},
+            {"Analysis Dimensions", std::to_string(totalAnalysisDimensions)}
+        },
+        {
+            preflightCull.dropped > 0
+                ? ("Pre-flight sparse-column cull removed " + std::to_string(preflightCull.dropped) + " highly missing columns.")
+                : "No severe pre-flight sparse-column issues were detected.",
+            strictFeatureReporting
+                ? "Strict feature-reporting is active to keep the report compact and readable."
+                : "Full-dimension descriptive profiling is enabled."
+        },
+        "Quick non-technical view before deep descriptive tables."
+    );
     addUnivariateDetailedSection(univariate, reportingData, prep, runCfg.verboseAnalysis, rawStatsCache);
     advance("Built univariate tables");
 
@@ -6941,6 +7344,25 @@ int AutomationPipeline::run(const AutoConfig& config) {
     if (strictFeatureReporting) {
         bivariate.addParagraph("Strict feature-reporting mode: suppressed " + std::to_string(strictSuppressedPairs) + " engineered-feature pairs (" + std::to_string(strictSuppressedSelected) + " were otherwise selected). See Univariate 'Feature Engineering Insights'.");
     }
+    addExecutiveDashboard(
+        bivariate,
+        "Executive Dashboard",
+        {
+            {"Pairs Evaluated", std::to_string(bivariatePairs.size())},
+            {"Statistically Significant", std::to_string(statSigCount)},
+            {"Selected Findings", std::to_string(sigRows.size())},
+            {"Tier-2", std::to_string(tier2Count)},
+            {"Tier-3", std::to_string(tier3Count)}
+        },
+        {
+            "Selection balances statistical significance with neural relevance and domain fallback rules.",
+            "Filtering removes redundant, structural, and leakage-risk relationships before final ranking.",
+            strictFeatureReporting
+                ? "Engineered-feature pair suppression is active for readability."
+                : "Pair coverage includes the full core signal set."
+        },
+        "Quick map of relationship strength before detailed pair evidence."
+    );
     if (compactBivariateRows) {
         bivariate.addParagraph("Low-memory mode: omitted full pair table and kept only selected + capped rejected samples for diagnostics.");
     } else {
@@ -7008,6 +7430,22 @@ int AutomationPipeline::run(const AutoConfig& config) {
     neuralReport.addParagraph("This synthesis captures neural network training traces and how neural relevance influenced bivariate selection.");
     neuralReport.addParagraph(std::string("Task type inferred from target: ") + targetContext.semantics.inferredTask);
     neuralReport.addParagraph("Bivariate significance now uses a three-tier gate: Tier-1 statistical evidence, Tier-2 neural confirmation, Tier-3 domain fallback for high-effect stable relationships when neural yield is sparse.");
+    addExecutiveDashboard(
+        neuralReport,
+        "Executive Dashboard",
+        {
+            {"Task Type", targetContext.semantics.inferredTask},
+            {"Training Rows Used", std::to_string(neural.trainingRowsUsed) + " / " + std::to_string(neural.trainingRowsTotal)},
+            {"Epochs", std::to_string(neural.epochs)},
+            {"Topology", neural.topology},
+            {"Health Score", toFixed(dataHealth.score, 1) + "/100 " + scoreBar100(dataHealth.score)}
+        },
+        {
+            "Auto policy and deterministic guardrails reduce overfitting and unstable topology growth.",
+            "Explainability and uncertainty traces are preserved for interpretability."
+        },
+        "Fast leadership view of model behavior before detailed training diagnostics."
+    );
     neuralReport.addTable("Auto Decision Log", {"Decision", "Value"}, {
         {"Target Selection", targetContext.userProvidedTarget ? "user-specified" : "auto"},
         {"Target Strategy", targetContext.choice.strategyUsed},
@@ -7141,9 +7579,42 @@ int AutomationPipeline::run(const AutoConfig& config) {
     finalAnalysis.addTitle("Final Analysis - Significant Findings Only");
     finalAnalysis.addParagraph("This report contains statistically significant findings selected by a tiered engine: Tier-2 (statistical + neural) and Tier-3 fallback (statistical + domain effect). Non-selected findings are excluded by design.");
     finalAnalysis.addParagraph("Data Health Score: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + "). This score estimates discovered signal strength using completeness, retained feature coverage, significant-pair yield, selected-pair yield, and neural training stability.");
+    addExecutiveDashboard(
+        finalAnalysis,
+        "Executive Dashboard",
+        {
+            {"Health Score", toFixed(dataHealth.score, 1) + "/100 " + scoreBar100(dataHealth.score)},
+            {"Health Band", dataHealth.band},
+            {"Selected Findings", std::to_string(sigRows.size())},
+            {"Rows", std::to_string(data.rowCount())},
+            {"Columns", std::to_string(data.colCount())}
+        },
+        {
+            "This top block is optimized for non-technical consumption.",
+            "Ordered methods, causal-lite checks, and detailed evidence tables follow below."
+        },
+        "Snapshot first; evidence next."
+    );
 
     if (!advancedOutputs.orderedRows.empty()) {
         finalAnalysis.addTable("Ordered Methods", {"Step", "Method", "Result"}, advancedOutputs.orderedRows);
+    }
+
+    if (!advancedOutputs.causalDagRows.empty()) {
+        finalAnalysis.addTable("Causal Inference (Lite) DAG Candidates",
+                               {"From", "To", "Confidence", "Evidence", "Interpretation"},
+                               advancedOutputs.causalDagRows);
+    }
+
+    if (!advancedOutputs.globalConditionalRows.empty()) {
+        finalAnalysis.addTable("Global vs Conditional Relationship Drift",
+                               {"Feature", "Global r", "Conditional r", "|conditional|/|global|", "Pattern", "Interpretation"},
+                               advancedOutputs.globalConditionalRows);
+    }
+
+    if (advancedOutputs.causalDagMermaid.has_value()) {
+        finalAnalysis.addParagraph("Causal Inference (Lite) visual sketch (heuristic DAG):\n" + *advancedOutputs.causalDagMermaid);
+        finalAnalysis.addParagraph("Causal-lite guardrail: edges are directional hypotheses inferred from partial-correlation retention and proxy collapse, and do not establish intervention-level causality.");
     }
 
     if (!advancedOutputs.mahalanobisRows.empty()) {
@@ -7317,6 +7788,25 @@ int AutomationPipeline::run(const AutoConfig& config) {
         : deterministic.residualNarrative;
 
     std::string phase5Narrative = "Deterministic narrative synthesis translated statistical findings into concise analytical statements.";
+
+    addExecutiveDashboard(
+        heuristicsReport,
+        "Executive Dashboard",
+        {
+            {"Semantic Admin Columns", std::to_string(adminCount)},
+            {"Target Candidates", std::to_string(targetCandidateCount)},
+            {"Low-Signal Columns", std::to_string(lowSignalCount)},
+            {"Rows:Features", toFixed(deterministic.rowsToFeatures, 2)},
+            {"Training Stability", stabilityPct}
+        },
+        {
+            "Deterministic phases provide interpretable quality controls independent of model complexity.",
+            stabilityGuardTriggered
+                ? "Stability guard triggered and topology was shrunk for safer convergence."
+                : "Stability guard did not trigger; topology remained in stable range."
+        },
+        "Control-layer summary before stage-level diagnostics."
+    );
 
     heuristicsReport.addTable("Analysis Workflow Summary", {"Stage", "Objective", "Method", "Outcome"}, {
         {"Semantic Filtering", "Reduce metadata and administrative noise", "Regex role tagging (ADMIN/METADATA/TARGET_CANDIDATE)", phase1Narrative},
