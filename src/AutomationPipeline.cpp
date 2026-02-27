@@ -4653,6 +4653,8 @@ struct AdvancedAnalyticsOutputs {
     std::vector<std::vector<std::string>> pdpRows;
     std::vector<std::vector<std::string>> causalDagRows;
     std::vector<std::vector<std::string>> globalConditionalRows;
+    std::vector<std::vector<std::string>> temporalDriftRows;
+    std::vector<std::vector<std::string>> contextualDeadZoneRows;
     std::vector<std::string> narrativeRows;
     std::vector<std::string> priorityTakeaways;
     std::optional<std::string> interactionEvidence;
@@ -4707,6 +4709,185 @@ std::string cramerStrengthLabel(double v) {
     if (v >= 0.20) return "moderate";
     if (v >= 0.10) return "weak";
     return "very weak";
+}
+
+struct TemporalAxisDescriptor {
+    std::vector<double> axis;
+    std::string name;
+};
+
+TemporalAxisDescriptor detectTemporalAxis(const TypedDataset& data) {
+    TemporalAxisDescriptor out;
+
+    const auto datetimeIdx = data.datetimeColumnIndices();
+    for (size_t idx : datetimeIdx) {
+        const auto& col = data.columns()[idx];
+        const auto& vals = std::get<std::vector<int64_t>>(col.values);
+        if (vals.size() < 16) continue;
+
+        out.axis.assign(vals.size(), 0.0);
+        std::unordered_set<int64_t> unique;
+        unique.reserve(vals.size());
+        for (size_t r = 0; r < vals.size(); ++r) {
+            out.axis[r] = static_cast<double>(vals[r]);
+            if (r < col.missing.size() && !col.missing[r]) unique.insert(vals[r]);
+        }
+        if (unique.size() >= 8) {
+            out.name = col.name;
+            return out;
+        }
+    }
+
+    const auto numericIdx = data.numericColumnIndices();
+    for (size_t idx : numericIdx) {
+        const std::string lower = CommonUtils::toLower(data.columns()[idx].name);
+        if (!(containsToken(lower, {"time", "date", "index", "idx", "step", "order", "epoch", "year", "month", "day", "week"}) ||
+              lower == "t" || lower == "ts")) {
+            continue;
+        }
+
+        const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
+        if (vals.size() < 16) continue;
+        out.axis.assign(vals.begin(), vals.end());
+        out.name = data.columns()[idx].name;
+        return out;
+    }
+
+    out.axis.resize(data.rowCount(), 0.0);
+    for (size_t r = 0; r < out.axis.size(); ++r) out.axis[r] = static_cast<double>(r + 1);
+    out.name = "row_index";
+    return out;
+}
+
+double absCorrAligned(const std::vector<double>& x,
+                      const std::vector<double>& y,
+                      const std::vector<size_t>& rows) {
+    std::vector<double> xa;
+    std::vector<double> ya;
+    xa.reserve(rows.size());
+    ya.reserve(rows.size());
+    for (size_t r : rows) {
+        if (r >= x.size() || r >= y.size()) continue;
+        if (!std::isfinite(x[r]) || !std::isfinite(y[r])) continue;
+        xa.push_back(x[r]);
+        ya.push_back(y[r]);
+    }
+    if (xa.size() < 10) return 0.0;
+    const ColumnStats xs = Statistics::calculateStats(xa);
+    const ColumnStats ys = Statistics::calculateStats(ya);
+    return std::abs(MathUtils::calculatePearson(xa, ya, xs, ys).value_or(0.0));
+}
+
+struct ContextualDeadZoneInsight {
+    std::string feature;
+    std::string strongCluster;
+    std::string weakCluster;
+    double strongCorr = 0.0;
+    double weakCorr = 0.0;
+    double dropRatio = 1.0;
+    size_t support = 0;
+};
+
+std::vector<ContextualDeadZoneInsight> detectContextualDeadZones(const TypedDataset& data,
+                                                                 size_t targetIdx,
+                                                                 const std::vector<size_t>& candidateFeatures,
+                                                                 size_t maxRows = 10) {
+    std::vector<ContextualDeadZoneInsight> out;
+    if (targetIdx >= data.columns().size() || data.columns()[targetIdx].type != ColumnType::NUMERIC) return out;
+
+    std::vector<size_t> anchors;
+    for (size_t idx : candidateFeatures) {
+        if (idx == targetIdx) continue;
+        if (data.columns()[idx].type != ColumnType::NUMERIC) continue;
+        anchors.push_back(idx);
+        if (anchors.size() >= 2) break;
+    }
+    if (anchors.size() < 2) return out;
+
+    const auto& ax = std::get<std::vector<double>>(data.columns()[anchors[0]].values);
+    const auto& ay = std::get<std::vector<double>>(data.columns()[anchors[1]].values);
+    const auto& target = std::get<std::vector<double>>(data.columns()[targetIdx].values);
+
+    std::vector<size_t> validRows;
+    validRows.reserve(data.rowCount());
+    for (size_t r = 0; r < data.rowCount(); ++r) {
+        if (r >= ax.size() || r >= ay.size() || r >= target.size()) continue;
+        if (!std::isfinite(ax[r]) || !std::isfinite(ay[r]) || !std::isfinite(target[r])) continue;
+        if (r < data.columns()[anchors[0]].missing.size() && data.columns()[anchors[0]].missing[r]) continue;
+        if (r < data.columns()[anchors[1]].missing.size() && data.columns()[anchors[1]].missing[r]) continue;
+        if (r < data.columns()[targetIdx].missing.size() && data.columns()[targetIdx].missing[r]) continue;
+        validRows.push_back(r);
+    }
+    if (validRows.size() < 40) return out;
+
+    std::pair<double, double> c0 = {ax[validRows.front()], ay[validRows.front()]};
+    std::pair<double, double> c1 = {ax[validRows[validRows.size() / 2]], ay[validRows[validRows.size() / 2]]};
+    std::unordered_map<size_t, int> clusterByRow;
+    for (int iter = 0; iter < 20; ++iter) {
+        double s0x = 0.0, s0y = 0.0, n0 = 0.0;
+        double s1x = 0.0, s1y = 0.0, n1 = 0.0;
+        for (size_t r : validRows) {
+            const double d0 = (ax[r] - c0.first) * (ax[r] - c0.first) + (ay[r] - c0.second) * (ay[r] - c0.second);
+            const double d1 = (ax[r] - c1.first) * (ax[r] - c1.first) + (ay[r] - c1.second) * (ay[r] - c1.second);
+            const int cid = (d0 <= d1) ? 0 : 1;
+            clusterByRow[r] = cid;
+            if (cid == 0) {
+                s0x += ax[r];
+                s0y += ay[r];
+                n0 += 1.0;
+            } else {
+                s1x += ax[r];
+                s1y += ay[r];
+                n1 += 1.0;
+            }
+        }
+        if (n0 < 10.0 || n1 < 10.0) return out;
+        c0 = {s0x / n0, s0y / n0};
+        c1 = {s1x / n1, s1y / n1};
+    }
+
+    std::vector<size_t> rows0;
+    std::vector<size_t> rows1;
+    rows0.reserve(validRows.size());
+    rows1.reserve(validRows.size());
+    for (size_t r : validRows) {
+        if (clusterByRow[r] == 0) rows0.push_back(r);
+        else rows1.push_back(r);
+    }
+    if (rows0.size() < 12 || rows1.size() < 12) return out;
+
+    for (size_t featureIdx : candidateFeatures) {
+        if (featureIdx == targetIdx || featureIdx == anchors[0] || featureIdx == anchors[1]) continue;
+        if (featureIdx >= data.columns().size() || data.columns()[featureIdx].type != ColumnType::NUMERIC) continue;
+        const auto& fv = std::get<std::vector<double>>(data.columns()[featureIdx].values);
+
+        const double cA = absCorrAligned(fv, target, rows0);
+        const double cB = absCorrAligned(fv, target, rows1);
+        const double strong = std::max(cA, cB);
+        const double weak = std::min(cA, cB);
+        const double delta = strong - weak;
+        if (strong < 0.35 || weak > 0.10 || delta < 0.25) continue;
+
+        const bool aStrong = cA >= cB;
+        out.push_back({
+            data.columns()[featureIdx].name,
+            aStrong ? "Cluster A" : "Cluster B",
+            aStrong ? "Cluster B" : "Cluster A",
+            strong,
+            weak,
+            (strong > 1e-9) ? (weak / strong) : 1.0,
+            std::min(rows0.size(), rows1.size())
+        });
+    }
+
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        const double da = a.strongCorr - a.weakCorr;
+        const double db = b.strongCorr - b.weakCorr;
+        if (da == db) return a.dropRatio < b.dropRatio;
+        return da > db;
+    });
+    if (out.size() > maxRows) out.resize(maxRows);
+    return out;
 }
 
 AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
@@ -5277,6 +5458,57 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
             }
         }
 
+        {
+            std::vector<size_t> dagNodes;
+            dagNodes.reserve(featureScores.size());
+            for (const auto& s : featureScores) {
+                dagNodes.push_back(s.idx);
+                if (dagNodes.size() >= 6) break;
+            }
+
+            for (size_t i = 0; i < dagNodes.size(); ++i) {
+                for (size_t j = i + 1; j < dagNodes.size(); ++j) {
+                    const size_t aIdx = dagNodes[i];
+                    const size_t bIdx = dagNodes[j];
+                    const auto& aVals = std::get<std::vector<double>>(data.columns()[aIdx].values);
+                    const auto& bVals = std::get<std::vector<double>>(data.columns()[bIdx].values);
+                    const auto direction = Statistics::asymmetricInformationGain(aVals, bVals, 8);
+                    if (std::abs(direction.asymmetry) < 0.015) continue;
+
+                    const bool aToB = direction.suggestedDirection == "x->y";
+                    const std::string from = aToB ? data.columns()[aIdx].name : data.columns()[bIdx].name;
+                    const std::string to = aToB ? data.columns()[bIdx].name : data.columns()[aIdx].name;
+                    const double pairCorr = pearsonAbsAligned(aIdx, bIdx);
+                    const double conf = std::clamp(0.20 + std::min(0.45, std::abs(direction.asymmetry) * 1.8) + 0.25 * pairCorr, 0.0, 0.93);
+
+                    edges.push_back({
+                        from,
+                        to,
+                        conf,
+                        "AIG(x→y)=" + toFixed(direction.xToY, 3) + ", AIG(y→x)=" + toFixed(direction.yToX, 3) + ", Δ=" + toFixed(direction.asymmetry, 3),
+                        "Directed by asymmetric information gain; treat as causal ordering hypothesis."
+                    });
+                }
+            }
+
+            if (drivers.size() >= 2) {
+                const size_t d1 = drivers[0];
+                const size_t d2 = drivers[1];
+                const double dd = pearsonAbsAligned(d1, d2);
+                const double dt1 = pearsonAbsAligned(d1, static_cast<size_t>(targetIdx));
+                const double dt2 = pearsonAbsAligned(d2, static_cast<size_t>(targetIdx));
+                if (dd <= 0.15 && dt1 >= 0.30 && dt2 >= 0.30) {
+                    edges.push_back({
+                        data.columns()[d1].name + " & " + data.columns()[d2].name,
+                        targetName,
+                        std::clamp(0.30 + 0.30 * (dt1 + dt2), 0.0, 0.95),
+                        "PC-style collider signal: parent-parent |r|=" + toFixed(dd, 3) + ", parent-target |r|=" + toFixed(dt1, 3) + "/" + toFixed(dt2, 3),
+                        "Potential collider around target consistent with Peter-Clark orientation logic."
+                    });
+                }
+            }
+        }
+
         if (igA != static_cast<size_t>(-1) && igB != static_cast<size_t>(-1) && bestIgProxy >= 0.12) {
             edges.push_back({
                 data.columns()[igA].name + " × " + data.columns()[igB].name,
@@ -5336,6 +5568,85 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
             out.orderedRows.push_back({"7", "Causal inference (lite) DAG", summary});
         } else {
             out.orderedRows.push_back({"7", "Causal inference (lite) DAG", "No stable directed candidates; current significant findings are likely associative only."});
+        }
+    }
+
+    {
+        const auto axis = detectTemporalAxis(data);
+        std::vector<size_t> temporalCandidates = numericFeatures;
+        if (std::find(temporalCandidates.begin(), temporalCandidates.end(), static_cast<size_t>(targetIdx)) == temporalCandidates.end()) {
+            temporalCandidates.push_back(static_cast<size_t>(targetIdx));
+        }
+
+        std::vector<StationarityDiagnostic> diagnostics;
+        diagnostics.reserve(temporalCandidates.size());
+        for (size_t idx : temporalCandidates) {
+            if (idx >= data.columns().size()) continue;
+            if (data.columns()[idx].type != ColumnType::NUMERIC) continue;
+            if (CommonUtils::toLower(data.columns()[idx].name) == CommonUtils::toLower(axis.name)) continue;
+            const auto& values = std::get<std::vector<double>>(data.columns()[idx].values);
+            auto diag = Statistics::adfStyleDrift(values, axis.axis, data.columns()[idx].name, axis.name);
+            if (diag.samples < 12) continue;
+            diagnostics.push_back(std::move(diag));
+        }
+
+        std::sort(diagnostics.begin(), diagnostics.end(), [](const auto& a, const auto& b) {
+            if (a.nonStationary != b.nonStationary) return a.nonStationary > b.nonStationary;
+            if (a.driftRatio == b.driftRatio) return a.pApprox > b.pApprox;
+            return a.driftRatio > b.driftRatio;
+        });
+
+        size_t flagged = 0;
+        for (const auto& d : diagnostics) {
+            if (d.nonStationary) ++flagged;
+            if (!d.nonStationary && d.verdict != "borderline") continue;
+            out.temporalDriftRows.push_back({
+                d.feature,
+                d.axis,
+                std::to_string(d.samples),
+                toFixed(d.gamma, 5),
+                toFixed(d.tStatistic, 4),
+                toFixed(d.pApprox, 6),
+                toFixed(d.driftRatio, 3),
+                d.verdict
+            });
+            if (out.temporalDriftRows.size() >= 12) break;
+        }
+
+        if (!diagnostics.empty()) {
+            const std::string msg = "ADF-style temporal drift scan on axis '" + axis.name +
+                "' flagged " + std::to_string(flagged) + " non-stationary signals out of " + std::to_string(diagnostics.size()) + ".";
+            out.orderedRows.push_back({"8", "Temporal drift kernels (ADF-style)", msg});
+            if (flagged > 0) {
+                out.priorityTakeaways.push_back(msg + " Prioritize time-aware features or differencing for flagged columns.");
+            }
+        }
+    }
+
+    {
+        const auto deadZones = detectContextualDeadZones(data,
+                                                         static_cast<size_t>(targetIdx),
+                                                         numericFeatures,
+                                                         10);
+        for (const auto& dz : deadZones) {
+            out.contextualDeadZoneRows.push_back({
+                dz.feature,
+                dz.strongCluster,
+                dz.weakCluster,
+                toFixed(dz.strongCorr, 4),
+                toFixed(dz.weakCorr, 4),
+                toFixed(dz.dropRatio, 3),
+                std::to_string(dz.support)
+            });
+        }
+        if (!deadZones.empty()) {
+            const auto& lead = deadZones.front();
+            const std::string msg = "Contextual dead-zones detected: " + std::to_string(deadZones.size()) +
+                " features switch from predictive to locally irrelevant across clusters; strongest example " +
+                lead.feature + " (" + lead.strongCluster + " |r|=" + toFixed(lead.strongCorr, 3) +
+                " vs " + lead.weakCluster + " |r|=" + toFixed(lead.weakCorr, 3) + ").";
+            out.orderedRows.push_back({"9", "Cross-cluster interaction anomalies", msg});
+            out.priorityTakeaways.push_back(msg);
         }
     }
 
@@ -7610,6 +7921,18 @@ int AutomationPipeline::run(const AutoConfig& config) {
         finalAnalysis.addTable("Global vs Conditional Relationship Drift",
                                {"Feature", "Global r", "Conditional r", "|conditional|/|global|", "Pattern", "Interpretation"},
                                advancedOutputs.globalConditionalRows);
+    }
+
+    if (!advancedOutputs.temporalDriftRows.empty()) {
+        finalAnalysis.addTable("Temporal Drift Kernels (ADF-Style)",
+                               {"Feature", "Axis", "Samples", "Gamma", "t-stat", "p-approx", "Drift Ratio", "Verdict"},
+                               advancedOutputs.temporalDriftRows);
+    }
+
+    if (!advancedOutputs.contextualDeadZoneRows.empty()) {
+        finalAnalysis.addTable("Cross-Cluster Contextual Dead-Zones",
+                               {"Feature", "Predictive Cluster", "Dead-Zone Cluster", "|r| strong", "|r| weak", "weak/strong", "Min Cluster N"},
+                               advancedOutputs.contextualDeadZoneRows);
     }
 
     if (advancedOutputs.causalDagMermaid.has_value()) {
