@@ -32,22 +32,26 @@ DenseLayer::DenseLayer(size_t size, size_t prevSize, NeuralActivation activation
     if (m_prevSize == 0) return;
 
     const size_t weightCount = m_size * m_prevSize;
+    const double fanIn = static_cast<double>(std::max<size_t>(1, m_prevSize));
+    const double fanOut = static_cast<double>(std::max<size_t>(1, m_size));
     double stddev = 0.1;
     if (m_activation == NeuralActivation::RELU || m_activation == NeuralActivation::GELU) {
-        stddev = std::sqrt(2.0 / static_cast<double>(m_prevSize));
+        stddev = std::sqrt(2.0 / fanIn);
     } else {
-        stddev = std::sqrt(1.0 / static_cast<double>(m_prevSize));
+        stddev = std::sqrt(2.0 / (fanIn + fanOut));
     }
 
     std::normal_distribution<double> weightDis(0.0, stddev);
+    const double clip = 2.5 * stddev;
     m_weights.resize(weightCount, 0.0);
     for (NeuralScalar& w : m_weights) {
-        w = static_cast<NeuralScalar>(weightDis(rng));
+        const double sampled = std::clamp(weightDis(rng), -clip, clip);
+        w = static_cast<NeuralScalar>(sampled);
     }
 
     m_mWeights.assign(weightCount, 0.0);
     m_vWeights.assign(weightCount, 0.0);
-    std::fill(m_biases.begin(), m_biases.end(), 0.01);
+    std::fill(m_biases.begin(), m_biases.end(), static_cast<NeuralScalar>(0.0));
 }
 
 NeuralScalar DenseLayer::activate(NeuralScalar x, NeuralActivation activation) {

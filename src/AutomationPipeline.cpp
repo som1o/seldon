@@ -357,6 +357,46 @@ bool shouldAddResidualPlot(double r,
     return PlotHeuristics::shouldAddResidualPlot(r, selected, sampleSize, tuning);
 }
 
+std::vector<size_t> buildNormalizedTopology(size_t inputNodes,
+                                            size_t outputNodes,
+                                            size_t hiddenLayers,
+                                            size_t firstHidden,
+                                            size_t maxHiddenNodes) {
+    std::vector<size_t> topology;
+    const size_t safeInput = std::max<size_t>(1, inputNodes);
+    const size_t safeOutput = std::max<size_t>(1, outputNodes);
+    const size_t safeLayers = std::max<size_t>(1, hiddenLayers);
+    const size_t safeMaxHidden = std::max<size_t>(4, maxHiddenNodes);
+    const size_t safeFirstHidden = std::clamp<size_t>(firstHidden, 4, safeMaxHidden);
+    const size_t tailTarget = std::clamp<size_t>(std::max<size_t>(8, safeOutput * 2), 4, safeFirstHidden);
+
+    topology.reserve(safeLayers + 2);
+    topology.push_back(safeInput);
+
+    size_t prevWidth = safeFirstHidden;
+    for (size_t l = 0; l < safeLayers; ++l) {
+        double widthD = static_cast<double>(safeFirstHidden);
+        if (safeLayers > 1) {
+            const double t = static_cast<double>(l) / static_cast<double>(safeLayers - 1);
+            const double ratio = static_cast<double>(tailTarget) / static_cast<double>(safeFirstHidden);
+            widthD = static_cast<double>(safeFirstHidden) * std::pow(ratio, t);
+        }
+
+        size_t width = std::clamp<size_t>(static_cast<size_t>(std::llround(widthD)), 4, safeMaxHidden);
+        if (l > 0) {
+            width = std::min(width, prevWidth > 4 ? prevWidth - 1 : static_cast<size_t>(4));
+            const size_t maxDropStep = std::max<size_t>(4, static_cast<size_t>(std::ceil(static_cast<double>(prevWidth) / 2.8)));
+            width = std::max(width, maxDropStep);
+        }
+
+        prevWidth = width;
+        topology.push_back(width);
+    }
+
+    topology.push_back(safeOutput);
+    return topology;
+}
+
 std::vector<size_t> clusteredOrderFromCorrelation(const std::vector<std::vector<double>>& corr) {
     const size_t n = corr.size();
     if (n <= 2) {
@@ -1909,12 +1949,10 @@ OodDriftDiagnostics computeOodDriftDiagnostics(const std::vector<std::vector<dou
         }
     }
 
-    size_t oodHits = 0;
-    double distSum = 0.0;
-    double distMax = 0.0;
-    for (size_t r = referenceRows; r < rows; ++r) {
-        const auto& row = X[r];
-        if (row.size() != cols) continue;
+    auto computeDistanceForRow = [&](const std::vector<double>& row,
+                                     bool* extremeFeatureOut,
+                                     std::vector<std::vector<double>>* pushToMonitorCols) -> std::optional<double> {
+        if (row.size() != cols) return std::nullopt;
         std::vector<double> dvec(dim, 0.0);
         double z2 = 0.0;
         size_t valid = 0;
@@ -1929,9 +1967,9 @@ OodDriftDiagnostics computeOodDriftDiagnostics(const std::vector<std::vector<dou
             z2 += z * z;
             ++valid;
             if (std::abs(z) >= config.neuralOodZThreshold) extremeFeature = true;
-            monCols[c].push_back(v);
+            if (pushToMonitorCols != nullptr) (*pushToMonitorCols)[c].push_back(v);
         }
-        if (valid == 0) continue;
+        if (valid == 0) return std::nullopt;
 
         double md2 = 0.0;
         if (useFullMahalanobis) {
@@ -1950,11 +1988,48 @@ OodDriftDiagnostics computeOodDriftDiagnostics(const std::vector<std::vector<dou
         md2 = std::max(0.0, md2);
         const double mahal = std::sqrt(md2 / static_cast<double>(std::max<size_t>(1, dim)));
         const double rmsZ = std::sqrt(z2 / static_cast<double>(valid));
-        const double distance = std::max(mahal, rmsZ);
+        if (extremeFeatureOut != nullptr) *extremeFeatureOut = extremeFeature;
+        return std::optional<double>(std::max(mahal, rmsZ));
+    };
+
+    std::vector<double> refDistances;
+    refDistances.reserve(referenceRows);
+    for (size_t r = 0; r < referenceRows; ++r) {
+        const auto maybeDist = computeDistanceForRow(X[r], nullptr, nullptr);
+        if (maybeDist.has_value() && std::isfinite(*maybeDist)) {
+            refDistances.push_back(*maybeDist);
+        }
+    }
+    double refMean = 0.0;
+    double refStd = 1.0;
+    if (!refDistances.empty()) {
+        refMean = std::accumulate(refDistances.begin(), refDistances.end(), 0.0) / static_cast<double>(refDistances.size());
+        double var = 0.0;
+        for (double d : refDistances) {
+            const double dd = d - refMean;
+            var += dd * dd;
+        }
+        const size_t denom = std::max<size_t>(1, refDistances.size() > 1 ? refDistances.size() - 1 : 1);
+        refStd = std::sqrt(var / static_cast<double>(denom));
+        if (!std::isfinite(refStd) || refStd < 1e-6) refStd = 1.0;
+    }
+
+    size_t oodHits = 0;
+    double distSum = 0.0;
+    double distMax = 0.0;
+    for (size_t r = referenceRows; r < rows; ++r) {
+        const auto& row = X[r];
+        bool extremeFeature = false;
+        const auto maybeDist = computeDistanceForRow(row, &extremeFeature, &monCols);
+        if (!maybeDist.has_value() || !std::isfinite(*maybeDist)) continue;
+        const double distance = *maybeDist;
+        const double distanceZ = (distance - refMean) / refStd;
 
         distSum += distance;
         distMax = std::max(distMax, distance);
-        if (extremeFeature || distance >= config.neuralOodDistanceThreshold) ++oodHits;
+        if (distanceZ >= config.neuralOodZThreshold || (extremeFeature && distance >= config.neuralOodDistanceThreshold)) {
+            ++oodHits;
+        }
     }
 
     const double monitorRowsD = static_cast<double>(std::max<size_t>(1, monitorRows));
@@ -2024,6 +2099,8 @@ struct DataHealthSummary {
     double statYield = 0.0;
     double selectedYield = 0.0;
     double trainingStability = 0.5;
+    double driftPsiMean = 0.0;
+    double driftPenalty = 0.0;
 };
 
 double safeRatio(size_t numerator, size_t denominator) {
@@ -2095,6 +2172,7 @@ DataHealthSummary computeDataHealthSummary(const TypedDataset& data,
     }
 
     out.trainingStability = estimateTrainingStability(neural.trainLoss, neural.valLoss);
+    out.driftPsiMean = std::max(0.0, std::isfinite(neural.driftPsiMean) ? neural.driftPsiMean : 0.0);
 
     const double score01 =
         0.30 * out.completeness +
@@ -2104,7 +2182,22 @@ DataHealthSummary computeDataHealthSummary(const TypedDataset& data,
         0.15 * out.selectedYield +
         0.10 * out.trainingStability;
 
-    out.score = std::clamp(score01 * 100.0, 0.0, 100.0);
+    double driftPenalty = 0.0;
+    if (out.driftPsiMean > 0.10) {
+        driftPenalty += std::min(0.20, (out.driftPsiMean - 0.10) * 0.20);
+    }
+    if (out.driftPsiMean > 0.50) {
+        driftPenalty += std::min(0.30, 0.12 + (out.driftPsiMean - 0.50) * 0.35);
+    }
+    if (neural.driftBand == "critical") {
+        driftPenalty += 0.08;
+    } else if (neural.driftBand == "warning") {
+        driftPenalty += 0.03;
+    }
+    out.driftPenalty = std::clamp(driftPenalty, 0.0, 0.55);
+
+    const double adjustedScore01 = std::clamp(score01 * (1.0 - out.driftPenalty), 0.0, 1.0);
+    out.score = std::clamp(adjustedScore01 * 100.0, 0.0, 100.0);
     out.band = healthBandFromScore(out.score);
     return out;
 }
@@ -3997,21 +4090,22 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
             1 + ((inputNodes > 24) ? 1 : 0) + ((outputNodes > 1) ? 1 : 0) + ((policyName == "expressive") ? 1 : 0),
             config.neuralMinLayers,
             config.neuralMaxLayers));
+        if (outputNodes <= 4 && inputNodes >= 32) {
+            hiddenLayers = std::clamp<size_t>(std::max<size_t>(hiddenLayers, 4),
+                                              static_cast<size_t>(config.neuralMinLayers),
+                                              static_cast<size_t>(config.neuralMaxLayers));
+        }
     }
 
     if (config.neuralFixedHiddenNodes > 0) {
         hidden = static_cast<size_t>(config.neuralFixedHiddenNodes);
     }
 
-    std::vector<size_t> topology;
-    topology.reserve(hiddenLayers + 2);
-    topology.push_back(inputNodes);
-    for (size_t l = 0; l < hiddenLayers; ++l) {
-        const double decay = std::pow(0.75, static_cast<double>(l));
-        const size_t width = std::clamp<size_t>(static_cast<size_t>(std::llround(static_cast<double>(hidden) * decay)), 4, static_cast<size_t>(std::max(4, config.neuralMaxHiddenNodes)));
-        topology.push_back(width);
-    }
-    topology.push_back(outputNodes);
+    std::vector<size_t> topology = buildNormalizedTopology(inputNodes,
+                                                           outputNodes,
+                                                           hiddenLayers,
+                                                           hidden,
+                                                           static_cast<size_t>(std::max(4, config.neuralMaxHiddenNodes)));
 
     auto estimateTrainableParams = [](const std::vector<size_t>& topo) {
         size_t params = 0;
@@ -4109,19 +4203,11 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     }
 
     auto buildTopology = [&](size_t layers, size_t firstHidden) {
-        std::vector<size_t> topo;
-        topo.reserve(layers + 2);
-        topo.push_back(inputNodes);
-        for (size_t l = 0; l < layers; ++l) {
-            const double decay = std::pow(0.75, static_cast<double>(l));
-            const size_t width = std::clamp<size_t>(
-                static_cast<size_t>(std::llround(static_cast<double>(firstHidden) * decay)),
-                4,
-                static_cast<size_t>(std::max(4, config.neuralMaxHiddenNodes)));
-            topo.push_back(width);
-        }
-        topo.push_back(outputNodes);
-        return topo;
+        return buildNormalizedTopology(inputNodes,
+                                       outputNodes,
+                                       layers,
+                                       firstHidden,
+                                       static_cast<size_t>(std::max(4, config.neuralMaxHiddenNodes)));
     };
 
     if (requested == "auto" && config.neuralFixedLayers == 0 && config.neuralFixedHiddenNodes == 0 && Xnn.size() >= 64) {
@@ -8708,7 +8794,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Feature Retention", toFixed(100.0 * dataHealth.featureRetention, 1) + "%"},
         {"Statistical Yield", toFixed(100.0 * dataHealth.statYield, 1) + "%"},
         {"Selected Yield", toFixed(100.0 * dataHealth.selectedYield, 1) + "%"},
-        {"Training Stability", toFixed(100.0 * dataHealth.trainingStability, 1) + "%"}
+        {"Training Stability", toFixed(100.0 * dataHealth.trainingStability, 1) + "%"},
+        {"Drift PSI Mean", toFixed(dataHealth.driftPsiMean, 4)},
+        {"Drift Penalty", toFixed(100.0 * dataHealth.driftPenalty, 1) + "%"}
     });
 
     finalAnalysis.addTable("Probabilistic Reliability Card", {"Metric", "Value"}, {
