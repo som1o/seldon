@@ -4,13 +4,17 @@
 #include "SeldonExceptions.h"
 #include "Statistics.h"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <functional>
 #include <iterator>
 #include <limits>
 #include <numeric>
+#include <optional>
+#include <set>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <unordered_map>
 #ifdef USE_OPENMP
@@ -75,6 +79,247 @@ void validateImputationStrategy(const std::string& strategy, ColumnType type, co
     }
     if (!valid) {
         throw Seldon::ConfigurationException("Invalid imputation strategy for column '" + columnName + "': " + strategy);
+    }
+}
+
+std::optional<double> parseBooleanLikeToken(const std::string& value) {
+    const std::string token = CommonUtils::toLower(CommonUtils::trim(value));
+    if (token.empty()) return std::nullopt;
+    if (token == "1" || token == "true" || token == "yes" || token == "y" || token == "t" || token == "on") {
+        return 1.0;
+    }
+    if (token == "0" || token == "false" || token == "no" || token == "n" || token == "f" || token == "off") {
+        return 0.0;
+    }
+    return std::nullopt;
+}
+
+std::string sanitizeTokenForColumn(std::string_view token) {
+    std::string out;
+    out.reserve(token.size());
+    bool prevUnderscore = false;
+    for (char ch : token) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::isalnum(uch)) {
+            out.push_back(static_cast<char>(std::tolower(uch)));
+            prevUnderscore = false;
+        } else if (!prevUnderscore) {
+            out.push_back('_');
+            prevUnderscore = true;
+        }
+    }
+    while (!out.empty() && out.front() == '_') out.erase(out.begin());
+    while (!out.empty() && out.back() == '_') out.pop_back();
+    if (out.empty()) out = "token";
+    if (out.size() > 24) out.resize(24);
+    return out;
+}
+
+std::vector<std::string> splitTokensBySeparator(const std::string& value, char separator) {
+    std::vector<std::string> out;
+    std::string current;
+    for (char ch : value) {
+        if (ch == separator) {
+            std::string tok = CommonUtils::trim(current);
+            if (!tok.empty()) out.push_back(CommonUtils::toLower(tok));
+            current.clear();
+            continue;
+        }
+        current.push_back(ch);
+    }
+    std::string tok = CommonUtils::trim(current);
+    if (!tok.empty()) out.push_back(CommonUtils::toLower(tok));
+    return out;
+}
+
+std::string reserveUniqueName(std::unordered_set<std::string>& reserved, const std::string& base) {
+    if (reserved.find(base) == reserved.end()) {
+        reserved.insert(base);
+        return base;
+    }
+    size_t suffix = 2;
+    while (true) {
+        std::string candidate = base + "_" + std::to_string(suffix);
+        if (reserved.find(candidate) == reserved.end()) {
+            reserved.insert(candidate);
+            return candidate;
+        }
+        ++suffix;
+    }
+}
+
+void addCategoricalSemanticIndicators(TypedDataset& data, const AutoConfig& config) {
+    const auto categoricalIndices = data.categoricalColumnIndices();
+    if (categoricalIndices.empty()) return;
+
+    std::unordered_set<std::string> reservedNames;
+    reservedNames.reserve(data.columns().size() * 2);
+    for (const auto& col : data.columns()) reservedNames.insert(col.name);
+
+    std::vector<TypedColumn> engineered;
+    engineered.reserve(categoricalIndices.size() * 3);
+
+    constexpr size_t kMaxDerivedGlobal = 64;
+    constexpr size_t kMaxTokenIndicatorsPerColumn = 6;
+
+    for (size_t idx : categoricalIndices) {
+        if (engineered.size() >= kMaxDerivedGlobal) break;
+        const auto& col = data.columns()[idx];
+        if (!config.targetColumn.empty() && col.name == config.targetColumn) continue;
+
+        const auto& values = std::get<StrVec>(col.values);
+        if (values.empty()) continue;
+
+        std::vector<size_t> observedRows;
+        observedRows.reserve(values.size());
+        for (size_t r = 0; r < values.size() && r < col.missing.size(); ++r) {
+            if (col.missing[r]) continue;
+            if (CommonUtils::trim(values[r]).empty()) continue;
+            observedRows.push_back(r);
+        }
+        if (observedRows.size() < 4) continue;
+
+        bool allBooleanLike = true;
+        bool seenZero = false;
+        bool seenOne = false;
+        for (size_t r : observedRows) {
+            const auto parsed = parseBooleanLikeToken(values[r]);
+            if (!parsed.has_value()) {
+                allBooleanLike = false;
+                break;
+            }
+            if (*parsed < 0.5) seenZero = true;
+            else seenOne = true;
+        }
+
+        if (allBooleanLike && (seenZero || seenOne)) {
+            TypedColumn boolCol;
+            boolCol.name = reserveUniqueName(reservedNames, col.name + "_bool");
+            boolCol.type = ColumnType::NUMERIC;
+            boolCol.values = std::vector<double>(values.size(), 0.0);
+            boolCol.missing = MissingMask(values.size(), static_cast<uint8_t>(0));
+            auto& out = std::get<NumVec>(boolCol.values);
+            for (size_t r = 0; r < values.size() && r < col.missing.size(); ++r) {
+                if (col.missing[r]) {
+                    out[r] = 0.0;
+                    continue;
+                }
+                const auto parsed = parseBooleanLikeToken(values[r]);
+                out[r] = parsed.has_value() ? *parsed : 0.0;
+            }
+            engineered.push_back(std::move(boolCol));
+            if (engineered.size() >= kMaxDerivedGlobal) break;
+        }
+
+        std::array<size_t, 3> sepRows = {0, 0, 0};
+        const std::array<char, 3> separators = {',', ';', '|'};
+        for (size_t r : observedRows) {
+            const std::string s = values[r];
+            for (size_t i = 0; i < separators.size(); ++i) {
+                if (s.find(separators[i]) != std::string::npos) {
+                    ++sepRows[i];
+                }
+            }
+        }
+
+        size_t bestSepIndex = 0;
+        for (size_t i = 1; i < sepRows.size(); ++i) {
+            if (sepRows[i] > sepRows[bestSepIndex]) bestSepIndex = i;
+        }
+        const size_t rowsWithSep = sepRows[bestSepIndex];
+        if (rowsWithSep < std::max<size_t>(3, observedRows.size() / 10)) continue;
+        const char separator = separators[bestSepIndex];
+
+        std::unordered_map<std::string, size_t> tokenRows;
+        tokenRows.reserve(observedRows.size() * 2);
+        std::vector<size_t> perRowTokenCount(values.size(), 0);
+        size_t totalTokens = 0;
+        for (size_t r : observedRows) {
+            const auto tokens = splitTokensBySeparator(values[r], separator);
+            if (tokens.size() < 2) continue;
+            std::set<std::string> uniqueRowTokens(tokens.begin(), tokens.end());
+            perRowTokenCount[r] = uniqueRowTokens.size();
+            totalTokens += uniqueRowTokens.size();
+            for (const auto& token : uniqueRowTokens) {
+                tokenRows[token]++;
+            }
+        }
+
+        if (tokenRows.size() < 3) continue;
+        const double avgTokens = static_cast<double>(totalTokens) / static_cast<double>(observedRows.size());
+        if (avgTokens < 1.30) continue;
+
+        size_t minCount = std::max<size_t>(2, observedRows.size() / 25);
+
+        std::vector<std::pair<std::string, size_t>> rankedTokens(tokenRows.begin(), tokenRows.end());
+        std::sort(rankedTokens.begin(), rankedTokens.end(), [](const auto& a, const auto& b) {
+            if (a.second == b.second) return a.first < b.first;
+            return a.second > b.second;
+        });
+
+        size_t minTokenCount = values.empty() ? 0 : values.size();
+        size_t maxTokenCount = 0;
+        for (size_t r = 0; r < values.size(); ++r) {
+            minTokenCount = std::min(minTokenCount, perRowTokenCount[r]);
+            maxTokenCount = std::max(maxTokenCount, perRowTokenCount[r]);
+        }
+        if (maxTokenCount > minTokenCount && engineered.size() < kMaxDerivedGlobal) {
+            TypedColumn countCol;
+            countCol.name = reserveUniqueName(reservedNames, col.name + "_selection_count");
+            countCol.type = ColumnType::NUMERIC;
+            countCol.values = std::vector<double>(values.size(), 0.0);
+            countCol.missing = MissingMask(values.size(), static_cast<uint8_t>(0));
+            auto& out = std::get<NumVec>(countCol.values);
+            for (size_t r = 0; r < values.size(); ++r) {
+                out[r] = static_cast<double>(perRowTokenCount[r]);
+            }
+            engineered.push_back(std::move(countCol));
+        }
+
+        for (const auto& kv : rankedTokens) {
+            if (engineered.size() >= kMaxDerivedGlobal) break;
+            if (kv.second < minCount) continue;
+
+            const std::string tokenLabel = sanitizeTokenForColumn(kv.first);
+            if (tokenLabel.empty()) continue;
+
+            TypedColumn tokenCol;
+            tokenCol.name = reserveUniqueName(reservedNames, col.name + "_has_" + tokenLabel);
+            tokenCol.type = ColumnType::NUMERIC;
+            tokenCol.values = std::vector<double>(values.size(), 0.0);
+            tokenCol.missing = MissingMask(values.size(), static_cast<uint8_t>(0));
+            auto& out = std::get<NumVec>(tokenCol.values);
+
+            for (size_t r = 0; r < values.size() && r < col.missing.size(); ++r) {
+                if (col.missing[r]) {
+                    out[r] = 0.0;
+                    continue;
+                }
+                const auto tokens = splitTokensBySeparator(values[r], separator);
+                bool hit = false;
+                for (const auto& tok : tokens) {
+                    if (tok == kv.first) {
+                        hit = true;
+                        break;
+                    }
+                }
+                out[r] = hit ? 1.0 : 0.0;
+            }
+
+            engineered.push_back(std::move(tokenCol));
+            const size_t perColumnAdded = std::count_if(
+                engineered.begin(),
+                engineered.end(),
+                [&](const TypedColumn& c) {
+                    return c.name.rfind(col.name + "_has_", 0) == 0;
+                });
+            if (perColumnAdded >= kMaxTokenIndicatorsPerColumn) break;
+        }
+    }
+
+    if (!engineered.empty()) {
+        auto& cols = data.columns();
+        cols.insert(cols.end(), std::make_move_iterator(engineered.begin()), std::make_move_iterator(engineered.end()));
     }
 }
 
@@ -799,6 +1044,8 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
         }
         report.outlierCounts[col.name] = std::count(flags.begin(), flags.end(), true);
     }
+
+    addCategoricalSemanticIndicators(data, config);
 
     // missing counts + imputation
     for (auto& col : data.columns()) {

@@ -99,7 +99,8 @@ Responsibilities:
 - outlier action application,
 - scaling,
 - temporal feature extraction,
-- controlled numeric feature expansion.
+- controlled numeric feature expansion,
+- categorical semantic expansion (boolean-like and multi-select indicator synthesis).
 
 ### 3.4 Statistics and Math
 
@@ -218,6 +219,21 @@ The loader performs an inference pass and follow-up passes to:
 - rescue likely datetime semantics when strongly detected.
 
 Explicit type overrides short-circuit fallback behaviors for forced columns.
+
+### 5.4 Categorical Semantic Expansion
+
+During preprocessing, categorical columns are profiled for two semantic patterns:
+
+- boolean-like labels (`yes/no`, `true/false`, `on/off`, `1/0`),
+- multi-select payloads (single-cell lists split by common separators such as `,`, `;`, `|`).
+
+When detected, Seldon synthesizes bounded numeric indicators:
+
+- one normalized boolean indicator per boolean-like source column,
+- for multi-select columns: one selection-count feature and top-token presence indicators.
+
+These engineered columns are appended as numeric features for downstream model selection,
+while original categorical columns remain intact for reporting and contingency analysis.
 
 ---
 

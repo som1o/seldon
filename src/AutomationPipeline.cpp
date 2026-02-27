@@ -158,6 +158,120 @@ bool containsToken(const std::string& text, const std::vector<std::string>& toke
     return false;
 }
 
+enum class CategoricalSemanticKind {
+    GENERIC,
+    BOOLEAN_LIKE,
+    MULTI_SELECT
+};
+
+struct CategoricalSemanticProfile {
+    CategoricalSemanticKind kind = CategoricalSemanticKind::GENERIC;
+    std::vector<std::pair<std::string, size_t>> topTokens;
+};
+
+std::optional<double> parseBooleanLikeTokenReport(const std::string& value) {
+    const std::string token = CommonUtils::toLower(CommonUtils::trim(value));
+    if (token.empty()) return std::nullopt;
+    if (token == "1" || token == "true" || token == "yes" || token == "y" || token == "t" || token == "on") return 1.0;
+    if (token == "0" || token == "false" || token == "no" || token == "n" || token == "f" || token == "off") return 0.0;
+    return std::nullopt;
+}
+
+std::vector<std::string> splitTokensBySeparatorReport(const std::string& value, char separator) {
+    std::vector<std::string> out;
+    std::string current;
+    for (char ch : value) {
+        if (ch == separator) {
+            std::string tok = CommonUtils::trim(current);
+            if (!tok.empty()) out.push_back(CommonUtils::toLower(tok));
+            current.clear();
+            continue;
+        }
+        current.push_back(ch);
+    }
+    std::string tok = CommonUtils::trim(current);
+    if (!tok.empty()) out.push_back(CommonUtils::toLower(tok));
+    return out;
+}
+
+CategoricalSemanticProfile detectCategoricalSemanticProfile(const std::vector<std::string>& values,
+                                                           const MissingMask& missing) {
+    CategoricalSemanticProfile profile;
+    if (values.empty()) return profile;
+
+    std::vector<size_t> observed;
+    observed.reserve(values.size());
+    for (size_t i = 0; i < values.size() && i < missing.size(); ++i) {
+        if (missing[i]) continue;
+        if (CommonUtils::trim(values[i]).empty()) continue;
+        observed.push_back(i);
+    }
+    if (observed.size() < 4) return profile;
+
+    bool allBoolLike = true;
+    bool seenZero = false;
+    bool seenOne = false;
+    for (size_t i : observed) {
+        const auto parsed = parseBooleanLikeTokenReport(values[i]);
+        if (!parsed.has_value()) {
+            allBoolLike = false;
+            break;
+        }
+        if (*parsed < 0.5) seenZero = true;
+        else seenOne = true;
+    }
+    if (allBoolLike && (seenZero || seenOne)) {
+        profile.kind = CategoricalSemanticKind::BOOLEAN_LIKE;
+        return profile;
+    }
+
+    std::array<size_t, 3> sepRows = {0, 0, 0};
+    const std::array<char, 3> separators = {',', ';', '|'};
+    for (size_t i : observed) {
+        const std::string& s = values[i];
+        for (size_t k = 0; k < separators.size(); ++k) {
+            if (s.find(separators[k]) != std::string::npos) ++sepRows[k];
+        }
+    }
+    size_t bestSepIdx = 0;
+    for (size_t i = 1; i < sepRows.size(); ++i) {
+        if (sepRows[i] > sepRows[bestSepIdx]) bestSepIdx = i;
+    }
+    const size_t rowsWithSep = sepRows[bestSepIdx];
+    if (rowsWithSep < std::max<size_t>(3, observed.size() / 10)) return profile;
+
+    const char sep = separators[bestSepIdx];
+    std::unordered_map<std::string, size_t> tokenRows;
+    size_t totalTokens = 0;
+    for (size_t i : observed) {
+        const auto tokens = splitTokensBySeparatorReport(values[i], sep);
+        if (tokens.size() < 2) continue;
+        std::set<std::string> uniq(tokens.begin(), tokens.end());
+        totalTokens += uniq.size();
+        for (const auto& token : uniq) tokenRows[token]++;
+    }
+    if (tokenRows.size() < 3) return profile;
+
+    const double avgTokens = static_cast<double>(totalTokens) / static_cast<double>(observed.size());
+    if (avgTokens < 1.30) return profile;
+
+    profile.kind = CategoricalSemanticKind::MULTI_SELECT;
+    std::vector<std::pair<std::string, size_t>> ranked(tokenRows.begin(), tokenRows.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        if (a.second == b.second) return a.first < b.first;
+        return a.second > b.second;
+    });
+    if (ranked.size() > 8) ranked.resize(8);
+    profile.topTokens = std::move(ranked);
+    return profile;
+}
+
+std::string categoricalSemanticLabel(CategoricalSemanticKind kind) {
+    if (kind == CategoricalSemanticKind::BOOLEAN_LIKE) return "categorical(bool-like)";
+    if (kind == CategoricalSemanticKind::MULTI_SELECT) return "categorical(multi-select)";
+    return "categorical";
+}
+
 bool isAdministrativeColumnName(const std::string& name) {
     const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
     if (lower.empty()) return false;
@@ -2329,6 +2443,7 @@ void addUnivariateDetailedSection(ReportEngine& report,
                                   const NumericStatsCache& statsCache) {
     std::vector<std::vector<std::string>> summaryRows;
     std::vector<std::vector<std::string>> categoricalRows;
+    std::vector<std::vector<std::string>> multiSelectTokenRows;
     std::vector<std::pair<size_t, double>> surpriseRows;
     std::unordered_map<size_t, NumericDetailedStats> summaryCache;
     summaryCache.reserve(data.numericColumnIndices().size());
@@ -2454,6 +2569,8 @@ void addUnivariateDetailedSection(ReportEngine& report,
                        + " outliers=" + std::to_string(outliers));
         } else if (col.type == ColumnType::CATEGORICAL) {
             const auto& vals = std::get<std::vector<std::string>>(col.values);
+            const CategoricalSemanticProfile semantic = detectCategoricalSemanticProfile(vals, col.missing);
+            const std::string semanticType = categoricalSemanticLabel(semantic.kind);
             std::map<std::string, size_t> freq;
             for (const auto& v : vals) freq[v]++;
 
@@ -2465,7 +2582,7 @@ void addUnivariateDetailedSection(ReportEngine& report,
 
             summaryRows.push_back({
                 col.name,
-                "categorical",
+                semanticType,
                 "-",
                 "-",
                 "-",
@@ -2498,6 +2615,17 @@ void addUnivariateDetailedSection(ReportEngine& report,
 
             for (size_t i = 0; i < top.size() && i < 8; ++i) {
                 categoricalRows.push_back({col.name, top[i].first, std::to_string(top[i].second), toFixed(static_cast<double>(top[i].second) / static_cast<double>(std::max<size_t>(1, vals.size())), 6)});
+            }
+
+            if (semantic.kind == CategoricalSemanticKind::MULTI_SELECT) {
+                for (const auto& token : semantic.topTokens) {
+                    multiSelectTokenRows.push_back({
+                        col.name,
+                        token.first,
+                        std::to_string(token.second),
+                        toFixed(static_cast<double>(token.second) / static_cast<double>(std::max<size_t>(1, vals.size())), 6)
+                    });
+                }
             }
 
             logVerbose("[Seldon][Univariate] Categorical " + col.name
@@ -2577,7 +2705,7 @@ void addUnivariateDetailedSection(ReportEngine& report,
             if (row.size() < 2) continue;
             const std::string t = row[1];
             if (t == "numeric") ++restNumeric;
-            else if (t == "categorical") ++restCategorical;
+            else if (t.rfind("categorical", 0) == 0) ++restCategorical;
             else if (t == "datetime") ++restDatetime;
             else if (t == "metadata") ++restMetadata;
         }
@@ -2599,7 +2727,15 @@ void addUnivariateDetailedSection(ReportEngine& report,
         const size_t missing = prep.missingCounts.count(col.name) ? prep.missingCounts.at(col.name) : fallbackMissing;
         const size_t outliers = prep.outlierCounts.count(col.name) ? prep.outlierCounts.at(col.name) : 0;
         const bool adminLike = isAdministrativeColumnName(col.name);
-        const std::string baseType = (col.type == ColumnType::NUMERIC) ? "numeric" : (col.type == ColumnType::CATEGORICAL ? "categorical" : "datetime");
+        std::string baseType;
+        if (col.type == ColumnType::NUMERIC) {
+            baseType = "numeric";
+        } else if (col.type == ColumnType::CATEGORICAL) {
+            const auto& vals = std::get<std::vector<std::string>>(col.values);
+            baseType = categoricalSemanticLabel(detectCategoricalSemanticProfile(vals, col.missing).kind);
+        } else {
+            baseType = "datetime";
+        }
         const std::string type = adminLike ? "metadata" : baseType;
         size_t unique = 0;
         if (col.type == ColumnType::NUMERIC) {
@@ -2629,6 +2765,10 @@ void addUnivariateDetailedSection(ReportEngine& report,
 
     if (!categoricalRows.empty()) {
         report.addTable("Categorical Top Frequencies", {"Column", "Category", "Count", "Share"}, categoricalRows);
+    }
+
+    if (!multiSelectTokenRows.empty()) {
+        report.addTable("Multi-Select Token Frequencies", {"Column", "Token", "Rows", "Share"}, multiSelectTokenRows);
     }
 }
 

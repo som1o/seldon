@@ -142,6 +142,20 @@ Missing-token detection also treats common unknown placeholders as missing value
 
 - `unknown`, `unk`, `?`, `-`, `--`, `tbd`
 
+### 4.2.2 Boolean and Multi-Select Categorical Handling (Default)
+
+Seldon automatically profiles categorical columns and can synthesize numeric indicators for:
+
+- boolean-like labels: `yes/no`, `true/false`, `on/off`, `1/0`
+- multi-select cells (lists in one field) split by common separators: `,`, `;`, `|`
+
+Generated features are bounded and appended to the dataset for feature selection/modeling.
+
+Report visibility:
+
+- categorical columns are labeled as `categorical(bool-like)` or `categorical(multi-select)` when detected
+- multi-select token prevalence appears in `Multi-Select Token Frequencies`
+
 ### 4.3 Plot Controls
 
 - `--plots <none|all|univariate|overall|bivariate|comma-list>`
