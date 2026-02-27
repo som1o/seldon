@@ -1667,9 +1667,353 @@ struct NeuralAnalysis {
     double categoricalImportanceShare = 0.0;
     std::vector<double> uncertaintyStd;
     std::vector<double> uncertaintyCiWidth;
+    std::vector<double> ensembleStd;
+    double confidenceScore = 0.0;
+    double oodRate = 0.0;
+    double oodMeanDistance = 0.0;
+    double oodMaxDistance = 0.0;
+    size_t oodReferenceRows = 0;
+    size_t oodMonitorRows = 0;
+    double driftPsiMean = 0.0;
+    double driftPsiMax = 0.0;
+    std::string driftBand = "stable";
+    bool driftWarning = false;
     bool strictPruningApplied = false;
     size_t strictPrunedColumns = 0;
 };
+
+struct OodDriftDiagnostics {
+    double oodRate = 0.0;
+    double meanDistance = 0.0;
+    double maxDistance = 0.0;
+    size_t referenceRows = 0;
+    size_t monitorRows = 0;
+    double psiMean = 0.0;
+    double psiMax = 0.0;
+    std::string driftBand = "stable";
+    bool warning = false;
+};
+
+double quantileFromSorted(const std::vector<double>& sortedValues, double q) {
+    if (sortedValues.empty()) return 0.0;
+    const double qq = std::clamp(q, 0.0, 1.0);
+    const double pos = qq * static_cast<double>(sortedValues.size() - 1);
+    const size_t lo = static_cast<size_t>(std::floor(pos));
+    const size_t hi = static_cast<size_t>(std::ceil(pos));
+    if (lo == hi) return sortedValues[lo];
+    const double w = pos - static_cast<double>(lo);
+    return sortedValues[lo] * (1.0 - w) + sortedValues[hi] * w;
+}
+
+double computePsiBetweenSlices(const std::vector<double>& reference,
+                               const std::vector<double>& monitor,
+                               size_t bins = 5) {
+    if (reference.size() < 16 || monitor.size() < 16 || bins < 2) return 0.0;
+
+    std::vector<double> sortedRef = reference;
+    std::sort(sortedRef.begin(), sortedRef.end());
+
+    std::vector<double> edges;
+    edges.reserve(bins + 1);
+    for (size_t b = 0; b <= bins; ++b) {
+        const double q = static_cast<double>(b) / static_cast<double>(bins);
+        edges.push_back(quantileFromSorted(sortedRef, q));
+    }
+
+    size_t uniqueEdges = 1;
+    for (size_t i = 1; i < edges.size(); ++i) {
+        if (std::abs(edges[i] - edges[i - 1]) > 1e-12) uniqueEdges++;
+    }
+    if (uniqueEdges < 3) return 0.0;
+
+    std::vector<double> refCounts(bins, 0.0);
+    std::vector<double> monCounts(bins, 0.0);
+
+    auto assignBin = [&](double v) {
+        if (v <= edges.front()) return static_cast<size_t>(0);
+        if (v >= edges.back()) return bins - 1;
+        auto it = std::upper_bound(edges.begin(), edges.end(), v);
+        size_t idx = static_cast<size_t>(std::distance(edges.begin(), it));
+        if (idx == 0) return static_cast<size_t>(0);
+        return std::min(bins - 1, idx - 1);
+    };
+
+    for (double v : reference) {
+        if (!std::isfinite(v)) continue;
+        refCounts[assignBin(v)] += 1.0;
+    }
+    for (double v : monitor) {
+        if (!std::isfinite(v)) continue;
+        monCounts[assignBin(v)] += 1.0;
+    }
+
+    const double refTotal = std::accumulate(refCounts.begin(), refCounts.end(), 0.0);
+    const double monTotal = std::accumulate(monCounts.begin(), monCounts.end(), 0.0);
+    if (refTotal <= 0.0 || monTotal <= 0.0) return 0.0;
+
+    constexpr double eps = 1e-6;
+    double psi = 0.0;
+    for (size_t b = 0; b < bins; ++b) {
+        const double r = std::max(eps, refCounts[b] / refTotal);
+        const double m = std::max(eps, monCounts[b] / monTotal);
+        psi += (m - r) * std::log(m / r);
+    }
+    return std::max(0.0, psi);
+}
+
+OodDriftDiagnostics computeOodDriftDiagnostics(const std::vector<std::vector<double>>& X,
+                                               const AutoConfig& config) {
+    OodDriftDiagnostics out;
+    if (!config.neuralOodEnabled || X.size() < 40 || X.front().empty()) return out;
+
+    const size_t rows = X.size();
+    const size_t cols = X.front().size();
+    const size_t referenceRows = std::clamp<size_t>(static_cast<size_t>(std::llround(0.70 * static_cast<double>(rows))), 24, rows - 12);
+    const size_t monitorRows = rows - referenceRows;
+    if (referenceRows < 24 || monitorRows < 12) return out;
+
+    std::vector<std::vector<double>> refCols(cols);
+    std::vector<std::vector<double>> monCols(cols);
+    for (size_t c = 0; c < cols; ++c) {
+        refCols[c].reserve(referenceRows);
+        monCols[c].reserve(monitorRows);
+    }
+
+    for (size_t r = 0; r < referenceRows; ++r) {
+        const auto& row = X[r];
+        if (row.size() != cols) continue;
+        for (size_t c = 0; c < cols; ++c) {
+            const double v = row[c];
+            if (std::isfinite(v)) refCols[c].push_back(v);
+        }
+    }
+
+    std::vector<double> muRaw(cols, 0.0);
+    std::vector<double> sigmaRaw(cols, 1.0);
+    for (size_t c = 0; c < cols; ++c) {
+        if (refCols[c].empty()) continue;
+        for (double v : refCols[c]) muRaw[c] += v;
+        muRaw[c] /= static_cast<double>(refCols[c].size());
+        double var = 0.0;
+        for (double v : refCols[c]) {
+            const double d = v - muRaw[c];
+            var += d * d;
+        }
+        const size_t denom = std::max<size_t>(1, refCols[c].size() > 1 ? refCols[c].size() - 1 : 1);
+        sigmaRaw[c] = std::sqrt(var / static_cast<double>(denom));
+        if (!std::isfinite(sigmaRaw[c]) || sigmaRaw[c] < 1e-9) sigmaRaw[c] = 1.0;
+    }
+
+    auto absCorr = [&](const std::vector<double>& a, const std::vector<double>& b) {
+        const size_t n = std::min(a.size(), b.size());
+        if (n < 16) return 0.0;
+        double ma = 0.0;
+        double mb = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            ma += a[i];
+            mb += b[i];
+        }
+        ma /= static_cast<double>(n);
+        mb /= static_cast<double>(n);
+        double va = 0.0;
+        double vb = 0.0;
+        double cov = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double da = a[i] - ma;
+            const double db = b[i] - mb;
+            va += da * da;
+            vb += db * db;
+            cov += da * db;
+        }
+        if (va <= 1e-12 || vb <= 1e-12) return 0.0;
+        return std::abs(cov / std::sqrt(va * vb));
+    };
+
+    std::vector<size_t> candidates;
+    candidates.reserve(cols);
+    for (size_t c = 0; c < cols; ++c) {
+        if (refCols[c].size() >= 24 && sigmaRaw[c] > 1e-7) {
+            candidates.push_back(c);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(), [&](size_t a, size_t b) {
+        if (sigmaRaw[a] == sigmaRaw[b]) return a < b;
+        return sigmaRaw[a] > sigmaRaw[b];
+    });
+    const size_t capCandidates = std::min<size_t>(candidates.size(), 48);
+    candidates.resize(capCandidates);
+
+    std::vector<size_t> selected;
+    selected.reserve(std::min<size_t>(24, candidates.size()));
+    constexpr double kOrthogonalityCorrCap = 0.90;
+    for (size_t c : candidates) {
+        bool orthogonalEnough = true;
+        for (size_t s : selected) {
+            if (absCorr(refCols[c], refCols[s]) >= kOrthogonalityCorrCap) {
+                orthogonalEnough = false;
+                break;
+            }
+        }
+        if (orthogonalEnough) selected.push_back(c);
+        if (selected.size() >= 24) break;
+    }
+    if (selected.size() < 2 && !candidates.empty()) {
+        selected.assign(candidates.begin(), candidates.begin() + std::min<size_t>(2, candidates.size()));
+    }
+    if (selected.empty()) return out;
+
+    const size_t dim = selected.size();
+    std::vector<double> mu(dim, 0.0);
+    std::vector<double> sigma(dim, 1.0);
+    for (size_t k = 0; k < dim; ++k) {
+        mu[k] = muRaw[selected[k]];
+        sigma[k] = sigmaRaw[selected[k]];
+    }
+
+    MathUtils::Matrix cov(dim, dim);
+    for (size_t i = 0; i < dim; ++i) {
+        for (size_t j = i; j < dim; ++j) {
+            double s = 0.0;
+            size_t n = std::min(refCols[selected[i]].size(), refCols[selected[j]].size());
+            for (size_t r = 0; r < n; ++r) {
+                s += (refCols[selected[i]][r] - mu[i]) * (refCols[selected[j]][r] - mu[j]);
+            }
+            const double denom = static_cast<double>(std::max<size_t>(1, n > 1 ? n - 1 : 1));
+            const double v = s / denom;
+            cov.at(i, j) = v;
+            cov.at(j, i) = v;
+        }
+    }
+
+    double trace = 0.0;
+    for (size_t i = 0; i < dim; ++i) trace += std::max(0.0, cov.at(i, i));
+    const double baseScale = (trace > 0.0) ? (trace / static_cast<double>(dim)) : 1.0;
+    double lambda = std::max(1e-8, 1e-6 * baseScale);
+
+    std::optional<MathUtils::Matrix> invCov;
+    MathUtils::Matrix covReg = cov;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        covReg = cov;
+        for (size_t i = 0; i < dim; ++i) covReg.at(i, i) += lambda;
+        covReg.setInversionTolerance(std::max(1e-12, lambda * 1e-3));
+        invCov = covReg.inverse();
+        if (invCov.has_value()) break;
+        lambda *= 10.0;
+    }
+
+    std::vector<double> invDiag(dim, 1.0);
+    bool useFullMahalanobis = invCov.has_value();
+    if (!useFullMahalanobis) {
+        for (size_t i = 0; i < dim; ++i) {
+            invDiag[i] = 1.0 / std::max(1e-8, covReg.at(i, i));
+        }
+    }
+
+    size_t oodHits = 0;
+    double distSum = 0.0;
+    double distMax = 0.0;
+    for (size_t r = referenceRows; r < rows; ++r) {
+        const auto& row = X[r];
+        if (row.size() != cols) continue;
+        std::vector<double> dvec(dim, 0.0);
+        double z2 = 0.0;
+        size_t valid = 0;
+        bool extremeFeature = false;
+        for (size_t k = 0; k < dim; ++k) {
+            const size_t c = selected[k];
+            const double v = row[c];
+            if (!std::isfinite(v)) continue;
+            const double centered = v - mu[k];
+            dvec[k] = centered;
+            const double z = centered / sigma[k];
+            z2 += z * z;
+            ++valid;
+            if (std::abs(z) >= config.neuralOodZThreshold) extremeFeature = true;
+            monCols[c].push_back(v);
+        }
+        if (valid == 0) continue;
+
+        double md2 = 0.0;
+        if (useFullMahalanobis) {
+            for (size_t i = 0; i < dim; ++i) {
+                double rowDot = 0.0;
+                for (size_t j = 0; j < dim; ++j) {
+                    rowDot += invCov->at(i, j) * dvec[j];
+                }
+                md2 += dvec[i] * rowDot;
+            }
+        } else {
+            for (size_t i = 0; i < dim; ++i) {
+                md2 += dvec[i] * dvec[i] * invDiag[i];
+            }
+        }
+        md2 = std::max(0.0, md2);
+        const double mahal = std::sqrt(md2 / static_cast<double>(std::max<size_t>(1, dim)));
+        const double rmsZ = std::sqrt(z2 / static_cast<double>(valid));
+        const double distance = std::max(mahal, rmsZ);
+
+        distSum += distance;
+        distMax = std::max(distMax, distance);
+        if (extremeFeature || distance >= config.neuralOodDistanceThreshold) ++oodHits;
+    }
+
+    const double monitorRowsD = static_cast<double>(std::max<size_t>(1, monitorRows));
+    out.oodRate = static_cast<double>(oodHits) / monitorRowsD;
+    out.meanDistance = distSum / monitorRowsD;
+    out.maxDistance = distMax;
+    out.referenceRows = referenceRows;
+    out.monitorRows = monitorRows;
+
+    double psiSum = 0.0;
+    size_t psiCount = 0;
+    double psiMax = 0.0;
+    for (size_t c : selected) {
+        const double psi = computePsiBetweenSlices(refCols[c], monCols[c], 5);
+        if (!std::isfinite(psi)) continue;
+        psiSum += psi;
+        ++psiCount;
+        psiMax = std::max(psiMax, psi);
+    }
+    out.psiMean = (psiCount > 0) ? (psiSum / static_cast<double>(psiCount)) : 0.0;
+    out.psiMax = psiMax;
+
+    if (out.psiMean >= config.neuralDriftPsiCritical || out.psiMax >= (config.neuralDriftPsiCritical * 1.5) || out.oodRate >= 0.25) {
+        out.driftBand = "critical";
+    } else if (out.psiMean >= config.neuralDriftPsiWarning || out.psiMax >= config.neuralDriftPsiCritical || out.oodRate >= 0.10) {
+        out.driftBand = "warning";
+    } else {
+        out.driftBand = "stable";
+    }
+    out.warning = out.driftBand != "stable";
+    return out;
+}
+
+double computeConfidenceScore(const std::vector<double>& uncertaintyStd,
+                              const std::vector<double>& ensembleStd,
+                              double oodRate,
+                              const std::string& driftBand) {
+    auto avg = [](const std::vector<double>& v) {
+        if (v.empty()) return 0.0;
+        double s = 0.0;
+        size_t n = 0;
+        for (double x : v) {
+            if (!std::isfinite(x)) continue;
+            s += std::max(0.0, x);
+            ++n;
+        }
+        return (n > 0) ? (s / static_cast<double>(n)) : 0.0;
+    };
+
+    const double unc = avg(uncertaintyStd);
+    const double ens = avg(ensembleStd);
+    const double uncPenalty = unc / (1.0 + unc);
+    const double ensPenalty = ens / (1.0 + ens);
+    const double oodPenalty = std::clamp(oodRate, 0.0, 1.0);
+    const double driftPenalty = (driftBand == "critical") ? 0.30 : ((driftBand == "warning") ? 0.15 : 0.0);
+
+    const double totalPenalty = std::clamp(0.50 * uncPenalty + 0.20 * ensPenalty + 0.30 * oodPenalty + driftPenalty, 0.0, 1.0);
+    return std::clamp(1.0 - totalPenalty, 0.0, 1.0);
+}
 
 struct DataHealthSummary {
     double score = 0.0;
@@ -3127,6 +3471,86 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
             }
         }
 
+        if (!sampleX.empty()) {
+            const size_t uncertaintyRows = std::min<size_t>(std::min<size_t>(sampleX.size(), 128), static_cast<size_t>(512));
+            std::vector<double> outStd(outputNodes, 0.0);
+            std::vector<double> outCiWidth(outputNodes, 0.0);
+            for (size_t r = 0; r < uncertaintyRows; ++r) {
+                const auto unc = nn.predictWithUncertainty(sampleX[r], config.neuralUncertaintySamples, hp.dropoutRate);
+                for (size_t j = 0; j < outputNodes && j < unc.stddev.size(); ++j) {
+                    outStd[j] += unc.stddev[j];
+                    const double width = (j < unc.ciLow.size() && j < unc.ciHigh.size()) ? (unc.ciHigh[j] - unc.ciLow[j]) : 0.0;
+                    outCiWidth[j] += width;
+                }
+            }
+            if (uncertaintyRows > 0) {
+                for (size_t j = 0; j < outputNodes; ++j) {
+                    outStd[j] /= static_cast<double>(uncertaintyRows);
+                    outCiWidth[j] /= static_cast<double>(uncertaintyRows);
+                }
+            }
+            analysis.uncertaintyStd = std::move(outStd);
+            analysis.uncertaintyCiWidth = std::move(outCiWidth);
+        }
+
+        if (config.neuralEnsembleMembers > 1 && sampleX.size() >= 32 && sampleY.size() == sampleX.size()) {
+            const size_t members = std::min<size_t>(config.neuralEnsembleMembers, 7);
+            const size_t probeRows = std::min<size_t>(sampleX.size(), std::max<size_t>(32, config.neuralEnsembleProbeRows));
+            std::vector<std::vector<double>> memberPredSums(members, std::vector<double>(outputNodes, 0.0));
+
+            for (size_t m = 0; m < members; ++m) {
+                NeuralNet ens(topology);
+                ens.setInputL2Scales(inputL2Scales);
+                NeuralNet::Hyperparameters ehp = hp;
+                ehp.epochs = std::min<size_t>(hp.epochs, std::max<size_t>(8, config.neuralEnsembleProbeEpochs));
+                ehp.batchSize = std::min<size_t>(hp.batchSize, static_cast<size_t>(64));
+                ehp.earlyStoppingPatience = std::min(hp.earlyStoppingPatience, 10);
+                ehp.verbose = false;
+                ehp.seed = config.neuralSeed + static_cast<uint32_t>(101 + 37 * m);
+                ens.train(sampleX, sampleY, ehp);
+
+                for (size_t r = 0; r < probeRows; ++r) {
+                    const std::vector<double> pred = ens.predict(sampleX[r]);
+                    for (size_t j = 0; j < outputNodes && j < pred.size(); ++j) {
+                        memberPredSums[m][j] += pred[j];
+                    }
+                }
+            }
+
+            std::vector<double> ensStd(outputNodes, 0.0);
+            for (size_t j = 0; j < outputNodes; ++j) {
+                double mean = 0.0;
+                for (size_t m = 0; m < members; ++m) {
+                    mean += memberPredSums[m][j] / static_cast<double>(probeRows);
+                }
+                mean /= static_cast<double>(members);
+
+                double var = 0.0;
+                for (size_t m = 0; m < members; ++m) {
+                    const double v = memberPredSums[m][j] / static_cast<double>(probeRows);
+                    const double d = v - mean;
+                    var += d * d;
+                }
+                ensStd[j] = std::sqrt(var / static_cast<double>(std::max<size_t>(1, members - 1)));
+            }
+            analysis.ensembleStd = std::move(ensStd);
+        }
+
+        const OodDriftDiagnostics ood = computeOodDriftDiagnostics(sampleX, config);
+        analysis.oodRate = ood.oodRate;
+        analysis.oodMeanDistance = ood.meanDistance;
+        analysis.oodMaxDistance = ood.maxDistance;
+        analysis.oodReferenceRows = ood.referenceRows;
+        analysis.oodMonitorRows = ood.monitorRows;
+        analysis.driftPsiMean = ood.psiMean;
+        analysis.driftPsiMax = ood.psiMax;
+        analysis.driftBand = ood.driftBand;
+        analysis.driftWarning = ood.warning;
+        analysis.confidenceScore = computeConfidenceScore(analysis.uncertaintyStd,
+                                                          analysis.ensembleStd,
+                                                          analysis.oodRate,
+                                                          analysis.driftBand);
+
         return analysis;
     }
 
@@ -3901,6 +4325,79 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         analysis.uncertaintyStd = std::move(outStd);
         analysis.uncertaintyCiWidth = std::move(outCiWidth);
     }
+
+    if (config.neuralEnsembleMembers > 1 && Xnn.size() >= 32 && Ynn.size() == Xnn.size()) {
+        const size_t members = std::min<size_t>(config.neuralEnsembleMembers, 7);
+        const size_t trainRows = std::min<size_t>(Xnn.size(), std::max<size_t>(32, config.neuralEnsembleProbeRows));
+        std::vector<size_t> rows(Xnn.size());
+        std::iota(rows.begin(), rows.end(), 0);
+        std::mt19937 ensRng(config.neuralSeed ^ 0x517cc1b7U);
+        std::shuffle(rows.begin(), rows.end(), ensRng);
+        rows.resize(trainRows);
+
+        std::vector<std::vector<double>> ensX;
+        std::vector<std::vector<double>> ensY;
+        ensX.reserve(trainRows);
+        ensY.reserve(trainRows);
+        for (size_t idx : rows) {
+            ensX.push_back(Xnn[idx]);
+            ensY.push_back(Ynn[idx]);
+        }
+
+        const size_t probeRows = std::min<size_t>(ensX.size(), static_cast<size_t>(128));
+        std::vector<std::vector<double>> memberPredSums(members, std::vector<double>(outputNodes, 0.0));
+        for (size_t m = 0; m < members; ++m) {
+            NeuralNet ens(topology);
+            ens.setInputL2Scales(inputL2Scales);
+            NeuralNet::Hyperparameters ehp = hp;
+            ehp.epochs = std::min<size_t>(hp.epochs, std::max<size_t>(8, config.neuralEnsembleProbeEpochs));
+            ehp.batchSize = std::min<size_t>(hp.batchSize, static_cast<size_t>(64));
+            ehp.earlyStoppingPatience = std::min(hp.earlyStoppingPatience, 10);
+            ehp.verbose = false;
+            ehp.seed = config.neuralSeed + static_cast<uint32_t>(101 + 37 * m);
+            ens.train(ensX, ensY, ehp);
+
+            for (size_t r = 0; r < probeRows; ++r) {
+                const std::vector<double> pred = ens.predict(ensX[r]);
+                for (size_t j = 0; j < outputNodes && j < pred.size(); ++j) {
+                    memberPredSums[m][j] += pred[j];
+                }
+            }
+        }
+
+        std::vector<double> ensStd(outputNodes, 0.0);
+        for (size_t j = 0; j < outputNodes; ++j) {
+            double mean = 0.0;
+            for (size_t m = 0; m < members; ++m) {
+                mean += memberPredSums[m][j] / static_cast<double>(probeRows);
+            }
+            mean /= static_cast<double>(members);
+
+            double var = 0.0;
+            for (size_t m = 0; m < members; ++m) {
+                const double v = memberPredSums[m][j] / static_cast<double>(probeRows);
+                const double d = v - mean;
+                var += d * d;
+            }
+            ensStd[j] = std::sqrt(var / static_cast<double>(std::max<size_t>(1, members - 1)));
+        }
+        analysis.ensembleStd = std::move(ensStd);
+    }
+
+    const OodDriftDiagnostics ood = computeOodDriftDiagnostics(Xnn, config);
+    analysis.oodRate = ood.oodRate;
+    analysis.oodMeanDistance = ood.meanDistance;
+    analysis.oodMaxDistance = ood.maxDistance;
+    analysis.oodReferenceRows = ood.referenceRows;
+    analysis.oodMonitorRows = ood.monitorRows;
+    analysis.driftPsiMean = ood.psiMean;
+    analysis.driftPsiMax = ood.psiMax;
+    analysis.driftBand = ood.driftBand;
+    analysis.driftWarning = ood.warning;
+    analysis.confidenceScore = computeConfidenceScore(analysis.uncertaintyStd,
+                                                      analysis.ensembleStd,
+                                                      analysis.oodRate,
+                                                      analysis.driftBand);
 
     analysis.featureImportance.assign(featureIdx.size(), 0.0);
 
@@ -7889,7 +8386,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
             {"Training Rows Used", std::to_string(neural.trainingRowsUsed) + " / " + std::to_string(neural.trainingRowsTotal)},
             {"Epochs", std::to_string(neural.epochs)},
             {"Topology", neural.topology},
-            {"Health Score", toFixed(dataHealth.score, 1) + "/100 " + scoreBar100(dataHealth.score)}
+            {"Health Score", toFixed(dataHealth.score, 1) + "/100 " + scoreBar100(dataHealth.score)},
+            {"Predictive Confidence", toFixed(100.0 * neural.confidenceScore, 1) + "%"},
+            {"OOD/Drift Sentinel", neural.driftBand}
         },
         {
             "Auto policy and deterministic guardrails reduce overfitting and unstable topology growth.",
@@ -7963,6 +8462,32 @@ int AutomationPipeline::run(const AutoConfig& config) {
             });
         }
         neuralReport.addTable("Predictive Uncertainty (MC Dropout)", {"Output", "Avg StdDev", "Avg 95% CI Width"}, uncertaintyRows);
+    }
+
+    if (!neural.ensembleStd.empty()) {
+        std::vector<std::vector<std::string>> ensembleRows;
+        for (size_t i = 0; i < neural.ensembleStd.size(); ++i) {
+            ensembleRows.push_back({
+                "output_" + std::to_string(i + 1),
+                toFixed(neural.ensembleStd[i], 6)
+            });
+        }
+        neuralReport.addTable("Predictive Disagreement (Mini Ensemble)", {"Output", "Across-Model StdDev"}, ensembleRows);
+    }
+
+    neuralReport.addTable("OOD & Data Drift Sentinel", {"Metric", "Value"}, {
+        {"Confidence Score", toFixed(100.0 * neural.confidenceScore, 2) + "%"},
+        {"OOD Rate (monitor window)", toFixed(100.0 * neural.oodRate, 2) + "%"},
+        {"OOD Mean RMS-z Distance", toFixed(neural.oodMeanDistance, 4)},
+        {"OOD Max RMS-z Distance", toFixed(neural.oodMaxDistance, 4)},
+        {"Reference Rows", std::to_string(neural.oodReferenceRows)},
+        {"Monitor Rows", std::to_string(neural.oodMonitorRows)},
+        {"Drift PSI Mean", toFixed(neural.driftPsiMean, 4)},
+        {"Drift PSI Max", toFixed(neural.driftPsiMax, 4)},
+        {"Sentinel Band", neural.driftBand}
+    });
+    if (neural.driftWarning) {
+        neuralReport.addParagraph("⚠️ Data Drift Warning: monitor-window distribution diverges from the model reference window. Predictions may be less reliable until data quality or upstream process stability is reviewed.");
     }
 
     std::vector<std::vector<std::string>> fiRows;
@@ -8185,6 +8710,17 @@ int AutomationPipeline::run(const AutoConfig& config) {
         {"Selected Yield", toFixed(100.0 * dataHealth.selectedYield, 1) + "%"},
         {"Training Stability", toFixed(100.0 * dataHealth.trainingStability, 1) + "%"}
     });
+
+    finalAnalysis.addTable("Probabilistic Reliability Card", {"Metric", "Value"}, {
+        {"Predictive Confidence", toFixed(100.0 * neural.confidenceScore, 2) + "%"},
+        {"OOD Rate", toFixed(100.0 * neural.oodRate, 2) + "%"},
+        {"Drift Band", neural.driftBand},
+        {"Drift PSI Mean", toFixed(neural.driftPsiMean, 4)},
+        {"Drift PSI Max", toFixed(neural.driftPsiMax, 4)}
+    });
+    if (neural.driftWarning) {
+        finalAnalysis.addParagraph("⚠️ Reliability Alert: Seldon detected out-of-distribution behavior and/or population drift. Treat downstream forecasts as conditional and prioritize data validation before actioning high-impact decisions.");
+    }
 
     std::vector<std::vector<std::string>> topFeatures;
     std::vector<std::pair<std::string, double>> fiPairs;

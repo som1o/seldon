@@ -172,6 +172,9 @@ struct AutoConfig {
     // neural_max_lr_reductions, neural_min_learning_rate,
     // neural_use_validation_loss_ema, neural_validation_loss_ema_beta,
     // neural_categorical_input_l2_boost,
+    // neural_ensemble_members, neural_ensemble_probe_rows, neural_ensemble_probe_epochs,
+    // neural_ood_enabled, neural_ood_z_threshold, neural_ood_distance_threshold,
+    // neural_drift_psi_warning, neural_drift_psi_critical,
     // impute.<column_name> (per-column imputation strategy).
     std::string datasetPath;
     std::string reportFile = "neural_synthesis.md";
@@ -264,6 +267,14 @@ struct AutoConfig {
     std::string neuralExplainability = "hybrid"; // permutation|integrated_gradients|hybrid
     size_t neuralIntegratedGradSteps = 8;
     size_t neuralUncertaintySamples = 24;
+    size_t neuralEnsembleMembers = 3;
+    size_t neuralEnsembleProbeRows = 256;
+    size_t neuralEnsembleProbeEpochs = 48;
+    bool neuralOodEnabled = true;
+    double neuralOodZThreshold = 3.5;
+    double neuralOodDistanceThreshold = 2.5;
+    double neuralDriftPsiWarning = 0.15;
+    double neuralDriftPsiCritical = 0.25;
     bool neuralImportanceParallel = true;
     size_t neuralImportanceMaxRows = 1000;
     size_t neuralImportanceTrials = 0; // 0 => auto

@@ -422,6 +422,7 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"low_memory_mode", &AutoConfig::lowMemoryMode},
         {"neural_streaming_mode", &AutoConfig::neuralStreamingMode},
         {"neural_multi_output", &AutoConfig::neuralMultiOutput},
+        {"neural_ood_enabled", &AutoConfig::neuralOodEnabled},
         {"neural_importance_parallel", &AutoConfig::neuralImportanceParallel},
         {"feature_engineering_enable_poly", &AutoConfig::featureEngineeringEnablePoly},
         {"feature_engineering_enable_log", &AutoConfig::featureEngineeringEnableLog},
@@ -455,6 +456,9 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_max_aux_targets", {&AutoConfig::neuralMaxAuxTargets, 0}},
         {"neural_integrated_grad_steps", {&AutoConfig::neuralIntegratedGradSteps, 4}},
         {"neural_uncertainty_samples", {&AutoConfig::neuralUncertaintySamples, 4}},
+        {"neural_ensemble_members", {&AutoConfig::neuralEnsembleMembers, 1}},
+        {"neural_ensemble_probe_rows", {&AutoConfig::neuralEnsembleProbeRows, 32}},
+        {"neural_ensemble_probe_epochs", {&AutoConfig::neuralEnsembleProbeEpochs, 8}},
         {"neural_importance_max_rows", {&AutoConfig::neuralImportanceMaxRows, 128}},
         {"neural_importance_trials", {&AutoConfig::neuralImportanceTrials, 0}},
         {"feature_engineering_max_base", {&AutoConfig::featureEngineeringMaxBase, 2}},
@@ -482,7 +486,11 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_gradient_noise_std", {&AutoConfig::neuralGradientNoiseStd, 0.0}},
         {"neural_gradient_noise_decay", {&AutoConfig::neuralGradientNoiseDecay, 0.0}},
         {"neural_ema_decay", {&AutoConfig::neuralEmaDecay, 0.0}},
-        {"neural_label_smoothing", {&AutoConfig::neuralLabelSmoothing, 0.0}}
+        {"neural_label_smoothing", {&AutoConfig::neuralLabelSmoothing, 0.0}},
+        {"neural_ood_z_threshold", {&AutoConfig::neuralOodZThreshold, 0.1}},
+        {"neural_ood_distance_threshold", {&AutoConfig::neuralOodDistanceThreshold, 0.1}},
+        {"neural_drift_psi_warning", {&AutoConfig::neuralDriftPsiWarning, 0.01}},
+        {"neural_drift_psi_critical", {&AutoConfig::neuralDriftPsiCritical, 0.01}}
     };
     static const std::unordered_map<std::string, PlotIntRule> plotIntFields = {
         {"plot_width", {&PlotConfig::width, 320}},
@@ -763,6 +771,22 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.neuralIntegratedGradSteps = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-integrated-grad-steps", 4));
         } else if (arg == "--neural-uncertainty-samples" && i + 1 < argc) {
             config.neuralUncertaintySamples = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-uncertainty-samples", 4));
+        } else if (arg == "--neural-ensemble-members" && i + 1 < argc) {
+            config.neuralEnsembleMembers = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-ensemble-members", 1));
+        } else if (arg == "--neural-ensemble-probe-rows" && i + 1 < argc) {
+            config.neuralEnsembleProbeRows = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-ensemble-probe-rows", 32));
+        } else if (arg == "--neural-ensemble-probe-epochs" && i + 1 < argc) {
+            config.neuralEnsembleProbeEpochs = static_cast<size_t>(parseIntStrict(argv[++i], "--neural-ensemble-probe-epochs", 8));
+        } else if (arg == "--neural-ood-enabled" && i + 1 < argc) {
+            config.neuralOodEnabled = parseBoolStrict(argv[++i], "--neural-ood-enabled");
+        } else if (arg == "--neural-ood-z-threshold" && i + 1 < argc) {
+            config.neuralOodZThreshold = parseDoubleStrict(argv[++i], "--neural-ood-z-threshold", 0.1);
+        } else if (arg == "--neural-ood-distance-threshold" && i + 1 < argc) {
+            config.neuralOodDistanceThreshold = parseDoubleStrict(argv[++i], "--neural-ood-distance-threshold", 0.1);
+        } else if (arg == "--neural-drift-psi-warning" && i + 1 < argc) {
+            config.neuralDriftPsiWarning = parseDoubleStrict(argv[++i], "--neural-drift-psi-warning", 0.01);
+        } else if (arg == "--neural-drift-psi-critical" && i + 1 < argc) {
+            config.neuralDriftPsiCritical = parseDoubleStrict(argv[++i], "--neural-drift-psi-critical", 0.01);
         } else if (arg == "--neural-importance-parallel" && i + 1 < argc) {
             config.neuralImportanceParallel = parseBoolStrict(argv[++i], "--neural-importance-parallel");
         } else if (arg == "--neural-importance-max-rows" && i + 1 < argc) {
@@ -1163,6 +1187,30 @@ void AutoConfig::validate() const {
     }
     if (neuralUncertaintySamples < 4) {
         throw Seldon::ConfigurationException("neural_uncertainty_samples must be >= 4");
+    }
+    if (neuralEnsembleMembers < 1) {
+        throw Seldon::ConfigurationException("neural_ensemble_members must be >= 1");
+    }
+    if (neuralEnsembleProbeRows < 32) {
+        throw Seldon::ConfigurationException("neural_ensemble_probe_rows must be >= 32");
+    }
+    if (neuralEnsembleProbeEpochs < 8) {
+        throw Seldon::ConfigurationException("neural_ensemble_probe_epochs must be >= 8");
+    }
+    if (neuralOodZThreshold <= 0.0) {
+        throw Seldon::ConfigurationException("neural_ood_z_threshold must be > 0");
+    }
+    if (neuralOodDistanceThreshold <= 0.0) {
+        throw Seldon::ConfigurationException("neural_ood_distance_threshold must be > 0");
+    }
+    if (neuralDriftPsiWarning <= 0.0) {
+        throw Seldon::ConfigurationException("neural_drift_psi_warning must be > 0");
+    }
+    if (neuralDriftPsiCritical <= 0.0) {
+        throw Seldon::ConfigurationException("neural_drift_psi_critical must be > 0");
+    }
+    if (neuralDriftPsiWarning >= neuralDriftPsiCritical) {
+        throw Seldon::ConfigurationException("neural_drift_psi_warning must be < neural_drift_psi_critical");
     }
     if (neuralImportanceMaxRows < 128) {
         throw Seldon::ConfigurationException("neural_importance_max_rows must be >= 128");

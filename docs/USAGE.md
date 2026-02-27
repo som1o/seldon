@@ -402,6 +402,14 @@ Sampling controls:
 
 - `neural_integrated_grad_steps`
 - `neural_uncertainty_samples`
+- `neural_ensemble_members`
+- `neural_ensemble_probe_rows`
+- `neural_ensemble_probe_epochs`
+- `neural_ood_enabled`
+- `neural_ood_z_threshold`
+- `neural_ood_distance_threshold`
+- `neural_drift_psi_warning`
+- `neural_drift_psi_critical`
 - `neural_importance_parallel`
 - `neural_importance_max_rows`
 - `neural_importance_trials`
@@ -559,6 +567,14 @@ neural_max_aux_targets: 2
 neural_explainability: hybrid
 neural_integrated_grad_steps: 8
 neural_uncertainty_samples: 24
+neural_ensemble_members: 3
+neural_ensemble_probe_rows: 256
+neural_ensemble_probe_epochs: 48
+neural_ood_enabled: true
+neural_ood_z_threshold: 3.5
+neural_ood_distance_threshold: 2.5
+neural_drift_psi_warning: 0.15
+neural_drift_psi_critical: 0.25
 neural_importance_parallel: true
 neural_importance_max_rows: 1000
 neural_importance_trials: 0

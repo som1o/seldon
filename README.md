@@ -403,6 +403,13 @@ Neural analysis includes:
 - explainability,
 - uncertainty estimation.
 
+Reliability guardrails now include:
+
+- Monte Carlo dropout uncertainty,
+- mini-ensemble disagreement,
+- OOD distance scoring,
+- PSI-based drift sentinels.
+
 Key controls:
 
 - `neural_strategy`,
@@ -411,7 +418,16 @@ Key controls:
 - `neural_lookahead_fast_optimizer`,
 - `neural_lookahead_sync_period`,
 - `neural_lookahead_alpha`,
-- `gradient_clip_norm`.
+- `gradient_clip_norm`,
+- `neural_uncertainty_samples`,
+- `neural_ensemble_members`,
+- `neural_ensemble_probe_rows`,
+- `neural_ensemble_probe_epochs`,
+- `neural_ood_enabled`,
+- `neural_ood_z_threshold`,
+- `neural_ood_distance_threshold`,
+- `neural_drift_psi_warning`,
+- `neural_drift_psi_critical`.
 
 ---
 
@@ -647,6 +663,15 @@ neural_max_trainable_params: 20000000
 neural_explainability: hybrid
 hybrid_explainability_weight_permutation: 0.5
 hybrid_explainability_weight_integrated_gradients: 0.5
+neural_uncertainty_samples: 24
+neural_ensemble_members: 3
+neural_ensemble_probe_rows: 256
+neural_ensemble_probe_epochs: 48
+neural_ood_enabled: true
+neural_ood_z_threshold: 3.5
+neural_ood_distance_threshold: 2.5
+neural_drift_psi_warning: 0.15
+neural_drift_psi_critical: 0.25
 
 plots: all
 plot_format: png

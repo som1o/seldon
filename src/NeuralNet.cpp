@@ -1047,6 +1047,7 @@ NeuralNet::UncertaintyEstimate NeuralNet::predictWithUncertainty(const std::vect
                                                                  size_t samples,
                                                                  double dropoutRate) {
     if (samples == 0) samples = 1;
+    const double safeDropout = std::clamp(dropoutRate, 0.0, 0.95);
 
     const size_t outDim = m_layers.back().size();
     UncertaintyEstimate out;
@@ -1055,11 +1056,27 @@ NeuralNet::UncertaintyEstimate NeuralNet::predictWithUncertainty(const std::vect
     out.ciLow.assign(outDim, 0.0);
     out.ciHigh.assign(outDim, 0.0);
 
+    std::vector<double> scaled = inputValues;
+    if (!inputScales.empty()) {
+        const size_t n = std::min(scaled.size(), inputScales.size());
+        for (size_t i = 0; i < n; ++i) {
+            double range = inputScales[i].max - inputScales[i].min;
+            if (std::abs(range) <= kNumericEps) range = 1.0;
+            scaled[i] = (scaled[i] - inputScales[i].min) / range;
+        }
+    }
+
     std::vector<std::vector<double>> draws(samples, std::vector<double>(outDim, 0.0));
     for (size_t s = 0; s < samples; ++s) {
-        feedForward(inputValues, true, dropoutRate);
+        feedForward(scaled, true, safeDropout);
         for (size_t j = 0; j < outDim; ++j) {
-            draws[s][j] = m_layers.back().outputs()[j];
+            double v = m_layers.back().outputs()[j];
+            if (!outputScales.empty() && j < outputScales.size()) {
+                double range = outputScales[j].max - outputScales[j].min;
+                if (std::abs(range) <= kNumericEps) range = 1.0;
+                v = v * range + outputScales[j].min;
+            }
+            draws[s][j] = v;
         }
     }
 
