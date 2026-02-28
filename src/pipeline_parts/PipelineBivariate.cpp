@@ -1384,11 +1384,22 @@ void addOverallSections(ReportEngine& report,
                     const auto& b = std::get<std::vector<double>>(data.columns()[idxJ].values);
                     auto ai = statsCache.find(idxI);
                     auto bi = statsCache.find(idxJ);
-                    ColumnStats aFallback = Statistics::calculateStats(a);
-                    ColumnStats bFallback = Statistics::calculateStats(b);
-                    const ColumnStats& sa = (ai != statsCache.end()) ? ai->second : aFallback;
-                    const ColumnStats& sb = (bi != statsCache.end()) ? bi->second : bFallback;
-                    double r = MathUtils::calculatePearson(a, b, sa, sb).value_or(0.0);
+                    std::optional<ColumnStats> aFallback;
+                    std::optional<ColumnStats> bFallback;
+                    const ColumnStats* sa = nullptr;
+                    const ColumnStats* sb = nullptr;
+                    if (ai != statsCache.end()) sa = &ai->second;
+                    else {
+                        aFallback = Statistics::calculateStats(a);
+                        sa = &(*aFallback);
+                    }
+                    if (bi != statsCache.end()) sb = &bi->second;
+                    else {
+                        bFallback = Statistics::calculateStats(b);
+                        sb = &(*bFallback);
+                    }
+                    if (sa == nullptr || sb == nullptr) continue;
+                    double r = MathUtils::calculatePearson(a, b, *sa, *sb).value_or(0.0);
                     corr[i][j] = r;
                     corr[j][i] = r;
                 }

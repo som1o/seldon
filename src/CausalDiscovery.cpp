@@ -16,6 +16,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
+
 namespace {
 constexpr double kBicSigma2Floor = 1e-12;
 constexpr double kBicTieThreshold = 1e-6;
@@ -488,6 +492,23 @@ CausalDataView buildCompleteCaseView(const TypedDataset& data,
     if (out.rows.size() < 30) {
         out.nodeColumnIdx.clear();
         out.rows.clear();
+        return out;
+    }
+
+    constexpr size_t kMaxCausalRows = 2500;
+    if (out.rows.size() > kMaxCausalRows) {
+        std::vector<std::vector<double>> reduced;
+        reduced.reserve(kMaxCausalRows);
+        const double step = static_cast<double>(out.rows.size() - 1) / static_cast<double>(kMaxCausalRows - 1);
+        size_t prev = static_cast<size_t>(-1);
+        for (size_t i = 0; i < kMaxCausalRows; ++i) {
+            size_t pick = static_cast<size_t>(std::llround(step * static_cast<double>(i)));
+            pick = std::min(pick, out.rows.size() - 1);
+            if (pick == prev && pick + 1 < out.rows.size()) ++pick;
+            reduced.push_back(std::move(out.rows[pick]));
+            prev = pick;
+        }
+        out.rows = std::move(reduced);
     }
     return out;
 }
@@ -528,6 +549,8 @@ DiscoveryCoreResult discoverCore(const std::vector<std::vector<double>>& rows,
     out.directed.assign(p, std::vector<bool>(p, false));
     out.undirected.assign(p, std::vector<bool>(p, false));
     out.sepsets.assign(p, std::vector<std::unordered_set<size_t>>(p));
+    std::unordered_map<std::string, CiTestResult> ciCache;
+    ciCache.reserve(p * p * 4);
 
     if (p < 3 || rows.size() < 30) return out;
 
@@ -555,9 +578,22 @@ DiscoveryCoreResult discoverCore(const std::vector<std::vector<double>>& rows,
                 const auto cands = combinations(adjI, level);
                 bool separated = false;
                 for (const auto& cond : cands) {
-                    const auto ci = conditionalIndependenceTest(rows, i, j, cond, options.alpha,
-                                                                options.enableKernelCiFallback,
-                                                                rng);
+                    std::string cacheKey = std::to_string(std::min(i, j)) + "|" + std::to_string(std::max(i, j)) + "|";
+                    for (size_t c : cond) {
+                        cacheKey += std::to_string(c);
+                        cacheKey.push_back(',');
+                    }
+
+                    CiTestResult ci;
+                    const auto cacheIt = ciCache.find(cacheKey);
+                    if (cacheIt != ciCache.end()) {
+                        ci = cacheIt->second;
+                    } else {
+                        ci = conditionalIndependenceTest(rows, i, j, cond, options.alpha,
+                                                         options.enableKernelCiFallback,
+                                                         rng);
+                        ciCache.emplace(std::move(cacheKey), ci);
+                    }
                     if (!ci.independent) continue;
                     out.undirected[i][j] = false;
                     out.undirected[j][i] = false;
@@ -986,23 +1022,57 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
     }
     result.usedLiNGAM = core.usedLiNGAM;
 
+    const size_t effectiveBootstrapSamples = [&]() {
+        if (options.bootstrapSamples == 0) return static_cast<size_t>(0);
+        if (view.rows.size() >= 8000) return std::min<size_t>(options.bootstrapSamples, 24);
+        if (view.rows.size() >= 4000) return std::min<size_t>(options.bootstrapSamples, 40);
+        if (view.rows.size() >= 2000) return std::min<size_t>(options.bootstrapSamples, 64);
+        return options.bootstrapSamples;
+    }();
+
     std::map<std::pair<size_t, size_t>, size_t> bootstrapCounts;
-    if (options.bootstrapSamples > 0) {
-        std::uniform_int_distribution<size_t> pick(0, view.rows.size() - 1);
-        for (size_t b = 0; b < options.bootstrapSamples; ++b) {
+    if (effectiveBootstrapSamples > 0) {
+        const size_t p = core.directed.size();
+        std::vector<size_t> edgeCounts(p * p, 0);
+
+        #ifdef USE_OPENMP
+        #pragma omp parallel for schedule(dynamic)
+        #endif
+        for (size_t b = 0; b < effectiveBootstrapSamples; ++b) {
+            std::mt19937 sampleRng(static_cast<uint32_t>(options.randomSeed + b * 104729u + 31u));
+            std::uniform_int_distribution<size_t> pick(0, view.rows.size() - 1);
             std::vector<std::vector<double>> sample;
             sample.reserve(view.rows.size());
-            for (size_t i = 0; i < view.rows.size(); ++i) sample.push_back(view.rows[pick(rng)]);
+            for (size_t i = 0; i < view.rows.size(); ++i) sample.push_back(view.rows[pick(sampleRng)]);
             std::mt19937 localRng(static_cast<uint32_t>(options.randomSeed + b * 7919u + 17u));
             const DiscoveryCoreResult boot = discoverCore(sample, forbidden, options, localRng);
+
+            std::vector<size_t> localEdgeCounts(p * p, 0);
             for (size_t i = 0; i < boot.directed.size(); ++i) {
                 for (size_t j = 0; j < boot.directed.size(); ++j) {
                     if (i == j || !boot.directed[i][j]) continue;
-                    bootstrapCounts[{i, j}] += 1;
+                    localEdgeCounts[i * p + j] += 1;
                 }
             }
-            ++result.bootstrapRuns;
+
+            #ifdef USE_OPENMP
+            #pragma omp critical
+            #endif
+            {
+                for (size_t idx = 0; idx < edgeCounts.size(); ++idx) {
+                    edgeCounts[idx] += localEdgeCounts[idx];
+                }
+            }
         }
+
+        for (size_t i = 0; i < p; ++i) {
+            for (size_t j = 0; j < p; ++j) {
+                const size_t count = edgeCounts[i * p + j];
+                if (count == 0) continue;
+                bootstrapCounts[{i, j}] = count;
+            }
+        }
+        result.bootstrapRuns = effectiveBootstrapSamples;
     }
 
     const TemporalSeries temporal = detectTemporalSeries(data);
@@ -1084,6 +1154,10 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
         result.notes.push_back("Temporal axis detected for proxy intervention checks: " + temporal.axisName + ".");
     }
     result.notes.push_back("Constraint-based PC discovery executed with max conditioning set " + std::to_string(options.maxConditionSet) + ".");
+    if (effectiveBootstrapSamples < options.bootstrapSamples) {
+        result.notes.push_back("Bootstrap samples auto-capped for runtime at " + std::to_string(effectiveBootstrapSamples) +
+                               " (requested " + std::to_string(options.bootstrapSamples) + ").");
+    }
     if (options.enableGES) {
         result.notes.push_back("Score-based GES orientation pass applied on unresolved undirected edges.");
     }

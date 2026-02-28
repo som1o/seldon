@@ -121,17 +121,21 @@ void DenseLayer::forward(const DenseLayer& prev,
     for (size_t n = 0; n < m_size; ++n) {
         NeuralScalar sum = m_biases[n];
         const size_t weightOffset = n * m_prevSize;
-        #ifdef USE_OPENMP
-        #pragma omp simd reduction(+:sum)
-        #endif
-        for (size_t pn = 0; pn < m_prevSize; ++pn) {
-            #if defined(__GNUC__) || defined(__clang__)
-            if (pn + 16 < m_prevSize) {
-                __builtin_prefetch(&prev.outputs()[pn + 16], 0, 1);
-                __builtin_prefetch(&m_weights[weightOffset + pn + 16], 0, 1);
-            }
+        constexpr size_t kTile = 32;
+        for (size_t t0 = 0; t0 < m_prevSize; t0 += kTile) {
+            const size_t tMax = std::min(m_prevSize, t0 + kTile);
+            #ifdef USE_OPENMP
+            #pragma omp simd reduction(+:sum)
             #endif
-            sum += prev.outputs()[pn] * m_weights[weightOffset + pn];
+            for (size_t pn = t0; pn < tMax; ++pn) {
+                #if defined(__GNUC__) || defined(__clang__)
+                if (pn + 16 < m_prevSize) {
+                    __builtin_prefetch(&prev.outputs()[pn + 16], 0, 1);
+                    __builtin_prefetch(&m_weights[weightOffset + pn + 16], 0, 1);
+                }
+                #endif
+                sum += prev.outputs()[pn] * m_weights[weightOffset + pn];
+            }
         }
 
         NeuralScalar activationInput = sum;

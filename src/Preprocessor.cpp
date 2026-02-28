@@ -14,6 +14,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <queue>
 #include <set>
 #include <tuple>
 #include <unordered_set>
@@ -164,6 +165,94 @@ const MissingMask* snapshotMissingForColumn(const NumericSnapshotStore& snapshot
     return &snapshot.missing[it->second];
 }
 
+struct KdPoint {
+    std::vector<double> coords;
+    double target = 0.0;
+};
+
+struct KdNode {
+    size_t pointIndex = 0;
+    size_t axis = 0;
+    int left = -1;
+    int right = -1;
+};
+
+double squaredDistance(const std::vector<double>& a, const std::vector<double>& b) {
+    if (a.size() != b.size()) return std::numeric_limits<double>::infinity();
+    double sum = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const double d = a[i] - b[i];
+        sum += d * d;
+    }
+    return sum;
+}
+
+int buildKdTree(std::vector<size_t>& order,
+                size_t begin,
+                size_t end,
+                size_t depth,
+                const std::vector<KdPoint>& points,
+                std::vector<KdNode>& nodes) {
+    if (begin >= end || points.empty()) return -1;
+
+    const size_t dims = points.front().coords.size();
+    const size_t axis = (dims == 0) ? 0 : (depth % dims);
+    const size_t mid = begin + (end - begin) / 2;
+
+    std::nth_element(order.begin() + static_cast<std::ptrdiff_t>(begin),
+                     order.begin() + static_cast<std::ptrdiff_t>(mid),
+                     order.begin() + static_cast<std::ptrdiff_t>(end),
+                     [&](size_t lhs, size_t rhs) {
+                         const double lv = points[lhs].coords[axis];
+                         const double rv = points[rhs].coords[axis];
+                         if (lv == rv) return lhs < rhs;
+                         return lv < rv;
+                     });
+
+    KdNode node;
+    node.pointIndex = order[mid];
+    node.axis = axis;
+    const int nodeIndex = static_cast<int>(nodes.size());
+    nodes.push_back(node);
+
+    nodes[static_cast<size_t>(nodeIndex)].left = buildKdTree(order, begin, mid, depth + 1, points, nodes);
+    nodes[static_cast<size_t>(nodeIndex)].right = buildKdTree(order, mid + 1, end, depth + 1, points, nodes);
+    return nodeIndex;
+}
+
+void queryKdKnn(const std::vector<KdPoint>& points,
+                const std::vector<KdNode>& nodes,
+                int nodeIndex,
+                const std::vector<double>& query,
+                size_t k,
+                std::priority_queue<std::pair<double, size_t>>& best) {
+    if (nodeIndex < 0 || static_cast<size_t>(nodeIndex) >= nodes.size()) return;
+
+    const KdNode& node = nodes[static_cast<size_t>(nodeIndex)];
+    const KdPoint& point = points[node.pointIndex];
+
+    const double dist2 = squaredDistance(point.coords, query);
+    if (std::isfinite(dist2)) {
+        if (best.size() < k) {
+            best.push({dist2, node.pointIndex});
+        } else if (dist2 < best.top().first) {
+            best.pop();
+            best.push({dist2, node.pointIndex});
+        }
+    }
+
+    const double axisDiff = query[node.axis] - point.coords[node.axis];
+    const int first = (axisDiff <= 0.0) ? node.left : node.right;
+    const int second = (axisDiff <= 0.0) ? node.right : node.left;
+    queryKdKnn(points, nodes, first, query, k, best);
+
+    const double planeDist2 = axisDiff * axisDiff;
+    const double worstBest = best.empty() ? std::numeric_limits<double>::infinity() : best.top().first;
+    if (best.size() < k || planeDist2 < worstBest) {
+        queryKdKnn(points, nodes, second, query, k, best);
+    }
+}
+
 void imputeNumericKnnWithSnapshot(NumVec& targetVals,
                                   MissingMask& targetMissing,
                                   const NumericSnapshotStore& snapshot,
@@ -178,6 +267,95 @@ void imputeNumericKnnWithSnapshot(NumVec& targetVals,
     if (predictors.empty()) {
         imputeNumeric(targetVals, targetMissing, "mean");
         return;
+    }
+
+    const bool useKdTree = targetVals.size() >= 4000 && predictors.size() >= 2;
+    if (useKdTree) {
+        const size_t dims = predictors.size();
+        std::vector<double> means(dims, 0.0);
+        std::vector<size_t> meanCounts(dims, 0);
+        for (size_t di = 0; di < dims; ++di) {
+            const NumVec* pVals = snapshotValuesForColumn(snapshot, predictors[di]);
+            const MissingMask* pMissing = snapshotMissingForColumn(snapshot, predictors[di]);
+            if (pVals == nullptr || pMissing == nullptr) continue;
+            const size_t n = std::min(pVals->size(), pMissing->size());
+            for (size_t row = 0; row < n; ++row) {
+                if ((*pMissing)[row] || !std::isfinite((*pVals)[row])) continue;
+                means[di] += (*pVals)[row];
+                ++meanCounts[di];
+            }
+            if (meanCounts[di] > 0) {
+                means[di] /= static_cast<double>(meanCounts[di]);
+            }
+        }
+
+        std::vector<KdPoint> points;
+        points.reserve(targetVals.size());
+        for (size_t row = 0; row < targetVals.size() && row < targetMissing.size(); ++row) {
+            if (targetMissing[row] || !std::isfinite(targetVals[row])) continue;
+
+            KdPoint p;
+            p.coords.assign(dims, 0.0);
+            p.target = targetVals[row];
+            for (size_t di = 0; di < dims; ++di) {
+                const NumVec* pVals = snapshotValuesForColumn(snapshot, predictors[di]);
+                const MissingMask* pMissing = snapshotMissingForColumn(snapshot, predictors[di]);
+                if (pVals == nullptr || pMissing == nullptr || row >= pVals->size() || row >= pMissing->size() ||
+                    (*pMissing)[row] || !std::isfinite((*pVals)[row])) {
+                    p.coords[di] = means[di];
+                } else {
+                    p.coords[di] = (*pVals)[row];
+                }
+            }
+            points.push_back(std::move(p));
+        }
+
+        if (!points.empty()) {
+            std::vector<size_t> order(points.size(), 0);
+            std::iota(order.begin(), order.end(), 0);
+            std::vector<KdNode> nodes;
+            nodes.reserve(points.size());
+            const int root = buildKdTree(order, 0, order.size(), 0, points, nodes);
+
+            for (size_t row = 0; row < targetVals.size() && row < targetMissing.size(); ++row) {
+                if (!targetMissing[row] && std::isfinite(targetVals[row])) continue;
+
+                std::vector<double> query(dims, 0.0);
+                for (size_t di = 0; di < dims; ++di) {
+                    const NumVec* pVals = snapshotValuesForColumn(snapshot, predictors[di]);
+                    const MissingMask* pMissing = snapshotMissingForColumn(snapshot, predictors[di]);
+                    if (pVals == nullptr || pMissing == nullptr || row >= pVals->size() || row >= pMissing->size() ||
+                        (*pMissing)[row] || !std::isfinite((*pVals)[row])) {
+                        query[di] = means[di];
+                    } else {
+                        query[di] = (*pVals)[row];
+                    }
+                }
+
+                std::priority_queue<std::pair<double, size_t>> best;
+                const size_t keep = std::min(k, points.size());
+                queryKdKnn(points, nodes, root, query, keep, best);
+                if (best.empty()) continue;
+
+                double wsum = 0.0;
+                double ysum = 0.0;
+                while (!best.empty()) {
+                    const auto [dist2, pointIdx] = best.top();
+                    best.pop();
+                    const double dist = std::sqrt(std::max(0.0, dist2));
+                    const double w = 1.0 / std::max(kNeighborDistanceFloor, dist);
+                    wsum += w;
+                    ysum += w * points[pointIdx].target;
+                }
+                if (wsum > 0.0) {
+                    targetVals[row] = ysum / wsum;
+                    targetMissing[row] = static_cast<uint8_t>(0);
+                }
+            }
+
+            imputeNumeric(targetVals, targetMissing, "mean");
+            return;
+        }
     }
 
     for (size_t row = 0; row < targetVals.size() && row < targetMissing.size(); ++row) {

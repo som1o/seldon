@@ -370,24 +370,36 @@ MathUtils::Matrix MathUtils::Matrix::transpose() const {
 MathUtils::Matrix MathUtils::Matrix::multiply(const Matrix& other) const {
     if (cols != other.rows) throw std::invalid_argument("Matrix dimensions mismatch for multiplication.");
     Matrix result(rows, other.cols);
-    Matrix otherT = other.transpose();
+
+    constexpr size_t kBlockRows = 32;
+    constexpr size_t kBlockCols = 32;
+    constexpr size_t kBlockK = 32;
 
     #ifdef USE_OPENMP
     #pragma omp parallel for schedule(static)
     #endif
-    for (size_t r = 0; r < rows; ++r) {
-        const auto& leftRow = data.at(r);
-        auto& outRow = result.data[r];
-        for (size_t c = 0; c < other.cols; ++c) {
-            const auto& rightRow = otherT.data.at(c);
-            double sum = 0.0;
-            #ifdef USE_OPENMP
-            #pragma omp simd reduction(+:sum)
-            #endif
-            for (size_t k = 0; k < cols; ++k) {
-                sum += leftRow[k] * rightRow[k];
+    for (size_t i0 = 0; i0 < rows; i0 += kBlockRows) {
+        const size_t iMax = std::min(rows, i0 + kBlockRows);
+        for (size_t k0 = 0; k0 < cols; k0 += kBlockK) {
+            const size_t kMax = std::min(cols, k0 + kBlockK);
+            for (size_t j0 = 0; j0 < other.cols; j0 += kBlockCols) {
+                const size_t jMax = std::min(other.cols, j0 + kBlockCols);
+
+                for (size_t i = i0; i < iMax; ++i) {
+                    const auto& leftRow = data[i];
+                    auto& outRow = result.data[i];
+                    for (size_t k = k0; k < kMax; ++k) {
+                        const double a = leftRow[k];
+                        const auto& otherRow = other.data[k];
+                        #ifdef USE_OPENMP
+                        #pragma omp simd
+                        #endif
+                        for (size_t j = j0; j < jMax; ++j) {
+                            outRow[j] += a * otherRow[j];
+                        }
+                    }
+                }
             }
-            outRow[c] = sum;
         }
     }
     return result;

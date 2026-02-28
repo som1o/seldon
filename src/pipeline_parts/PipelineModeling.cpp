@@ -1503,9 +1503,26 @@ std::vector<StructuralRelation> detectStructuralRelations(const TypedDataset& da
     std::vector<size_t> cols = numericIdx;
     if (cols.size() > capColumns) cols.resize(capColumns);
 
+    std::unordered_set<uint64_t> correlatedPairs;
+    correlatedPairs.reserve(cols.size() * cols.size());
+    for (size_t ia = 0; ia < cols.size(); ++ia) {
+        const auto& av = std::get<std::vector<double>>(data.columns()[cols[ia]].values);
+        const ColumnStats sa = Statistics::calculateStats(av);
+        for (size_t ib = ia + 1; ib < cols.size(); ++ib) {
+            const auto& bv = std::get<std::vector<double>>(data.columns()[cols[ib]].values);
+            const ColumnStats sb = Statistics::calculateStats(bv);
+            const double ar = std::abs(MathUtils::calculatePearson(av, bv, sa, sb).value_or(0.0));
+            if (ar < 0.20) continue;
+            const uint64_t key = (static_cast<uint64_t>(std::min(ia, ib)) << 32) | static_cast<uint64_t>(std::max(ia, ib));
+            correlatedPairs.insert(key);
+        }
+    }
+
     for (size_t ia = 0; ia < cols.size(); ++ia) {
         const auto& av = std::get<std::vector<double>>(data.columns()[cols[ia]].values);
         for (size_t ib = ia + 1; ib < cols.size(); ++ib) {
+            const uint64_t pairKey = (static_cast<uint64_t>(ia) << 32) | static_cast<uint64_t>(ib);
+            if (correlatedPairs.find(pairKey) == correlatedPairs.end()) continue;
             const auto& bv = std::get<std::vector<double>>(data.columns()[cols[ib]].values);
             for (size_t ic = 0; ic < cols.size(); ++ic) {
                 if (ic == ia || ic == ib) continue;
@@ -1582,11 +1599,22 @@ std::unordered_map<size_t, size_t> buildInformationClusters(const TypedDataset& 
             const auto& vb = std::get<std::vector<double>>(data.columns()[ib].values);
             auto aIt = statsCache.find(ia);
             auto bIt = statsCache.find(ib);
-            ColumnStats aFallback = Statistics::calculateStats(va);
-            ColumnStats bFallback = Statistics::calculateStats(vb);
-            const ColumnStats& sa = (aIt != statsCache.end()) ? aIt->second : aFallback;
-            const ColumnStats& sb = (bIt != statsCache.end()) ? bIt->second : bFallback;
-            const double r = std::abs(MathUtils::calculatePearson(va, vb, sa, sb).value_or(0.0));
+            std::optional<ColumnStats> aFallback;
+            std::optional<ColumnStats> bFallback;
+            const ColumnStats* sa = nullptr;
+            const ColumnStats* sb = nullptr;
+            if (aIt != statsCache.end()) sa = &aIt->second;
+            else {
+                aFallback = Statistics::calculateStats(va);
+                sa = &(*aFallback);
+            }
+            if (bIt != statsCache.end()) sb = &bIt->second;
+            else {
+                bFallback = Statistics::calculateStats(vb);
+                sb = &(*bFallback);
+            }
+            if (sa == nullptr || sb == nullptr) continue;
+            const double r = std::abs(MathUtils::calculatePearson(va, vb, *sa, *sb).value_or(0.0));
             if (r >= absCorrThreshold) unite(ia, ib);
         }
     }
@@ -1666,9 +1694,23 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     std::vector<PairInsight> pairs;
     const auto numericIdx = data.numericColumnIndices();
     const size_t n = data.rowCount();
-    std::vector<size_t> evalNumericIdx = numericIdx;
+    std::vector<size_t> evalNumericIdx;
+    evalNumericIdx.reserve(numericIdx.size());
+    for (size_t idx : numericIdx) {
+        const auto it = statsCache.find(idx);
+        if (it != statsCache.end()) {
+            const double var = std::isfinite(it->second.variance) ? it->second.variance : 0.0;
+            if (var <= numericEpsilon) continue;
+        }
+        const auto& col = data.columns()[idx];
+        const size_t miss = std::count(col.missing.begin(), col.missing.end(), static_cast<uint8_t>(1));
+        const double missRatio = col.missing.empty() ? 0.0 : static_cast<double>(miss) / static_cast<double>(col.missing.size());
+        if (missRatio > 0.95) continue;
+        evalNumericIdx.push_back(idx);
+    }
+    if (evalNumericIdx.size() < 2) return pairs;
 
-    const auto representativeByFeature = buildInformationClusters(data, numericIdx, statsCache, importanceByIndex);
+    const auto representativeByFeature = buildInformationClusters(data, evalNumericIdx, statsCache, importanceByIndex);
     const auto structuralRelations = detectStructuralRelations(data, evalNumericIdx);
     std::unordered_map<std::string, std::string> structuralPairLabel;
     for (const auto& sr : structuralRelations) {
@@ -1681,11 +1723,11 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         structuralPairLabel[key] = label;
     }
 
-    const size_t totalPairs = numericIdx.size() < 2 ? 0 : (numericIdx.size() * (numericIdx.size() - 1)) / 2;
+    const size_t totalPairs = evalNumericIdx.size() < 2 ? 0 : (evalNumericIdx.size() * (evalNumericIdx.size() - 1)) / 2;
     if (maxPairs > 0 && totalPairs > maxPairs) {
         std::vector<std::pair<size_t, double>> ranked;
-        ranked.reserve(numericIdx.size());
-        for (size_t idx : numericIdx) {
+        ranked.reserve(evalNumericIdx.size());
+        for (size_t idx : evalNumericIdx) {
             double imp = 0.0;
             auto it = importanceByIndex.find(idx);
             if (it != importanceByIndex.end()) imp = it->second;
@@ -1717,6 +1759,90 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         std::cout << "...\n";
     }
 
+    const size_t evalCount = evalNumericIdx.size();
+    auto pairSlot = [evalCount](size_t i, size_t j) {
+        return i * evalCount + j;
+    };
+
+    std::vector<ColumnStats> evalStats(evalCount);
+    std::vector<std::vector<double>> evalRanks(evalCount);
+    std::vector<ColumnStats> evalRankStats(evalCount);
+
+    auto computeAverageRanks = [](const std::vector<double>& values) {
+        std::vector<double> ranks(values.size(), 0.0);
+        if (values.empty()) return ranks;
+
+        std::vector<size_t> order(values.size(), 0);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            if (values[a] == values[b]) return a < b;
+            return values[a] < values[b];
+        });
+
+        size_t i = 0;
+        while (i < order.size()) {
+            size_t j = i + 1;
+            while (j < order.size() && values[order[j]] == values[order[i]]) ++j;
+            const double rank = (static_cast<double>(i) + static_cast<double>(j - 1)) * 0.5 + 1.0;
+            for (size_t k = i; k < j; ++k) ranks[order[k]] = rank;
+            i = j;
+        }
+        return ranks;
+    };
+
+    for (size_t pos = 0; pos < evalCount; ++pos) {
+        const size_t colIdx = evalNumericIdx[pos];
+        const auto cacheIt = statsCache.find(colIdx);
+        if (cacheIt != statsCache.end()) {
+            evalStats[pos] = cacheIt->second;
+        } else {
+            const auto& colVals = std::get<std::vector<double>>(data.columns()[colIdx].values);
+            evalStats[pos] = Statistics::calculateStats(colVals);
+        }
+
+        const auto& colVals = std::get<std::vector<double>>(data.columns()[colIdx].values);
+        evalRanks[pos] = computeAverageRanks(colVals);
+        evalRankStats[pos] = Statistics::calculateStats(evalRanks[pos]);
+    }
+
+    std::vector<double> pearsonMatrix(evalCount * evalCount, 0.0);
+    std::vector<double> spearmanMatrix(evalCount * evalCount, 0.0);
+    if (n > 1 && evalCount > 0) {
+        MathUtils::Matrix standardized(n, evalCount);
+        MathUtils::Matrix rankStandardized(n, evalCount);
+
+        for (size_t c = 0; c < evalCount; ++c) {
+            const auto& values = std::get<std::vector<double>>(data.columns()[evalNumericIdx[c]].values);
+            const double mean = evalStats[c].mean;
+            const double sd = std::abs(evalStats[c].stddev) > numericEpsilon ? evalStats[c].stddev : 1.0;
+
+            const double rankMean = evalRankStats[c].mean;
+            const double rankSd = std::abs(evalRankStats[c].stddev) > numericEpsilon ? evalRankStats[c].stddev : 1.0;
+
+            for (size_t r = 0; r < n; ++r) {
+                const double v = (r < values.size() && std::isfinite(values[r])) ? values[r] : mean;
+                const double rv = (r < evalRanks[c].size() && std::isfinite(evalRanks[c][r])) ? evalRanks[c][r] : rankMean;
+                standardized.at(r, c) = (v - mean) / sd;
+                rankStandardized.at(r, c) = (rv - rankMean) / rankSd;
+            }
+        }
+
+        const MathUtils::Matrix pearsonCov = standardized.transpose().multiply(standardized);
+        const MathUtils::Matrix spearmanCov = rankStandardized.transpose().multiply(rankStandardized);
+        const double denom = static_cast<double>(n - 1);
+        for (size_t i = 0; i < evalCount; ++i) {
+            for (size_t j = 0; j < evalCount; ++j) {
+                pearsonMatrix[pairSlot(i, j)] = pearsonCov.at(i, j) / denom;
+                spearmanMatrix[pairSlot(i, j)] = spearmanCov.at(i, j) / denom;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < evalCount; ++i) {
+            pearsonMatrix[pairSlot(i, i)] = 1.0;
+            spearmanMatrix[pairSlot(i, i)] = 1.0;
+        }
+    }
+
     auto buildPair = [&](size_t aPos, size_t bPos) {
             size_t ia = evalNumericIdx[aPos];
             size_t ib = evalNumericIdx[bPos];
@@ -1728,18 +1854,12 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             p.idxB = ib;
             p.featureA = data.columns()[ia].name;
             p.featureB = data.columns()[ib].name;
-            auto aIt = statsCache.find(ia);
-            auto bIt = statsCache.find(ib);
-            ColumnStats statsAFallback = Statistics::calculateStats(va);
-            ColumnStats statsBFallback = Statistics::calculateStats(vb);
-            const ColumnStats& statsA = (aIt != statsCache.end()) ? aIt->second : statsAFallback;
-            const ColumnStats& statsB = (bIt != statsCache.end()) ? bIt->second : statsBFallback;
-            p.r = MathUtils::calculatePearson(va, vb, statsA, statsB).value_or(0.0);
+            p.r = pearsonMatrix[pairSlot(aPos, bPos)];
             p.spearman = 0.0;
             p.kendallTau = 0.0;
             p.r2 = p.r * p.r;
             // Keep regression parameter derivation centralized in MathUtils.
-            auto fit = MathUtils::simpleLinearRegression(va, vb, statsA, statsB, p.r);
+            auto fit = MathUtils::simpleLinearRegression(va, vb, evalStats[aPos], evalStats[bPos], p.r);
             p.slope = fit.first;
             p.intercept = fit.second;
 
@@ -1748,9 +1868,15 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             p.tStat = sig.t_stat;
             p.statSignificant = sig.is_significant;
 
-            if (p.statSignificant || std::abs(p.r) >= 0.20) {
-                p.spearman = MathUtils::calculateSpearman(va, vb).value_or(0.0);
-                p.kendallTau = MathUtils::calculateKendallTau(va, vb).value_or(0.0);
+            const double absR = std::abs(p.r);
+            if (p.statSignificant || absR >= 0.20) {
+                p.spearman = spearmanMatrix[pairSlot(aPos, bPos)];
+                if (va.size() <= 1200) {
+                    p.kendallTau = MathUtils::calculateKendallTau(va, vb).value_or(0.0);
+                } else {
+                    const double rho = std::clamp(p.spearman, -1.0, 1.0);
+                    p.kendallTau = (2.0 / 3.14159265358979323846) * std::asin(rho);
+                }
             }
 
             const bool monotonicIdentity = (std::abs(p.spearman) >= 0.999 && std::abs(p.r) < 0.9985);
@@ -1791,7 +1917,9 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             if (itb != importanceByIndex.end()) impB = itb->second;
             double impScore = std::clamp((impA + impB) / 2.0, 0.0, 1.0);
             p.effectSize = std::clamp(p.r2, 0.0, 1.0);
-            p.foldStability = computeFoldStabilityFromCorrelation(va, vb, 5);
+            p.foldStability = (p.statSignificant || absR >= 0.25)
+                ? computeFoldStabilityFromCorrelation(va, vb, 5)
+                : 0.0;
             bool aModeled = modeledIndices.find(ia) != modeledIndices.end();
             bool bModeled = modeledIndices.find(ib) != modeledIndices.end();
             double coverageFactor = (aModeled && bModeled) ? policy.coverageBoth : ((aModeled || bModeled) ? policy.coverageOne : policy.coverageNone);
