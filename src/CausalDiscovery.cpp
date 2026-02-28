@@ -17,6 +17,9 @@
 #include <unordered_set>
 
 namespace {
+constexpr double kBicSigma2Floor = 1e-12;
+constexpr double kBicTieThreshold = 1e-6;
+
 
 struct CausalDataView {
     std::vector<size_t> nodeColumnIdx;
@@ -47,6 +50,67 @@ bool hasToken(const std::string& text, const std::vector<std::string>& tokens) {
     const std::string lower = CommonUtils::toLower(text);
     for (const auto& token : tokens) {
         if (lower.find(token) != std::string::npos) return true;
+    }
+    return false;
+}
+
+std::vector<std::string> engineeredRoots(const std::string& name) {
+    std::vector<std::string> roots;
+    const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
+    if (lower.empty()) return roots;
+
+    auto pushUnique = [&](const std::string& token) {
+        const std::string t = CommonUtils::trim(token);
+        if (t.empty()) return;
+        if (std::find(roots.begin(), roots.end(), t) == roots.end()) {
+            roots.push_back(t);
+        }
+    };
+
+    const size_t mulPos = lower.find("_x_");
+    if (mulPos != std::string::npos) {
+        pushUnique(lower.substr(0, mulPos));
+        pushUnique(lower.substr(mulPos + 3));
+        return roots;
+    }
+    const size_t divPos = lower.find("_div_");
+    if (divPos != std::string::npos) {
+        pushUnique(lower.substr(0, divPos));
+        pushUnique(lower.substr(divPos + 5));
+        return roots;
+    }
+    const size_t powPos = lower.find("_pow");
+    if (powPos != std::string::npos && powPos > 0) {
+        pushUnique(lower.substr(0, powPos));
+        return roots;
+    }
+    const size_t logPos = lower.find("_log1p_abs");
+    if (logPos != std::string::npos && logPos > 0) {
+        pushUnique(lower.substr(0, logPos));
+        return roots;
+    }
+
+    pushUnique(lower);
+    return roots;
+}
+
+bool sharesEngineeredFamilyRoot(const std::string& a, const std::string& b) {
+    const std::string la = CommonUtils::toLower(CommonUtils::trim(a));
+    const std::string lb = CommonUtils::toLower(CommonUtils::trim(b));
+    if (la.empty() || lb.empty()) return false;
+
+    const bool engineeredA = la.find("_pow") != std::string::npos || la.find("_log1p_abs") != std::string::npos ||
+                             la.find("_x_") != std::string::npos || la.find("_div_") != std::string::npos;
+    const bool engineeredB = lb.find("_pow") != std::string::npos || lb.find("_log1p_abs") != std::string::npos ||
+                             lb.find("_x_") != std::string::npos || lb.find("_div_") != std::string::npos;
+    if (!engineeredA && !engineeredB) return false;
+
+    const std::vector<std::string> rootsA = engineeredRoots(la);
+    const std::vector<std::string> rootsB = engineeredRoots(lb);
+    for (const auto& ra : rootsA) {
+        if (std::find(rootsB.begin(), rootsB.end(), ra) != rootsB.end()) {
+            return true;
+        }
     }
     return false;
 }
@@ -173,11 +237,13 @@ CiTestResult conditionalIndependenceTest(const std::vector<std::vector<double>>&
         for (size_t ci = 0; ci < condSet.size(); ++ci) controls[ci][r] = rows[r][condSet[ci]];
     }
 
+    // Step 1: regress out conditioning variables and test residual association.
     const std::vector<double> rx = regressResidual(x, controls);
     const std::vector<double> ry = regressResidual(y, controls);
     const double r = std::clamp(pearsonAligned(rx, ry).value_or(0.0), -0.999999, 0.999999);
     out.effect = std::abs(r);
 
+    // Step 2: Fisher z-transform approximates p-value for partial correlation.
     if (n > condSet.size() + 3) {
         const double fisher = 0.5 * std::log((1.0 + r) / (1.0 - r));
         const double z = std::abs(fisher) * std::sqrt(static_cast<double>(n) - static_cast<double>(condSet.size()) - 3.0);
@@ -185,6 +251,7 @@ CiTestResult conditionalIndependenceTest(const std::vector<std::vector<double>>&
         out.independent = out.pValue > alpha;
     }
 
+    // Step 3: if close to decision boundary, use lightweight kernel fallback.
     if (!enableKernelFallback) return out;
     if (out.pValue < alpha * 0.5 || out.pValue > alpha * 2.0) return out;
 
@@ -592,6 +659,177 @@ DiscoveryCoreResult discoverCore(const std::vector<std::vector<double>>& rows,
     return out;
 }
 
+std::vector<size_t> parentSetOf(const std::vector<std::vector<bool>>& directed, size_t node) {
+    std::vector<size_t> parents;
+    parents.reserve(directed.size());
+    for (size_t p = 0; p < directed.size(); ++p) {
+        if (directed[p][node]) parents.push_back(p);
+    }
+    return parents;
+}
+
+double bicForNodeGivenParents(const std::vector<std::vector<double>>& rows,
+                              size_t nodeIdx,
+                              const std::vector<size_t>& parentIdx) {
+    if (rows.size() < 8) return std::numeric_limits<double>::infinity();
+
+    MathUtils::Matrix X(rows.size(), parentIdx.size() + 1);
+    MathUtils::Matrix Y(rows.size(), 1);
+    for (size_t r = 0; r < rows.size(); ++r) {
+        X.at(r, 0) = 1.0;
+        for (size_t c = 0; c < parentIdx.size(); ++c) {
+            X.at(r, c + 1) = rows[r][parentIdx[c]];
+        }
+        Y.at(r, 0) = rows[r][nodeIdx];
+    }
+
+    const auto beta = MathUtils::multipleLinearRegression(X, Y);
+    if (beta.size() != parentIdx.size() + 1) return std::numeric_limits<double>::infinity();
+
+    double rss = 0.0;
+    for (size_t r = 0; r < rows.size(); ++r) {
+        double pred = beta[0];
+        for (size_t c = 0; c < parentIdx.size(); ++c) {
+            pred += beta[c + 1] * rows[r][parentIdx[c]];
+        }
+        const double e = rows[r][nodeIdx] - pred;
+        rss += e * e;
+    }
+
+    const double n = static_cast<double>(rows.size());
+    const double k = static_cast<double>(parentIdx.size() + 1);
+    const double sigma2 = std::max(kBicSigma2Floor, rss / n);
+    return n * std::log(sigma2) + k * std::log(n);
+}
+
+double totalDagBic(const std::vector<std::vector<double>>& rows,
+                   const std::vector<std::vector<bool>>& directed) {
+    const size_t p = directed.size();
+    double total = 0.0;
+    for (size_t node = 0; node < p; ++node) {
+        const std::vector<size_t> parents = parentSetOf(directed, node);
+        const double bic = bicForNodeGivenParents(rows, node, parents);
+        if (!std::isfinite(bic)) return std::numeric_limits<double>::infinity();
+        total += bic;
+    }
+    return total;
+}
+
+void applyGesOrientation(DiscoveryCoreResult& core,
+                         const std::vector<std::vector<double>>& rows,
+                         const std::vector<std::vector<bool>>& forbidden) {
+    const size_t p = core.undirected.size();
+    if (p < 2 || rows.size() < 16) return;
+
+    auto currentScore = totalDagBic(rows, core.directed);
+    if (!std::isfinite(currentScore)) {
+        currentScore = 0.0;
+    }
+
+    // Forward phase: greedily orient undirected edges by best BIC improvement.
+    bool improved = true;
+    while (improved) {
+        improved = false;
+        double bestDelta = 0.0;
+        std::vector<std::vector<bool>> bestDirected = core.directed;
+        std::vector<std::vector<bool>> bestUndirected = core.undirected;
+
+        for (size_t i = 0; i < p; ++i) {
+            for (size_t j = i + 1; j < p; ++j) {
+                if (!core.undirected[i][j]) continue;
+                if (forbidden[i][j] && forbidden[j][i]) continue;
+
+                for (int dir = 0; dir < 2; ++dir) {
+                    const size_t from = (dir == 0) ? i : j;
+                    const size_t to = (dir == 0) ? j : i;
+
+                    auto directedCand = core.directed;
+                    auto undirectedCand = core.undirected;
+                    if (!orientEdge(directedCand, undirectedCand, forbidden, from, to)) continue;
+
+                    const double candScore = totalDagBic(rows, directedCand);
+                    if (!std::isfinite(candScore)) continue;
+                    const double delta = currentScore - candScore;
+                    if (delta > bestDelta + kBicTieThreshold) {
+                        bestDelta = delta;
+                        bestDirected = std::move(directedCand);
+                        bestUndirected = std::move(undirectedCand);
+                    }
+                }
+            }
+        }
+
+        if (bestDelta > kBicTieThreshold) {
+            core.directed = std::move(bestDirected);
+            core.undirected = std::move(bestUndirected);
+            currentScore -= bestDelta;
+            improved = true;
+        }
+    }
+
+    // Backward phase: attempt beneficial edge reversals on already-directed edges.
+    improved = true;
+    while (improved) {
+        improved = false;
+        double bestDelta = 0.0;
+        std::vector<std::vector<bool>> bestDirected = core.directed;
+
+        for (size_t from = 0; from < p; ++from) {
+            for (size_t to = 0; to < p; ++to) {
+                if (from == to || !core.directed[from][to]) continue;
+                if (forbidden[to][from]) continue;
+
+                auto directedCand = core.directed;
+                auto undirectedCand = core.undirected;
+                directedCand[from][to] = false;
+                directedCand[to][from] = false;
+                if (!orientEdge(directedCand, undirectedCand, forbidden, to, from)) continue;
+
+                const double candScore = totalDagBic(rows, directedCand);
+                if (!std::isfinite(candScore)) continue;
+                const double delta = currentScore - candScore;
+                if (delta > bestDelta + kBicTieThreshold) {
+                    bestDelta = delta;
+                    bestDirected = std::move(directedCand);
+                }
+            }
+        }
+
+        if (bestDelta > kBicTieThreshold) {
+            core.directed = std::move(bestDirected);
+            currentScore -= bestDelta;
+            improved = true;
+        }
+    }
+}
+
+bool hasLikelyLatentConfounding(const std::vector<std::vector<double>>& rows,
+                                size_t fromIdx,
+                                size_t toIdx) {
+    if (rows.size() < 20) return false;
+    std::vector<double> x(rows.size(), 0.0);
+    std::vector<double> y(rows.size(), 0.0);
+    for (size_t r = 0; r < rows.size(); ++r) {
+        x[r] = rows[r][fromIdx];
+        y[r] = rows[r][toIdx];
+    }
+
+    const auto beta = MathUtils::simpleLinearRegression(x,
+                                                         y,
+                                                         Statistics::calculateStats(x),
+                                                         Statistics::calculateStats(y),
+                                                         pearsonAligned(x, y).value_or(0.0));
+    std::vector<double> resid(y.size(), 0.0);
+    for (size_t i = 0; i < y.size(); ++i) {
+        resid[i] = y[i] - (beta.first * x[i] + beta.second);
+    }
+    const double confoundSignal = std::abs(MathUtils::calculatePearson(x,
+                                                                       resid,
+                                                                       Statistics::calculateStats(x),
+                                                                       Statistics::calculateStats(resid)).value_or(0.0));
+    return confoundSignal >= 0.22;
+}
+
 std::optional<double> grangerPValue(const TypedDataset& data,
                                     size_t fromCol,
                                     size_t toCol,
@@ -743,6 +981,9 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
     const auto forbidden = inferForbiddenMatrix(data, view.nodeColumnIdx);
 
     DiscoveryCoreResult core = discoverCore(view.rows, forbidden, options, rng);
+    if (options.enableGES) {
+        applyGesOrientation(core, view.rows, forbidden);
+    }
     result.usedLiNGAM = core.usedLiNGAM;
 
     std::map<std::pair<size_t, size_t>, size_t> bootstrapCounts;
@@ -765,10 +1006,18 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
     }
 
     const TemporalSeries temporal = detectTemporalSeries(data);
+    size_t suppressedByEngineeredFamilyGuard = 0;
 
     for (size_t i = 0; i < core.directed.size(); ++i) {
         for (size_t j = 0; j < core.directed.size(); ++j) {
             if (i == j || !core.directed[i][j]) continue;
+
+            const std::string& fromName = data.columns()[view.nodeColumnIdx[i]].name;
+            const std::string& toName = data.columns()[view.nodeColumnIdx[j]].name;
+            if (sharesEngineeredFamilyRoot(fromName, toName)) {
+                ++suppressedByEngineeredFamilyGuard;
+                continue;
+            }
 
             std::vector<double> xi(view.rows.size(), 0.0);
             std::vector<double> yj(view.rows.size(), 0.0);
@@ -807,13 +1056,21 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
             }
 
             const double confidence = std::clamp(0.20 + 0.35 * absR + 0.45 * support, 0.0, 0.99);
+            const bool latentHint = options.enableFCI && hasLikelyLatentConfounding(view.rows, i, j);
             result.edges.push_back({
                 view.nodeColumnIdx[i],
                 view.nodeColumnIdx[j],
                 confidence,
                 support,
-                "|r|=" + std::to_string(absR).substr(0, 5) + ", support=" + std::to_string(100.0 * support).substr(0, 5) + "%",
-                "PC/Meek orientation" + std::string(core.usedLiNGAM ? " + LiNGAM order" : "") + "; " + validation
+                "|r|=" + std::to_string(absR).substr(0, 5) + ", support=" + std::to_string(100.0 * support).substr(0, 5) + "%" +
+                    std::string(latentHint ? ", latent_hint=possible" : ""),
+                "PC/Meek" + std::string(options.enableGES ? " + GES" : "") +
+                    std::string(core.usedLiNGAM ? " + LiNGAM" : "") +
+                    std::string(options.enableFCI ? " + FCI checks" : "") +
+                    std::string((options.markExperimentalHeuristics && (options.enableGES || options.enableFCI))
+                                    ? " [experimental-lite]"
+                                    : "") +
+                    "; " + validation
             });
         }
     }
@@ -827,8 +1084,21 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
         result.notes.push_back("Temporal axis detected for proxy intervention checks: " + temporal.axisName + ".");
     }
     result.notes.push_back("Constraint-based PC discovery executed with max conditioning set " + std::to_string(options.maxConditionSet) + ".");
+    if (options.enableGES) {
+        result.notes.push_back("Score-based GES orientation pass applied on unresolved undirected edges (experimental-lite heuristic).");
+    }
+    if (options.enableFCI) {
+        result.notes.push_back("FCI-style latent-confounding hints computed from residual dependence checks (experimental-lite heuristic).");
+    }
+    if (options.markExperimentalHeuristics && (options.enableGES || options.enableFCI)) {
+        result.notes.push_back("Experimental notice: current GES/FCI steps are lightweight approximations and require external validation for high-stakes causal decisions.");
+    }
     if (core.usedLiNGAM) {
         result.notes.push_back("Non-Gaussian signal detected; applied DirectLiNGAM-style orientation for unresolved edges.");
+    }
+    if (suppressedByEngineeredFamilyGuard > 0) {
+        result.notes.push_back("Causal semantic guard suppressed " + std::to_string(suppressedByEngineeredFamilyGuard) +
+                               " base/engineered-family edge(s) to avoid identity-lineage causality artifacts.");
     }
 
     return result;

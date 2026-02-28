@@ -2,7 +2,7 @@
 
 #include "AutoConfig.h"
 
-class AutomationPipeline {
+class AutomationPipeline final {
 public:
     int run(const AutoConfig& config);
 };

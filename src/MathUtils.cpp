@@ -13,6 +13,9 @@
 #endif
 
 namespace {
+constexpr double kNearOneCorrelationThreshold = 0.9999999;
+constexpr double kVeryLargeTStatisticCutoff = 1e10;
+
 struct RuntimeConfig {
     double significanceAlpha = 0.05;
     double numericEpsilon = 1e-12;
@@ -199,7 +202,7 @@ static double pvalue_from_t(double t, size_t df) {
     double t_abs = std::abs(t);
     
     // Handle very large t (numerically safe fallback)
-    if (t_abs > 1e10) return 0.0;
+    if (!std::isfinite(t_abs) || t_abs > kVeryLargeTStatisticCutoff) return 0.0;
     
     double x = nu / (nu + t_abs * t_abs);
     return betainc(nu / 2.0, 0.5, x); // two-tailed
@@ -256,10 +259,10 @@ Significance MathUtils::calculateSignificance(double r, size_t n) {
     Significance sig{0.0, 0.0, false};
     if (n <= 2) return sig;
     
-    // Avoid division by zero if r is perfectly 1 or -1
-    if (std::abs(r) >= 0.9999999) {
-        sig.p_value = runtimeConfig().numericEpsilon;
-        sig.t_stat = (r > 0 ? 1e6 : -1e6);
+    // Avoid division by zero if correlation is effectively perfect.
+    if (std::abs(r) >= kNearOneCorrelationThreshold) {
+        sig.p_value = 0.0;
+        sig.t_stat = (r > 0 ? std::numeric_limits<double>::infinity() : -std::numeric_limits<double>::infinity());
         sig.is_significant = true;
         return sig;
     }

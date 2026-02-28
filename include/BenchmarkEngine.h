@@ -15,7 +15,19 @@ struct BenchmarkResult {
     std::vector<double> featureImportance;
 };
 
+struct MultiTargetBenchmarkSummary {
+    std::vector<int> targetIndices;
+    std::vector<std::string> targetNames;
+    std::vector<std::vector<BenchmarkResult>> perTargetResults;
+    std::vector<BenchmarkResult> aggregateByModel;
+};
+
 class BenchmarkEngine {
 public:
     static std::vector<BenchmarkResult> run(const TypedDataset& data, int targetIndex, const std::vector<int>& featureIndices, int kfold, uint32_t seed = 1337);
+    static MultiTargetBenchmarkSummary runMultiTarget(const TypedDataset& data,
+                                                      const std::vector<int>& targetIndices,
+                                                      const std::vector<int>& featureIndices,
+                                                      int kfold,
+                                                      uint32_t seed = 1337);
 };

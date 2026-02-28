@@ -9,7 +9,9 @@
 #include <cmath>
 #include <functional>
 #include <iterator>
+#include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -26,6 +28,369 @@ using NumVec = std::vector<double>;
 using StrVec = std::vector<std::string>;
 using TimeVec = std::vector<int64_t>;
 using MissingMask = ::MissingMask;
+
+constexpr double kNumericEpsilon = 1e-12;
+constexpr double kNeighborDistanceFloor = 1e-9;
+constexpr double kModifiedZScaleFactor = 0.6745;
+constexpr double kMatrixCompletionBlend = 0.5;
+std::recursive_mutex gImputationCrossColumnMutex;
+
+enum class UnitSemanticKind {
+    UNKNOWN,
+    CURRENCY,
+    PERCENT,
+    RATIO,
+    RATE,
+    COUNT,
+    DURATION,
+    DISTANCE,
+    MASS,
+    VOLUME,
+    TEMPERATURE,
+    SCORE
+};
+
+UnitSemanticKind inferUnitSemanticKind(const std::string& name) {
+    const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
+    if (lower.empty()) return UnitSemanticKind::UNKNOWN;
+
+    auto hasAny = [&](std::initializer_list<const char*> tokens) {
+        for (const char* token : tokens) {
+            if (lower.find(token) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    if (hasAny({"price", "cost", "revenue", "salary", "income", "expense", "budget", "usd", "eur", "gbp", "jpy", "amount", "payment"})) {
+        return UnitSemanticKind::CURRENCY;
+    }
+    if (hasAny({"percent", "percentage", "pct", "%"})) {
+        return UnitSemanticKind::PERCENT;
+    }
+    if (hasAny({"ratio"})) {
+        return UnitSemanticKind::RATIO;
+    }
+    if (hasAny({"rate", "per_", "per ", "/"})) {
+        return UnitSemanticKind::RATE;
+    }
+    if (hasAny({"count", "qty", "quantity", "num", "number", "users", "cases", "population", "clicks", "visits"})) {
+        return UnitSemanticKind::COUNT;
+    }
+    if (hasAny({"duration", "latency", "time", "seconds", "second", "minutes", "minute", "hours", "hour", "days", "day", "ms"})) {
+        return UnitSemanticKind::DURATION;
+    }
+    if (hasAny({"distance", "km", "kilometer", "mile", "meter", "meters", "miles"})) {
+        return UnitSemanticKind::DISTANCE;
+    }
+    if (hasAny({"weight", "mass", "kg", "kilogram", "lb", "pound", "grams", "gram"})) {
+        return UnitSemanticKind::MASS;
+    }
+    if (hasAny({"volume", "litre", "liter", "ml", "gallon"})) {
+        return UnitSemanticKind::VOLUME;
+    }
+    if (hasAny({"temp", "temperature", "celsius", "fahrenheit", "kelvin"})) {
+        return UnitSemanticKind::TEMPERATURE;
+    }
+    if (hasAny({"score", "index", "rating"})) {
+        return UnitSemanticKind::SCORE;
+    }
+    return UnitSemanticKind::UNKNOWN;
+}
+
+bool isDimensionlessUnit(UnitSemanticKind kind) {
+    return kind == UnitSemanticKind::PERCENT ||
+           kind == UnitSemanticKind::RATIO ||
+           kind == UnitSemanticKind::SCORE;
+}
+
+bool areUnitsRatioCompatible(UnitSemanticKind a, UnitSemanticKind b) {
+    if (a == UnitSemanticKind::UNKNOWN || b == UnitSemanticKind::UNKNOWN) return true;
+    if (a == b) return true;
+    if (isDimensionlessUnit(a) || isDimensionlessUnit(b)) return true;
+
+    const bool currencyPerCount =
+        (a == UnitSemanticKind::CURRENCY && b == UnitSemanticKind::COUNT) ||
+        (b == UnitSemanticKind::CURRENCY && a == UnitSemanticKind::COUNT);
+    if (currencyPerCount) return true;
+
+    const bool distancePerDuration =
+        (a == UnitSemanticKind::DISTANCE && b == UnitSemanticKind::DURATION) ||
+        (b == UnitSemanticKind::DISTANCE && a == UnitSemanticKind::DURATION);
+    if (distancePerDuration) return true;
+
+    const bool countPerDuration =
+        (a == UnitSemanticKind::COUNT && b == UnitSemanticKind::DURATION) ||
+        (b == UnitSemanticKind::COUNT && a == UnitSemanticKind::DURATION);
+    if (countPerDuration) return true;
+
+    return false;
+}
+
+void imputeNumeric(NumVec& values, MissingMask& missing, const std::string& method);
+
+struct NumericSnapshotStore {
+    std::vector<size_t> numericIndices;
+    std::unordered_map<size_t, size_t> posByColumn;
+    std::vector<NumVec> values;
+    std::vector<MissingMask> missing;
+};
+
+NumericSnapshotStore buildNumericSnapshotStore(const TypedDataset& data) {
+    NumericSnapshotStore snapshot;
+    snapshot.numericIndices = data.numericColumnIndices();
+    snapshot.posByColumn.reserve(snapshot.numericIndices.size());
+    snapshot.values.reserve(snapshot.numericIndices.size());
+    snapshot.missing.reserve(snapshot.numericIndices.size());
+
+    for (size_t pos = 0; pos < snapshot.numericIndices.size(); ++pos) {
+        const size_t colIdx = snapshot.numericIndices[pos];
+        snapshot.posByColumn[colIdx] = pos;
+        const auto& col = data.columns()[colIdx];
+        snapshot.values.push_back(std::get<NumVec>(col.values));
+        snapshot.missing.push_back(col.missing);
+    }
+    return snapshot;
+}
+
+const NumVec* snapshotValuesForColumn(const NumericSnapshotStore& snapshot, size_t colIdx) {
+    const auto it = snapshot.posByColumn.find(colIdx);
+    if (it == snapshot.posByColumn.end()) return nullptr;
+    return &snapshot.values[it->second];
+}
+
+const MissingMask* snapshotMissingForColumn(const NumericSnapshotStore& snapshot, size_t colIdx) {
+    const auto it = snapshot.posByColumn.find(colIdx);
+    if (it == snapshot.posByColumn.end()) return nullptr;
+    return &snapshot.missing[it->second];
+}
+
+void imputeNumericKnnWithSnapshot(NumVec& targetVals,
+                                  MissingMask& targetMissing,
+                                  const NumericSnapshotStore& snapshot,
+                                  size_t targetCol,
+                                  size_t k = 5) {
+    std::vector<size_t> predictors;
+    predictors.reserve(snapshot.numericIndices.size());
+    for (size_t idx : snapshot.numericIndices) {
+        if (idx == targetCol) continue;
+        predictors.push_back(idx);
+    }
+    if (predictors.empty()) {
+        imputeNumeric(targetVals, targetMissing, "mean");
+        return;
+    }
+
+    for (size_t row = 0; row < targetVals.size() && row < targetMissing.size(); ++row) {
+        if (!targetMissing[row] && std::isfinite(targetVals[row])) continue;
+
+        std::vector<std::pair<double, double>> neighbors;
+        neighbors.reserve(128);
+        for (size_t cand = 0; cand < targetVals.size() && cand < targetMissing.size(); ++cand) {
+            if (targetMissing[cand] || !std::isfinite(targetVals[cand])) continue;
+
+            double dist = 0.0;
+            size_t overlap = 0;
+            for (size_t pIdx : predictors) {
+                const NumVec* pVals = snapshotValuesForColumn(snapshot, pIdx);
+                const MissingMask* pMissing = snapshotMissingForColumn(snapshot, pIdx);
+                if (pVals == nullptr || pMissing == nullptr) continue;
+                if (row >= pVals->size() || cand >= pVals->size()) continue;
+                if (row < pMissing->size() && (*pMissing)[row]) continue;
+                if (cand < pMissing->size() && (*pMissing)[cand]) continue;
+                if (!std::isfinite((*pVals)[row]) || !std::isfinite((*pVals)[cand])) continue;
+                const double d = (*pVals)[row] - (*pVals)[cand];
+                dist += d * d;
+                ++overlap;
+            }
+            if (overlap == 0) continue;
+            neighbors.push_back({std::sqrt(dist / static_cast<double>(overlap)), targetVals[cand]});
+        }
+
+        if (neighbors.empty()) continue;
+        const size_t keep = std::min(k, neighbors.size());
+        std::nth_element(neighbors.begin(), neighbors.begin() + static_cast<std::ptrdiff_t>(keep - 1), neighbors.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        double wsum = 0.0;
+        double ysum = 0.0;
+        for (size_t i = 0; i < keep; ++i) {
+            const double w = 1.0 / std::max(kNeighborDistanceFloor, neighbors[i].first);
+            wsum += w;
+            ysum += w * neighbors[i].second;
+        }
+        if (wsum > 0.0) {
+            targetVals[row] = ysum / wsum;
+            targetMissing[row] = static_cast<uint8_t>(0);
+        }
+    }
+
+    imputeNumeric(targetVals, targetMissing, "mean");
+}
+
+void imputeNumericMiceWithSnapshot(NumVec& targetVals,
+                                   MissingMask& targetMissing,
+                                   const NumericSnapshotStore& snapshot,
+                                   size_t targetCol) {
+    std::vector<size_t> predictors;
+    predictors.reserve(snapshot.numericIndices.size());
+    for (size_t idx : snapshot.numericIndices) {
+        if (idx == targetCol) continue;
+        predictors.push_back(idx);
+    }
+    if (predictors.empty()) {
+        imputeNumeric(targetVals, targetMissing, "mean");
+        return;
+    }
+
+    std::vector<std::pair<size_t, double>> ranked;
+    ranked.reserve(predictors.size());
+    for (size_t pIdx : predictors) {
+        const NumVec* pVals = snapshotValuesForColumn(snapshot, pIdx);
+        const MissingMask* pMissing = snapshotMissingForColumn(snapshot, pIdx);
+        if (pVals == nullptr || pMissing == nullptr) continue;
+
+        std::vector<double> x;
+        std::vector<double> y;
+        const size_t n = std::min(targetVals.size(), pVals->size());
+        x.reserve(n);
+        y.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            if (i < targetMissing.size() && targetMissing[i]) continue;
+            if (i < pMissing->size() && (*pMissing)[i]) continue;
+            if (!std::isfinite(targetVals[i]) || !std::isfinite((*pVals)[i])) continue;
+            x.push_back((*pVals)[i]);
+            y.push_back(targetVals[i]);
+        }
+        if (x.size() < 12) continue;
+        const double r = std::abs(MathUtils::calculatePearson(x, y, Statistics::calculateStats(x), Statistics::calculateStats(y)).value_or(0.0));
+        if (std::isfinite(r)) ranked.push_back({pIdx, r});
+    }
+    if (ranked.empty()) {
+        imputeNumericKnnWithSnapshot(targetVals, targetMissing, snapshot, targetCol, 5);
+        return;
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    predictors.clear();
+    for (size_t i = 0; i < std::min<size_t>(4, ranked.size()); ++i) predictors.push_back(ranked[i].first);
+
+    std::vector<std::vector<double>> rows;
+    std::vector<double> ytrain;
+    for (size_t i = 0; i < targetVals.size(); ++i) {
+        if (i < targetMissing.size() && targetMissing[i]) continue;
+        if (!std::isfinite(targetVals[i])) continue;
+
+        std::vector<double> row;
+        row.reserve(predictors.size() + 1);
+        row.push_back(1.0);
+        bool ok = true;
+        for (size_t pIdx : predictors) {
+            const NumVec* pVals = snapshotValuesForColumn(snapshot, pIdx);
+            const MissingMask* pMissing = snapshotMissingForColumn(snapshot, pIdx);
+            if (pVals == nullptr || pMissing == nullptr) { ok = false; break; }
+            if (i >= pVals->size()) { ok = false; break; }
+            if (i < pMissing->size() && (*pMissing)[i]) { ok = false; break; }
+            if (!std::isfinite((*pVals)[i])) { ok = false; break; }
+            row.push_back((*pVals)[i]);
+        }
+        if (!ok) continue;
+        rows.push_back(std::move(row));
+        ytrain.push_back(targetVals[i]);
+    }
+
+    if (rows.size() < predictors.size() + 8) {
+        imputeNumericKnnWithSnapshot(targetVals, targetMissing, snapshot, targetCol, 5);
+        return;
+    }
+
+    MathUtils::Matrix X(rows.size(), predictors.size() + 1);
+    MathUtils::Matrix Y(rows.size(), 1);
+    for (size_t r = 0; r < rows.size(); ++r) {
+        for (size_t c = 0; c < rows[r].size(); ++c) X.at(r, c) = rows[r][c];
+        Y.at(r, 0) = ytrain[r];
+    }
+    const auto beta = MathUtils::multipleLinearRegression(X, Y);
+    if (beta.size() != predictors.size() + 1) {
+        imputeNumericKnnWithSnapshot(targetVals, targetMissing, snapshot, targetCol, 5);
+        return;
+    }
+
+    for (size_t i = 0; i < targetVals.size(); ++i) {
+        if (i >= targetMissing.size() || !targetMissing[i]) continue;
+        double pred = beta[0];
+        bool ok = true;
+        for (size_t p = 0; p < predictors.size(); ++p) {
+            const size_t pIdx = predictors[p];
+            const NumVec* pVals = snapshotValuesForColumn(snapshot, pIdx);
+            const MissingMask* pMissing = snapshotMissingForColumn(snapshot, pIdx);
+            if (pVals == nullptr || pMissing == nullptr) { ok = false; break; }
+            if (i >= pVals->size()) { ok = false; break; }
+            if (i < pMissing->size() && (*pMissing)[i]) { ok = false; break; }
+            if (!std::isfinite((*pVals)[i])) { ok = false; break; }
+            pred += beta[p + 1] * (*pVals)[i];
+        }
+        if (!ok || !std::isfinite(pred)) continue;
+        targetVals[i] = pred;
+        targetMissing[i] = static_cast<uint8_t>(0);
+    }
+
+    imputeNumeric(targetVals, targetMissing, "mean");
+}
+
+void imputeNumericMatrixCompletionWithSnapshot(NumVec& targetVals,
+                                               MissingMask& targetMissing,
+                                               const NumericSnapshotStore& snapshot,
+                                               size_t targetCol,
+                                               size_t iterations = 3) {
+    if (snapshot.numericIndices.size() < 2) {
+        imputeNumeric(targetVals, targetMissing, "mean");
+        return;
+    }
+
+    for (size_t it = 0; it < iterations; ++it) {
+        double colMean = 0.0;
+        size_t colCount = 0;
+        for (size_t r = 0; r < targetVals.size(); ++r) {
+            if (r < targetMissing.size() && targetMissing[r]) continue;
+            if (!std::isfinite(targetVals[r])) continue;
+            colMean += targetVals[r];
+            ++colCount;
+        }
+        colMean = (colCount > 0) ? (colMean / static_cast<double>(colCount)) : 0.0;
+
+        for (size_t r = 0; r < targetVals.size(); ++r) {
+            if (r >= targetMissing.size() || !targetMissing[r]) continue;
+
+            double rowMean = 0.0;
+            size_t rowCount = 0;
+            for (size_t cIdx : snapshot.numericIndices) {
+                if (cIdx == targetCol) {
+                    if (r < targetMissing.size() && targetMissing[r]) continue;
+                    if (!std::isfinite(targetVals[r])) continue;
+                    rowMean += targetVals[r];
+                    ++rowCount;
+                    continue;
+                }
+
+                const NumVec* vals = snapshotValuesForColumn(snapshot, cIdx);
+                const MissingMask* missing = snapshotMissingForColumn(snapshot, cIdx);
+                if (vals == nullptr || missing == nullptr) continue;
+                if (r >= vals->size()) continue;
+                if (r < missing->size() && (*missing)[r]) continue;
+                if (!std::isfinite((*vals)[r])) continue;
+                rowMean += (*vals)[r];
+                ++rowCount;
+            }
+
+            const double blend = (rowCount > 0)
+                ? (kMatrixCompletionBlend * colMean + (1.0 - kMatrixCompletionBlend) * (rowMean / static_cast<double>(rowCount)))
+                : colMean;
+            targetVals[r] = std::isfinite(blend) ? blend : colMean;
+            targetMissing[r] = static_cast<uint8_t>(0);
+        }
+    }
+
+    imputeNumeric(targetVals, targetMissing, "mean");
+}
 
 int64_t floorDiv(int64_t value, int64_t divisor) {
     int64_t q = value / divisor;
@@ -71,7 +436,8 @@ void validateImputationStrategy(const std::string& strategy, ColumnType type, co
     const std::string m = CommonUtils::toLower(strategy);
     bool valid = false;
     if (type == ColumnType::NUMERIC) {
-        valid = (m == "auto" || m == "mean" || m == "median" || m == "zero" || m == "interpolate");
+        valid = (m == "auto" || m == "mean" || m == "median" || m == "zero" || m == "interpolate" ||
+                 m == "knn" || m == "mice" || m == "matrix_completion");
     } else if (type == ColumnType::CATEGORICAL) {
         valid = (m == "auto" || m == "mode");
     } else {
@@ -80,18 +446,6 @@ void validateImputationStrategy(const std::string& strategy, ColumnType type, co
     if (!valid) {
         throw Seldon::ConfigurationException("Invalid imputation strategy for column '" + columnName + "': " + strategy);
     }
-}
-
-std::optional<double> parseBooleanLikeToken(const std::string& value) {
-    const std::string token = CommonUtils::toLower(CommonUtils::trim(value));
-    if (token.empty()) return std::nullopt;
-    if (token == "1" || token == "true" || token == "yes" || token == "y" || token == "t" || token == "on") {
-        return 1.0;
-    }
-    if (token == "0" || token == "false" || token == "no" || token == "n" || token == "f" || token == "off") {
-        return 0.0;
-    }
-    return std::nullopt;
 }
 
 std::string sanitizeTokenForColumn(std::string_view token) {
@@ -183,7 +537,7 @@ void addCategoricalSemanticIndicators(TypedDataset& data, const AutoConfig& conf
         bool seenZero = false;
         bool seenOne = false;
         for (size_t r : observedRows) {
-            const auto parsed = parseBooleanLikeToken(values[r]);
+            const auto parsed = CommonUtils::parseBooleanLikeToken(values[r]);
             if (!parsed.has_value()) {
                 allBooleanLike = false;
                 break;
@@ -204,7 +558,7 @@ void addCategoricalSemanticIndicators(TypedDataset& data, const AutoConfig& conf
                     out[r] = 0.0;
                     continue;
                 }
-                const auto parsed = parseBooleanLikeToken(values[r]);
+                const auto parsed = CommonUtils::parseBooleanLikeToken(values[r]);
                 out[r] = parsed.has_value() ? *parsed : 0.0;
             }
             engineered.push_back(std::move(boolCol));
@@ -359,6 +713,230 @@ void imputeNumeric(NumVec& values, MissingMask& missing, const std::string& meth
             missing[i] = static_cast<uint8_t>(0);
         }
     }
+}
+
+std::vector<size_t> numericPredictorColumns(const TypedDataset& data, size_t targetCol) {
+    std::vector<size_t> predictors;
+    for (size_t idx : data.numericColumnIndices()) {
+        if (idx == targetCol) continue;
+        predictors.push_back(idx);
+    }
+    return predictors;
+}
+
+void imputeNumericKnnColumn(TypedDataset& data, size_t targetCol, size_t k = 5) {
+    std::lock_guard<std::recursive_mutex> lock(gImputationCrossColumnMutex);
+    if (targetCol >= data.columns().size()) return;
+    auto& targetTyped = data.columns()[targetCol];
+    if (targetTyped.type != ColumnType::NUMERIC) return;
+
+    auto& targetVals = std::get<NumVec>(targetTyped.values);
+    auto& targetMissing = targetTyped.missing;
+    const std::vector<size_t> predictors = numericPredictorColumns(data, targetCol);
+    if (predictors.empty()) {
+        imputeNumeric(targetVals, targetMissing, "mean");
+        return;
+    }
+
+    for (size_t row = 0; row < targetVals.size() && row < targetMissing.size(); ++row) {
+        if (!targetMissing[row] && std::isfinite(targetVals[row])) continue;
+
+        std::vector<std::pair<double, double>> neighbors;
+        neighbors.reserve(128);
+        for (size_t cand = 0; cand < targetVals.size() && cand < targetMissing.size(); ++cand) {
+            if (targetMissing[cand] || !std::isfinite(targetVals[cand])) continue;
+
+            double dist = 0.0;
+            size_t overlap = 0;
+            for (size_t pIdx : predictors) {
+                const auto& pCol = data.columns()[pIdx];
+                const auto& pVals = std::get<NumVec>(pCol.values);
+                if (row >= pVals.size() || cand >= pVals.size()) continue;
+                if (row < pCol.missing.size() && pCol.missing[row]) continue;
+                if (cand < pCol.missing.size() && pCol.missing[cand]) continue;
+                if (!std::isfinite(pVals[row]) || !std::isfinite(pVals[cand])) continue;
+                const double d = pVals[row] - pVals[cand];
+                dist += d * d;
+                ++overlap;
+            }
+            if (overlap == 0) continue;
+            neighbors.push_back({std::sqrt(dist / static_cast<double>(overlap)), targetVals[cand]});
+        }
+
+        if (neighbors.empty()) continue;
+        const size_t keep = std::min(k, neighbors.size());
+        std::nth_element(neighbors.begin(), neighbors.begin() + static_cast<std::ptrdiff_t>(keep - 1), neighbors.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        double wsum = 0.0;
+        double ysum = 0.0;
+        for (size_t i = 0; i < keep; ++i) {
+            const double w = 1.0 / std::max(kNeighborDistanceFloor, neighbors[i].first);
+            wsum += w;
+            ysum += w * neighbors[i].second;
+        }
+        if (wsum > 0.0) {
+            targetVals[row] = ysum / wsum;
+            targetMissing[row] = static_cast<uint8_t>(0);
+        }
+    }
+
+    imputeNumeric(targetVals, targetMissing, "mean");
+}
+
+void imputeNumericMiceColumn(TypedDataset& data, size_t targetCol) {
+    std::lock_guard<std::recursive_mutex> lock(gImputationCrossColumnMutex);
+    if (targetCol >= data.columns().size()) return;
+    auto& targetTyped = data.columns()[targetCol];
+    if (targetTyped.type != ColumnType::NUMERIC) return;
+
+    auto& targetVals = std::get<NumVec>(targetTyped.values);
+    auto& targetMissing = targetTyped.missing;
+    std::vector<size_t> predictors = numericPredictorColumns(data, targetCol);
+    if (predictors.empty()) {
+        imputeNumeric(targetVals, targetMissing, "mean");
+        return;
+    }
+
+    std::vector<std::pair<size_t, double>> ranked;
+    ranked.reserve(predictors.size());
+    for (size_t pIdx : predictors) {
+        const auto& pCol = data.columns()[pIdx];
+        const auto& pVals = std::get<NumVec>(pCol.values);
+        std::vector<double> x;
+        std::vector<double> y;
+        const size_t n = std::min(targetVals.size(), pVals.size());
+        x.reserve(n);
+        y.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            if (i < targetMissing.size() && targetMissing[i]) continue;
+            if (i < pCol.missing.size() && pCol.missing[i]) continue;
+            if (!std::isfinite(targetVals[i]) || !std::isfinite(pVals[i])) continue;
+            x.push_back(pVals[i]);
+            y.push_back(targetVals[i]);
+        }
+        if (x.size() < 12) continue;
+        const double r = std::abs(MathUtils::calculatePearson(x, y, Statistics::calculateStats(x), Statistics::calculateStats(y)).value_or(0.0));
+        if (std::isfinite(r)) ranked.push_back({pIdx, r});
+    }
+    if (ranked.empty()) {
+        imputeNumericKnnColumn(data, targetCol, 5);
+        return;
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    predictors.clear();
+    for (size_t i = 0; i < std::min<size_t>(4, ranked.size()); ++i) predictors.push_back(ranked[i].first);
+
+    std::vector<std::vector<double>> rows;
+    std::vector<double> ytrain;
+    for (size_t i = 0; i < targetVals.size(); ++i) {
+        if (i < targetMissing.size() && targetMissing[i]) continue;
+        if (!std::isfinite(targetVals[i])) continue;
+
+        std::vector<double> row;
+        row.reserve(predictors.size() + 1);
+        row.push_back(1.0);
+        bool ok = true;
+        for (size_t pIdx : predictors) {
+            const auto& pCol = data.columns()[pIdx];
+            const auto& pVals = std::get<NumVec>(pCol.values);
+            if (i >= pVals.size()) { ok = false; break; }
+            if (i < pCol.missing.size() && pCol.missing[i]) { ok = false; break; }
+            if (!std::isfinite(pVals[i])) { ok = false; break; }
+            row.push_back(pVals[i]);
+        }
+        if (!ok) continue;
+        rows.push_back(std::move(row));
+        ytrain.push_back(targetVals[i]);
+    }
+
+    if (rows.size() < predictors.size() + 8) {
+        imputeNumericKnnColumn(data, targetCol, 5);
+        return;
+    }
+
+    MathUtils::Matrix X(rows.size(), predictors.size() + 1);
+    MathUtils::Matrix Y(rows.size(), 1);
+    for (size_t r = 0; r < rows.size(); ++r) {
+        for (size_t c = 0; c < rows[r].size(); ++c) X.at(r, c) = rows[r][c];
+        Y.at(r, 0) = ytrain[r];
+    }
+    const auto beta = MathUtils::multipleLinearRegression(X, Y);
+    if (beta.size() != predictors.size() + 1) {
+        imputeNumericKnnColumn(data, targetCol, 5);
+        return;
+    }
+
+    for (size_t i = 0; i < targetVals.size(); ++i) {
+        if (i >= targetMissing.size() || !targetMissing[i]) continue;
+        double pred = beta[0];
+        bool ok = true;
+        for (size_t p = 0; p < predictors.size(); ++p) {
+            const auto pIdx = predictors[p];
+            const auto& pCol = data.columns()[pIdx];
+            const auto& pVals = std::get<NumVec>(pCol.values);
+            if (i >= pVals.size()) { ok = false; break; }
+            if (i < pCol.missing.size() && pCol.missing[i]) { ok = false; break; }
+            if (!std::isfinite(pVals[i])) { ok = false; break; }
+            pred += beta[p + 1] * pVals[i];
+        }
+        if (!ok || !std::isfinite(pred)) continue;
+        targetVals[i] = pred;
+        targetMissing[i] = static_cast<uint8_t>(0);
+    }
+
+    imputeNumeric(targetVals, targetMissing, "mean");
+}
+
+void imputeNumericMatrixCompletionColumn(TypedDataset& data, size_t targetCol, size_t iterations = 3) {
+    std::lock_guard<std::recursive_mutex> lock(gImputationCrossColumnMutex);
+    if (targetCol >= data.columns().size()) return;
+    auto& targetTyped = data.columns()[targetCol];
+    if (targetTyped.type != ColumnType::NUMERIC) return;
+
+    auto& targetVals = std::get<NumVec>(targetTyped.values);
+    auto& targetMissing = targetTyped.missing;
+    std::vector<size_t> numCols = data.numericColumnIndices();
+    if (numCols.size() < 2) {
+        imputeNumeric(targetVals, targetMissing, "mean");
+        return;
+    }
+
+    for (size_t it = 0; it < iterations; ++it) {
+        double colMean = 0.0;
+        size_t colCount = 0;
+        for (size_t r = 0; r < targetVals.size(); ++r) {
+            if (r < targetMissing.size() && targetMissing[r]) continue;
+            if (!std::isfinite(targetVals[r])) continue;
+            colMean += targetVals[r];
+            ++colCount;
+        }
+        colMean = (colCount > 0) ? (colMean / static_cast<double>(colCount)) : 0.0;
+
+        for (size_t r = 0; r < targetVals.size(); ++r) {
+            if (r >= targetMissing.size() || !targetMissing[r]) continue;
+
+            double rowMean = 0.0;
+            size_t rowCount = 0;
+            for (size_t cIdx : numCols) {
+                const auto& c = data.columns()[cIdx];
+                const auto& vals = std::get<NumVec>(c.values);
+                if (r >= vals.size()) continue;
+                if (r < c.missing.size() && c.missing[r]) continue;
+                if (!std::isfinite(vals[r])) continue;
+                rowMean += vals[r];
+                ++rowCount;
+            }
+
+            const double blend = (rowCount > 0)
+                ? (kMatrixCompletionBlend * colMean + (1.0 - kMatrixCompletionBlend) * (rowMean / static_cast<double>(rowCount)))
+                : colMean;
+            targetVals[r] = std::isfinite(blend) ? blend : colMean;
+            targetMissing[r] = static_cast<uint8_t>(0);
+        }
+    }
+
+    imputeNumeric(targetVals, targetMissing, "mean");
 }
 
 void interpolateSeries(NumVec& values, MissingMask& missing) {
@@ -615,6 +1193,36 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
                                  size_t parentB) {
         const double var = varianceObserved(x, xMissing);
         if (var <= config.tuning.featureMinVariance) return false;
+
+        auto absCorrObservedWithParent = [&](size_t parentIdx) {
+            if (parentIdx >= data.columns().size()) return 0.0;
+            if (data.columns()[parentIdx].type != ColumnType::NUMERIC) return 0.0;
+            const auto& parentCol = data.columns()[parentIdx];
+            const auto& pv = std::get<NumVec>(parentCol.values);
+            const size_t n = std::min({x.size(), xMissing.size(), pv.size(), parentCol.missing.size()});
+            std::vector<double> cleanX;
+            std::vector<double> cleanP;
+            cleanX.reserve(n);
+            cleanP.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+                if (xMissing[i] || parentCol.missing[i]) continue;
+                if (!std::isfinite(x[i]) || !std::isfinite(pv[i])) continue;
+                cleanX.push_back(x[i]);
+                cleanP.push_back(pv[i]);
+            }
+            if (cleanX.size() < 16) return 0.0;
+            const ColumnStats sx = Statistics::calculateStats(cleanX);
+            const ColumnStats sp = Statistics::calculateStats(cleanP);
+            return std::abs(MathUtils::calculatePearson(cleanX, cleanP, sx, sp).value_or(0.0));
+        };
+
+        constexpr double kStrictParentCollinearityThreshold = 0.985;
+        const double corrParentA = absCorrObservedWithParent(parentA);
+        const double corrParentB = (parentB == parentA) ? corrParentA : absCorrObservedWithParent(parentB);
+        if (std::max(corrParentA, corrParentB) >= kStrictParentCollinearityThreshold) {
+            return false;
+        }
+
         if (!hasNumericTarget) return true;
 
         const double derivedCorr = absCorrWithTarget(x, xMissing);
@@ -644,12 +1252,14 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
                 for (size_t i = 0; i < vals.size(); ++i) {
                     poly[i] = std::pow(vals[i], static_cast<double>(p));
                 }
-                TypedColumn c;
-                c.name = uniqueColumnName(data, col.name + "_pow" + std::to_string(p));
-                c.type = ColumnType::NUMERIC;
-                c.values = std::move(poly);
-                c.missing = col.missing;
-                engineered.push_back(std::move(c));
+                if (shouldKeepDerived(poly, col.missing, idx, idx)) {
+                    TypedColumn c;
+                    c.name = uniqueColumnName(data, col.name + "_pow" + std::to_string(p));
+                    c.type = ColumnType::NUMERIC;
+                    c.values = std::move(poly);
+                    c.missing = col.missing;
+                    engineered.push_back(std::move(c));
+                }
             }
         }
 
@@ -663,12 +1273,14 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
                 const double mag = std::log1p(std::abs(v));
                 logSigned[i] = (v < 0.0) ? -mag : mag;
             }
-            TypedColumn c;
-            c.name = uniqueColumnName(data, col.name + "_log1p_abs");
-            c.type = ColumnType::NUMERIC;
-            c.values = std::move(logSigned);
-            c.missing = col.missing;
-            engineered.push_back(std::move(c));
+            if (shouldKeepDerived(logSigned, col.missing, idx, idx)) {
+                TypedColumn c;
+                c.name = uniqueColumnName(data, col.name + "_log1p_abs");
+                c.type = ColumnType::NUMERIC;
+                c.values = std::move(logSigned);
+                c.missing = col.missing;
+                engineered.push_back(std::move(c));
+            }
         }
     }
 
@@ -688,6 +1300,20 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
                 const auto& av = std::get<NumVec>(a.values);
                 const auto& bv = std::get<NumVec>(b.values);
                 const size_t n = std::min(av.size(), bv.size());
+
+                if (hasNumericTarget) {
+                    const double corrA = baseCorr.count(idxA) ? baseCorr[idxA] : 0.0;
+                    const double corrB = baseCorr.count(idxB) ? baseCorr[idxB] : 0.0;
+                    constexpr double kModerateCorrThreshold = 0.20;
+                    constexpr double kNearPerfectCorrThreshold = 0.98;
+                    if (corrA < kModerateCorrThreshold || corrB < kModerateCorrThreshold) {
+                        continue;
+                    }
+                    if (std::max(corrA, corrB) >= kNearPerfectCorrThreshold) {
+                        continue;
+                    }
+                }
+
                 std::vector<double> inter(n, 0.0);
                 MissingMask miss(n, static_cast<uint8_t>(0));
                 for (size_t r = 0; r < n; ++r) {
@@ -709,6 +1335,13 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
 
                 if (!config.featureEngineeringEnableRatioProductDiscovery) continue;
                 if (!canAddMore()) break;
+
+                const UnitSemanticKind unitA = inferUnitSemanticKind(a.name);
+                const UnitSemanticKind unitB = inferUnitSemanticKind(b.name);
+                const bool ratioCompatible = areUnitsRatioCompatible(unitA, unitB);
+                if (!ratioCompatible) {
+                    continue;
+                }
 
                 const double denomEps = std::max(1e-9, config.tuning.numericEpsilon * 1000.0);
 
@@ -804,7 +1437,7 @@ std::vector<bool> detectOutliersZ(const NumVec& values, double zThreshold) {
     for (double v : values) { double d = v - mean; var += d * d; }
     var /= std::max<size_t>(1, values.size() - 1);
     double sd = std::sqrt(var);
-    if (sd <= 1e-12) return flags;
+    if (sd <= kNumericEpsilon) return flags;
 
     for (size_t i = 0; i < values.size(); ++i) {
         double z = std::abs((values[i] - mean) / sd);
@@ -849,10 +1482,10 @@ std::vector<bool> detectOutliersModifiedZObserved(const NumVec& values, const Mi
     NumVec absDev(observed.size(), 0.0);
     for (size_t i = 0; i < observed.size(); ++i) absDev[i] = std::abs(observed[i] - med);
     const double mad = CommonUtils::medianByNth(absDev);
-    if (mad <= 1e-12) return flags;
+    if (mad <= kNumericEpsilon) return flags;
 
     for (size_t i = 0; i < observed.size(); ++i) {
-        const double mz = 0.6745 * (observed[i] - med) / mad;
+        const double mz = kModifiedZScaleFactor * (observed[i] - med) / mad;
         if (std::abs(mz) > zThreshold) flags[obsIdx[i]] = true;
     }
     return flags;
@@ -873,7 +1506,7 @@ std::vector<bool> detectOutliersAdjustedBoxplotObserved(const NumVec& values, co
     const double med = CommonUtils::quantileByNth(observed, 0.50);
     const double q3 = CommonUtils::quantileByNth(observed, 0.75);
     const double iqr = q3 - q1;
-    if (iqr <= 1e-12) return flags;
+    if (iqr <= kNumericEpsilon) return flags;
 
     const double bowleySkew = (q3 + q1 - 2.0 * med) / iqr;
     const double loFactor = iqrMultiplier * std::exp(-4.0 * bowleySkew);
@@ -887,115 +1520,29 @@ std::vector<bool> detectOutliersAdjustedBoxplotObserved(const NumVec& values, co
     return flags;
 }
 
-std::vector<bool> detectOutliersLOFObserved(const NumVec& values,
-                                            const MissingMask& missing,
-                                            const HeuristicTuningConfig& tuning) {
-    std::vector<bool> flags(values.size(), false);
-    NumVec observed;
-    std::vector<size_t> obsIdx;
-    for (size_t i = 0; i < values.size() && i < missing.size(); ++i) {
-        if (missing[i] || !std::isfinite(values[i])) continue;
-        observed.push_back(values[i]);
-        obsIdx.push_back(i);
-    }
-    if (observed.size() < 12) return flags;
+std::vector<bool> detectOutliersLofHeuristicFallbackObserved(const NumVec& values,
+                                                             const MissingMask& missing,
+                                                             const HeuristicTuningConfig& tuning) {
+    const double mzThreshold = std::max(tuning.lofFallbackModifiedZThreshold, tuning.lofThresholdFloor);
+    const std::vector<bool> mzFlags = detectOutliersModifiedZObserved(values, missing, mzThreshold);
+    const std::vector<bool> zFlags = detectOutliersZObserved(values,
+                                                             missing,
+                                                             std::max(tuning.outlierZThreshold, tuning.lofThresholdFloor));
+    const std::vector<bool> adjFlags = detectOutliersAdjustedBoxplotObserved(values,
+                                                                              missing,
+                                                                              std::max(1.2, tuning.outlierIqrMultiplier));
 
-    const size_t n = observed.size();
-    if (n > tuning.lofMaxRows) {
-        return detectOutliersModifiedZObserved(values, missing, tuning.lofFallbackModifiedZThreshold);
-    }
-
-    const size_t k = std::min<size_t>(10, std::max<size_t>(3, n / 12));
-
-    std::vector<std::pair<double, size_t>> sorted;
-    sorted.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        sorted.push_back({observed[i], i});
-    }
-    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
-        if (a.first == b.first) return a.second < b.second;
-        return a.first < b.first;
-    });
-
-    std::vector<size_t> rankByIndex(n, 0);
-    for (size_t rank = 0; rank < n; ++rank) {
-        rankByIndex[sorted[rank].second] = rank;
+    std::vector<bool> combined(values.size(), false);
+    for (size_t i = 0; i < combined.size() && i < missing.size(); ++i) {
+        if (missing[i]) continue;
+        size_t votes = 0;
+        if (i < mzFlags.size() && mzFlags[i]) ++votes;
+        if (i < zFlags.size() && zFlags[i]) ++votes;
+        if (i < adjFlags.size() && adjFlags[i]) ++votes;
+        combined[i] = votes >= 2;
     }
 
-    std::vector<std::vector<size_t>> nbr(n);
-    std::vector<double> kdist(n, 0.0);
-    #ifdef USE_OPENMP
-    #pragma omp parallel for schedule(static)
-    #endif
-    for (size_t i = 0; i < n; ++i) {
-        const size_t rank = rankByIndex[i];
-        size_t left = rank;
-        size_t right = rank + 1;
-        nbr[i].reserve(k);
-
-        while (nbr[i].size() < k && (left > 0 || right < n)) {
-            const bool hasLeft = left > 0;
-            const bool hasRight = right < n;
-
-            if (hasLeft && hasRight) {
-                const double dl = std::abs(observed[i] - sorted[left - 1].first);
-                const double dr = std::abs(observed[i] - sorted[right].first);
-                if (dl <= dr) {
-                    --left;
-                    nbr[i].push_back(sorted[left].second);
-                } else {
-                    nbr[i].push_back(sorted[right].second);
-                    ++right;
-                }
-            } else if (hasLeft) {
-                --left;
-                nbr[i].push_back(sorted[left].second);
-            } else {
-                nbr[i].push_back(sorted[right].second);
-                ++right;
-            }
-        }
-
-        double kd = 0.0;
-        for (size_t nb : nbr[i]) {
-            kd = std::max(kd, std::abs(observed[i] - observed[nb]));
-        }
-        kdist[i] = kd;
-    }
-
-    std::vector<double> lrd(n, 0.0);
-    #ifdef USE_OPENMP
-    #pragma omp parallel for schedule(static)
-    #endif
-    for (size_t i = 0; i < n; ++i) {
-        double reach = 0.0;
-        for (size_t nb : nbr[i]) {
-            reach += std::max(kdist[nb], std::abs(observed[i] - observed[nb]));
-        }
-        lrd[i] = (reach <= 1e-12) ? 0.0 : (static_cast<double>(k) / reach);
-    }
-
-    std::vector<double> lof(n, 1.0);
-    #ifdef USE_OPENMP
-    #pragma omp parallel for schedule(static)
-    #endif
-    for (size_t i = 0; i < n; ++i) {
-        if (lrd[i] <= 1e-12) {
-            lof[i] = 1.0;
-            continue;
-        }
-        double ratioSum = 0.0;
-        for (size_t nb : nbr[i]) ratioSum += (lrd[nb] / lrd[i]);
-        lof[i] = ratioSum / static_cast<double>(k);
-    }
-
-    const double q3 = CommonUtils::quantileByNth(lof, 0.75);
-    const double q1 = CommonUtils::quantileByNth(lof, 0.25);
-    const double threshold = std::max(tuning.lofThresholdFloor, q3 + 1.5 * (q3 - q1));
-    for (size_t i = 0; i < n; ++i) {
-        if (lof[i] > threshold) flags[obsIdx[i]] = true;
-    }
-    return flags;
+    return combined;
 }
 
 void capOutliers(NumVec& values, const std::vector<bool>& flags) {
@@ -1021,17 +1568,23 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
 
     // Outlier flags are computed from observed raw numeric values before imputation.
     std::unordered_map<std::string, std::vector<bool>> detectedFlags;
+    const std::string selectedOutlierMethod = CommonUtils::toLower(config.outlierMethod);
+    if ((selectedOutlierMethod == "lof" || selectedOutlierMethod == "lof_fallback_modified_zscore") && config.verboseAnalysis) {
+        std::cout << "[Seldon][Preprocessor] outlier_method='" << selectedOutlierMethod
+                  << "' uses a modified Z-score fallback heuristic (not a strict Local Outlier Factor implementation).\n";
+    }
     for (const auto& col : data.columns()) {
         if (col.type != ColumnType::NUMERIC) continue;
         const auto& values = std::get<NumVec>(col.values);
 
-        const std::string method = CommonUtils::toLower(config.outlierMethod);
+        const std::string method = selectedOutlierMethod;
         const std::unordered_map<std::string, std::function<std::vector<bool>()>> outlierFactory = {
             {"iqr", [&]() { return detectOutliersIQRObserved(values, col.missing, config.tuning.outlierIqrMultiplier); }},
             {"zscore", [&]() { return detectOutliersZObserved(values, col.missing, config.tuning.outlierZThreshold); }},
             {"modified_zscore", [&]() { return detectOutliersModifiedZObserved(values, col.missing, config.tuning.outlierZThreshold); }},
             {"adjusted_boxplot", [&]() { return detectOutliersAdjustedBoxplotObserved(values, col.missing, config.tuning.outlierIqrMultiplier); }},
-            {"lof", [&]() { return detectOutliersLOFObserved(values, col.missing, config.tuning); }}
+            {"lof", [&]() { return detectOutliersLofHeuristicFallbackObserved(values, col.missing, config.tuning); }},
+            {"lof_fallback_modified_zscore", [&]() { return detectOutliersLofHeuristicFallbackObserved(values, col.missing, config.tuning); }}
         };
 
         const auto itFactory = outlierFactory.find(method);
@@ -1048,20 +1601,67 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
     addCategoricalSemanticIndicators(data, config);
 
     // missing counts + imputation
-    for (auto& col : data.columns()) {
+    std::vector<std::string> strategies(data.columns().size(), "auto");
+    std::vector<std::string> normalizedStrategies(data.columns().size(), "auto");
+    for (size_t colIdx = 0; colIdx < data.columns().size(); ++colIdx) {
+        const auto& col = data.columns()[colIdx];
         size_t missingCount = std::count(col.missing.begin(), col.missing.end(), static_cast<uint8_t>(1));
         report.missingCounts[col.name] = missingCount;
 
-        std::string strategy = "auto";
         auto it = config.columnImputation.find(col.name);
-        if (it != config.columnImputation.end()) strategy = it->second;
-        validateImputationStrategy(strategy, col.type, col.name);
+        if (it != config.columnImputation.end()) strategies[colIdx] = it->second;
+        validateImputationStrategy(strategies[colIdx], col.type, col.name);
+        normalizedStrategies[colIdx] = CommonUtils::toLower(strategies[colIdx]);
+    }
 
-        if (col.type == ColumnType::NUMERIC) {
-            auto& values = std::get<NumVec>(col.values);
-            if (CommonUtils::toLower(strategy) == "interpolate") interpolateSeries(values, col.missing);
-            else imputeNumeric(values, col.missing, strategy);
-        } else if (col.type == ColumnType::CATEGORICAL) {
+    const std::vector<size_t> numericCols = data.numericColumnIndices();
+    if (!numericCols.empty()) {
+        const NumericSnapshotStore numericSnapshot = buildNumericSnapshotStore(data);
+        std::vector<NumVec> numericValuesResult(numericCols.size());
+        std::vector<MissingMask> numericMissingResult(numericCols.size());
+
+        #ifdef USE_OPENMP
+        #pragma omp parallel for schedule(dynamic)
+        #endif
+        for (size_t pos = 0; pos < numericCols.size(); ++pos) {
+            const size_t colIdx = numericCols[pos];
+            const auto& col = data.columns()[colIdx];
+
+            NumVec values = std::get<NumVec>(col.values);
+            MissingMask missing = col.missing;
+            const std::string& strategy = strategies[colIdx];
+            const std::string& normalizedStrategy = normalizedStrategies[colIdx];
+
+            if (normalizedStrategy == "interpolate") {
+                interpolateSeries(values, missing);
+            } else if (normalizedStrategy == "knn") {
+                imputeNumericKnnWithSnapshot(values, missing, numericSnapshot, colIdx, 5);
+            } else if (normalizedStrategy == "mice") {
+                imputeNumericMiceWithSnapshot(values, missing, numericSnapshot, colIdx);
+            } else if (normalizedStrategy == "matrix_completion") {
+                imputeNumericMatrixCompletionWithSnapshot(values, missing, numericSnapshot, colIdx, 3);
+            } else {
+                imputeNumeric(values, missing, strategy);
+            }
+
+            numericValuesResult[pos] = std::move(values);
+            numericMissingResult[pos] = std::move(missing);
+        }
+
+        for (size_t pos = 0; pos < numericCols.size(); ++pos) {
+            const size_t colIdx = numericCols[pos];
+            auto& col = data.columns()[colIdx];
+            col.values = std::move(numericValuesResult[pos]);
+            col.missing = std::move(numericMissingResult[pos]);
+        }
+    }
+
+    for (size_t colIdx = 0; colIdx < data.columns().size(); ++colIdx) {
+        auto& col = data.columns()[colIdx];
+        if (col.type == ColumnType::NUMERIC) continue;
+
+        const std::string& strategy = strategies[colIdx];
+        if (col.type == ColumnType::CATEGORICAL) {
             auto& values = std::get<StrVec>(col.values);
             imputeCategorical(values, col.missing, strategy.empty() ? "mode" : strategy);
         } else {

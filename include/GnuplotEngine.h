@@ -78,6 +78,18 @@ public:
                         double confidenceZ = 1.96,
                         size_t downsampleThreshold = 10000);
 
+    std::string scatter3D(const std::string& id,
+                          const std::vector<double>& x,
+                          const std::vector<double>& y,
+                          const std::vector<double>& z,
+                          const std::string& title);
+
+    std::string surface(const std::string& id,
+                        const std::vector<double>& x,
+                        const std::vector<double>& y,
+                        const std::vector<std::vector<double>>& z,
+                        const std::string& title);
+
     /**
      * @brief Generates residual-vs-fitted plot image.
      */
@@ -109,6 +121,11 @@ public:
                                         const std::vector<std::string>& categories,
                                         const std::vector<double>& values,
                                         const std::string& title);
+
+    std::string violin(const std::string& id,
+                       const std::vector<std::string>& categories,
+                       const std::vector<double>& values,
+                       const std::string& title);
 
     /**
      * @brief Generates faceted scatter plot split by category.
@@ -177,6 +194,12 @@ public:
                         const std::vector<std::vector<double>>& matrix,
                         const std::string& title,
                         const std::vector<std::string>& labels = {});
+
+    std::string clusteredHeatmap(const std::string& id,
+                                 const std::vector<std::vector<double>>& matrix,
+                                 const std::string& title,
+                                 const std::vector<std::string>& labels = {},
+                                 bool withDendrogram = true);
 
 private:
     std::string assetsDir_;

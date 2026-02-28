@@ -23,4 +23,17 @@ std::vector<std::string> parseCSVLine(std::istream& is,
 									  bool* limitExceeded = nullptr,
 									  const ParseLimits& limits = ParseLimits{});
 std::vector<std::string> normalizeHeader(const std::vector<std::string>& header);
+
+class CSVChunkReader {
+public:
+	explicit CSVChunkReader(std::istream& is, char delimiter, ParseLimits limits = ParseLimits{});
+	std::vector<std::vector<std::string>> readChunk(size_t maxRows,
+											 bool* malformed = nullptr,
+											 bool* limitExceeded = nullptr);
+
+private:
+	std::istream& is_;
+	char delimiter_;
+	ParseLimits limits_;
+};
 }

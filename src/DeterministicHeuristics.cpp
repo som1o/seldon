@@ -92,6 +92,73 @@ bool isTargetCandidateName(const std::string& name) {
     return std::regex_search(name, re);
 }
 
+enum class UnitSemanticKind {
+    UNKNOWN,
+    CURRENCY,
+    PERCENT,
+    RATIO,
+    RATE,
+    COUNT,
+    DURATION,
+    DISTANCE,
+    TEMPERATURE,
+    SCORE
+};
+
+UnitSemanticKind inferUnitSemanticKind(const std::string& name) {
+    const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
+    if (lower.empty()) return UnitSemanticKind::UNKNOWN;
+
+    auto hasAny = [&](std::initializer_list<const char*> tokens) {
+        for (const char* token : tokens) {
+            if (lower.find(token) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    if (hasAny({"price", "cost", "revenue", "salary", "income", "expense", "budget", "usd", "eur", "gbp", "jpy", "amount", "payment"})) {
+        return UnitSemanticKind::CURRENCY;
+    }
+    if (hasAny({"percent", "percentage", "pct", "%", "ratio"})) {
+        if (hasAny({"rate"})) return UnitSemanticKind::RATE;
+        return (lower.find("ratio") != std::string::npos) ? UnitSemanticKind::RATIO : UnitSemanticKind::PERCENT;
+    }
+    if (hasAny({"rate", "per_", "per ", "/"})) {
+        return UnitSemanticKind::RATE;
+    }
+    if (hasAny({"count", "qty", "quantity", "num", "number", "visits", "clicks", "users", "cases", "population"})) {
+        return UnitSemanticKind::COUNT;
+    }
+    if (hasAny({"duration", "latency", "time", "seconds", "second", "minutes", "minute", "hours", "hour", "days", "day", "ms"})) {
+        return UnitSemanticKind::DURATION;
+    }
+    if (hasAny({"distance", "km", "kilometer", "mile", "meter", "miles", "meters"})) {
+        return UnitSemanticKind::DISTANCE;
+    }
+    if (hasAny({"temp", "temperature", "celsius", "fahrenheit", "kelvin"})) {
+        return UnitSemanticKind::TEMPERATURE;
+    }
+    if (hasAny({"score", "index", "rating"})) {
+        return UnitSemanticKind::SCORE;
+    }
+    return UnitSemanticKind::UNKNOWN;
+}
+
+std::string unitSemanticLabel(UnitSemanticKind kind) {
+    switch (kind) {
+        case UnitSemanticKind::CURRENCY: return "currency";
+        case UnitSemanticKind::PERCENT: return "percentage";
+        case UnitSemanticKind::RATIO: return "ratio";
+        case UnitSemanticKind::RATE: return "rate";
+        case UnitSemanticKind::COUNT: return "count";
+        case UnitSemanticKind::DURATION: return "duration";
+        case UnitSemanticKind::DISTANCE: return "distance";
+        case UnitSemanticKind::TEMPERATURE: return "temperature";
+        case UnitSemanticKind::SCORE: return "score/index";
+        default: return "unspecified";
+    }
+}
+
 double safeAbsCorr(const std::vector<double>& x, const std::vector<double>& y) {
     const ColumnStats sx = Statistics::calculateStats(x);
     const ColumnStats sy = Statistics::calculateStats(y);
@@ -261,6 +328,7 @@ Outcome runAllPhases(const TypedDataset& data,
         out.roleTagRows.push_back({
             col.name,
             role,
+            unitSemanticLabel(inferUnitSemanticKind(col.name)),
             std::to_string(uniq),
             std::to_string(missing),
             formatDouble(100.0 * nullRatio, 2) + "%"

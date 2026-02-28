@@ -2,6 +2,7 @@
 #include "MathUtils.h"
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 #include <numeric>
 #include <random>
 #ifdef USE_OPENMP
@@ -345,4 +346,89 @@ std::vector<BenchmarkResult> BenchmarkEngine::run(const TypedDataset& data, int 
     }
 
     return out;
+}
+
+MultiTargetBenchmarkSummary BenchmarkEngine::runMultiTarget(const TypedDataset& data,
+                                                            const std::vector<int>& targetIndices,
+                                                            const std::vector<int>& featureIndices,
+                                                            int kfold,
+                                                            uint32_t seed) {
+    MultiTargetBenchmarkSummary summary;
+    if (targetIndices.empty()) return summary;
+
+    std::vector<int> uniqueTargets;
+    uniqueTargets.reserve(targetIndices.size());
+    for (int idx : targetIndices) {
+        if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
+        if (data.columns()[idx].type != ColumnType::NUMERIC) continue;
+        if (std::find(uniqueTargets.begin(), uniqueTargets.end(), idx) != uniqueTargets.end()) continue;
+        uniqueTargets.push_back(idx);
+    }
+    if (uniqueTargets.empty()) return summary;
+
+    summary.targetIndices = uniqueTargets;
+    summary.targetNames.reserve(uniqueTargets.size());
+    summary.perTargetResults.reserve(uniqueTargets.size());
+
+    struct AggregateState {
+        std::string model;
+        double rmseSum = 0.0;
+        double r2Sum = 0.0;
+        size_t metricCount = 0;
+        double accuracySum = 0.0;
+        size_t accuracyCount = 0;
+    };
+    std::unordered_map<std::string, AggregateState> aggregate;
+
+    for (size_t i = 0; i < uniqueTargets.size(); ++i) {
+        const int targetIdx = uniqueTargets[i];
+        summary.targetNames.push_back(data.columns()[static_cast<size_t>(targetIdx)].name);
+        const uint32_t targetSeed = seed ^ static_cast<uint32_t>(0x9e3779b9U + static_cast<uint32_t>(targetIdx * 31) + static_cast<uint32_t>(i * 17));
+        std::vector<BenchmarkResult> perTarget = run(data, targetIdx, featureIndices, kfold, targetSeed);
+
+        for (const auto& result : perTarget) {
+            auto it = aggregate.find(result.model);
+            if (it == aggregate.end()) {
+                AggregateState init;
+                init.model = result.model;
+                it = aggregate.emplace(result.model, std::move(init)).first;
+            }
+
+            if (std::isfinite(result.rmse)) {
+                it->second.rmseSum += result.rmse;
+                it->second.metricCount += 1;
+            }
+            if (std::isfinite(result.r2)) {
+                it->second.r2Sum += result.r2;
+            }
+            if (result.hasAccuracy && std::isfinite(result.accuracy)) {
+                it->second.accuracySum += result.accuracy;
+                it->second.accuracyCount += 1;
+            }
+        }
+
+        summary.perTargetResults.push_back(std::move(perTarget));
+    }
+
+    summary.aggregateByModel.reserve(aggregate.size());
+    for (const auto& kv : aggregate) {
+        const auto& state = kv.second;
+        if (state.metricCount == 0) continue;
+        BenchmarkResult agg;
+        agg.model = state.model;
+        agg.rmse = state.rmseSum / static_cast<double>(state.metricCount);
+        agg.r2 = state.r2Sum / static_cast<double>(state.metricCount);
+        agg.hasAccuracy = state.accuracyCount > 0;
+        agg.accuracy = agg.hasAccuracy
+            ? (state.accuracySum / static_cast<double>(state.accuracyCount))
+            : 0.0;
+        summary.aggregateByModel.push_back(std::move(agg));
+    }
+
+    std::sort(summary.aggregateByModel.begin(), summary.aggregateByModel.end(), [](const BenchmarkResult& a, const BenchmarkResult& b) {
+        if (a.rmse == b.rmse) return a.r2 > b.r2;
+        return a.rmse < b.rmse;
+    });
+
+    return summary;
 }

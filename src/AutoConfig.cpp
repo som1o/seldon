@@ -10,6 +10,11 @@
 #include <limits>
 #include <unordered_set>
 
+#if __has_include(<nlohmann/json.hpp>)
+#include <nlohmann/json.hpp>
+#define SELDON_HAS_NLOHMANN_JSON 1
+#endif
+
 namespace {
 std::vector<std::string> splitCSV(const std::string& s) {
     std::vector<std::string> out;
@@ -182,7 +187,7 @@ bool parseBoolStrict(const std::string& value, const std::string& key) {
 
 bool isValidImputationStrategy(const std::string& value) {
     static const std::unordered_set<std::string> allowed = {
-        "auto", "mean", "median", "zero", "mode", "interpolate"
+        "auto", "mean", "median", "zero", "mode", "interpolate", "knn", "mice", "matrix_completion"
     };
     return allowed.find(CommonUtils::toLower(CommonUtils::trim(value))) != allowed.end();
 }
@@ -196,8 +201,8 @@ bool isValidColumnTypeOverride(const std::string& value) {
 
 void applyProfile(AutoConfig& config, const std::string& profileRaw) {
     const std::string p = CommonUtils::toLower(CommonUtils::trim(profileRaw));
-    if (p.empty() || p == "auto") {
-        config.profile = "auto";
+    if (p.empty() || p == StrategyKeys::kAuto) {
+        config.profile = std::string(StrategyKeys::kAuto);
         return;
     }
 
@@ -211,14 +216,14 @@ void applyProfile(AutoConfig& config, const std::string& profileRaw) {
         config.generateHtml = false;
         config.fastMaxBivariatePairs = std::min<size_t>(config.fastMaxBivariatePairs, 1200);
         config.fastNeuralSampleRows = std::min<size_t>(config.fastNeuralSampleRows, 12000);
-        config.neuralStrategy = "fast";
+        config.neuralStrategy = std::string(StrategyKeys::kFast);
     } else if (p == "thorough") {
         config.fastMode = false;
         config.plotUnivariate = true;
         config.plotOverall = true;
         config.plotBivariateSignificant = true;
         config.plotModesExplicit = true;
-        config.neuralStrategy = "expressive";
+        config.neuralStrategy = std::string(StrategyKeys::kExpressive);
         config.neuralImportanceMaxRows = std::max<size_t>(config.neuralImportanceMaxRows, 1000);
         config.neuralIntegratedGradSteps = std::max<size_t>(config.neuralIntegratedGradSteps, 8);
     } else if (p == "minimal") {
@@ -228,7 +233,7 @@ void applyProfile(AutoConfig& config, const std::string& profileRaw) {
         config.plotBivariateSignificant = false;
         config.plotModesExplicit = true;
         config.generateHtml = false;
-        config.neuralStrategy = "fast";
+        config.neuralStrategy = std::string(StrategyKeys::kFast);
         config.fastMaxBivariatePairs = std::min<size_t>(config.fastMaxBivariatePairs, 500);
     }
 }
@@ -236,11 +241,13 @@ void applyProfile(AutoConfig& config, const std::string& profileRaw) {
 void applyLowMemoryDefaults(AutoConfig& config) {
     config.lowMemoryMode = true;
     config.fastMode = true;
-    config.profile = (config.profile == "auto") ? "quick" : config.profile;
+    config.profile = (config.profile == StrategyKeys::kAuto) ? "quick" : config.profile;
 
     config.fastMaxBivariatePairs = std::min<size_t>(config.fastMaxBivariatePairs, 600);
     config.fastNeuralSampleRows = std::min<size_t>(config.fastNeuralSampleRows, 10000);
-    config.neuralStrategy = (config.neuralStrategy == "auto") ? "fast" : config.neuralStrategy;
+    config.neuralStrategy = (config.neuralStrategy == StrategyKeys::kAuto)
+        ? std::string(StrategyKeys::kFast)
+        : config.neuralStrategy;
     config.neuralStreamingMode = true;
     config.neuralStreamingChunkRows = std::min<size_t>(std::max<size_t>(128, config.neuralStreamingChunkRows), 512);
     config.neuralMaxOneHotPerColumn = std::min<size_t>(config.neuralMaxOneHotPerColumn, 8);
@@ -274,13 +281,13 @@ AutoConfig runInteractiveWizard() {
 
     cfg.datasetPath = ask("Dataset path (.csv/.csv.gz/.csv.zip/.xlsx/.xls): ");
     cfg.targetColumn = ask("Target column (optional): ");
-    applyProfile(cfg, ask("Profile [quick/thorough/minimal/auto] (auto): ", "auto"));
+    applyProfile(cfg, ask("Profile [quick/thorough/minimal/auto] (auto): ", std::string(StrategyKeys::kAuto)));
     cfg.plotUnivariate = parseBoolStrict(ask("Enable univariate plots? [true/false] (false): ", "false"), "interactive.plot_univariate");
     cfg.plotOverall = parseBoolStrict(ask("Enable overall plots? [true/false] (false): ", "false"), "interactive.plot_overall");
     cfg.plotBivariateSignificant = parseBoolStrict(ask("Enable significant bivariate plots? [true/false] (true): ", "true"), "interactive.plot_bivariate");
     cfg.plotModesExplicit = true;
-    cfg.neuralStrategy = CommonUtils::toLower(ask("Neural strategy [auto/fast/balanced/expressive] (auto): ", "auto"));
-    cfg.bivariateStrategy = CommonUtils::toLower(ask("Bivariate strategy [auto/balanced/corr_heavy/importance_heavy] (auto): ", "auto"));
+    cfg.neuralStrategy = CommonUtils::toLower(ask("Neural strategy [auto/fast/balanced/expressive] (auto): ", std::string(StrategyKeys::kAuto)));
+    cfg.bivariateStrategy = CommonUtils::toLower(ask("Bivariate strategy [auto/balanced/corr_heavy/importance_heavy] (auto): ", std::string(StrategyKeys::kAuto)));
     cfg.exportPreprocessed = CommonUtils::toLower(ask("Export preprocessed dataset [none/csv/parquet] (none): ", "none"));
 
     const std::string outputCfgPath = ask("Write config file path (seldon_interactive.yaml): ", "seldon_interactive.yaml");
@@ -614,6 +621,120 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         return;
     }
 }
+
+std::string normalizeStructuredPath(std::string path) {
+    if (path.rfind("tuning.", 0) == 0) {
+        path = path.substr(7);
+    } else if (path.rfind("plot.", 0) == 0) {
+        path = "plot_" + path.substr(5);
+    } else if (path.rfind("column_imputation.", 0) == 0) {
+        path = "impute." + path.substr(18);
+    } else if (path.rfind("column_type_overrides.", 0) == 0) {
+        path = "type." + path.substr(22);
+    }
+    std::replace(path.begin(), path.end(), '.', '_');
+    const size_t imputePos = path.find("impute_");
+    if (imputePos == 0) path = "impute." + path.substr(7);
+    const size_t typePos = path.find("type_");
+    if (typePos == 0) path = "type." + path.substr(5);
+    return path;
+}
+
+void assignConfigEntry(AutoConfig& config,
+                       const std::string& rawPath,
+                       const std::string& rawValue,
+                       const std::string& context) {
+    const std::string key = normalizeConfigKey(normalizeStructuredPath(rawPath));
+    const std::string value = CommonUtils::trim(rawValue);
+
+    try {
+        assignKeyValue(config, key, value);
+    } catch (const Seldon::SeldonException& ex) {
+        throw Seldon::ConfigurationException(context + " -> " + ex.what());
+    }
+
+    if (key.rfind("impute.", 0) == 0) {
+        const std::string normalized = CommonUtils::toLower(value);
+        if (!isValidImputationStrategy(normalized)) {
+            throw Seldon::ConfigurationException(context + " -> invalid imputation strategy '" + value +
+                                                 "' (allowed: auto, mean, median, zero, mode, interpolate)");
+        }
+        const std::string columnName = CommonUtils::trim(key.substr(7));
+        if (columnName.empty()) {
+            throw Seldon::ConfigurationException(context + " -> impute.<column> requires a non-empty column name");
+        }
+        config.columnImputation[columnName] = normalized;
+    }
+    if (key.rfind("type.", 0) == 0) {
+        const std::string normalized = CommonUtils::toLower(value);
+        if (!isValidColumnTypeOverride(normalized)) {
+            throw Seldon::ConfigurationException(context + " -> invalid column type override '" + value +
+                                                 "' (allowed: numeric, categorical, datetime)");
+        }
+        config.columnTypeOverrides[CommonUtils::toLower(key.substr(5))] = normalized;
+    }
+}
+
+#ifdef SELDON_HAS_NLOHMANN_JSON
+std::string jsonScalarToString(const nlohmann::json& value) {
+    if (value.is_string()) return value.get<std::string>();
+    if (value.is_boolean()) return value.get<bool>() ? "true" : "false";
+    if (value.is_number_float()) return std::to_string(value.get<double>());
+    if (value.is_number_integer()) return std::to_string(value.get<long long>());
+    if (value.is_number_unsigned()) return std::to_string(value.get<unsigned long long>());
+    if (value.is_null()) return "";
+    if (value.is_array()) {
+        std::string joined;
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (i > 0) joined += ",";
+            joined += jsonScalarToString(value[i]);
+        }
+        return joined;
+    }
+    return value.dump();
+}
+
+void flattenJsonObject(const nlohmann::json& node,
+                       const std::string& prefix,
+                       std::vector<std::pair<std::string, std::string>>& out) {
+    if (node.is_object()) {
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            const std::string childKey = prefix.empty() ? it.key() : (prefix + "." + it.key());
+            flattenJsonObject(it.value(), childKey, out);
+        }
+        return;
+    }
+    out.push_back({prefix, jsonScalarToString(node)});
+}
+
+bool parseStructuredJsonConfig(const std::string& configPath, AutoConfig& config) {
+    std::ifstream in(configPath);
+    if (!in) {
+        throw Seldon::ConfigurationException("Could not open config file: " + configPath);
+    }
+
+    nlohmann::json root;
+    try {
+        in >> root;
+    } catch (...) {
+        return false;
+    }
+    if (!root.is_object()) {
+        throw Seldon::ConfigurationException("Config JSON must be a top-level object: " + configPath);
+    }
+
+    std::vector<std::pair<std::string, std::string>> entries;
+    flattenJsonObject(root, "", entries);
+    for (const auto& entry : entries) {
+        if (entry.first.empty()) continue;
+        assignConfigEntry(config,
+                          entry.first,
+                          entry.second,
+                          "Config parse error for key '" + entry.first + "'");
+    }
+    return true;
+}
+#endif
 }
 
 AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
@@ -624,7 +745,7 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     }
 
     if (argc < 2) {
-        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--plot-theme auto|light|dark] [--plot-grid true|false] [--plot-point-size >0] [--plot-line-width >0] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--neural-optimizer sgd|adam|lookahead] [--neural-lookahead-fast-optimizer sgd|adam] [--neural-lookahead-sync-period N] [--neural-lookahead-alpha 0..1] [--neural-use-batch-norm true|false] [--neural-batch-norm-momentum 0..1) [--neural-batch-norm-epsilon >0] [--neural-use-layer-norm true|false] [--neural-layer-norm-epsilon >0] [--neural-lr-decay 0..1] [--neural-lr-plateau-patience N] [--neural-lr-cooldown-epochs N] [--neural-max-lr-reductions N] [--neural-min-learning-rate >=0] [--neural-use-validation-loss-ema true|false] [--neural-validation-loss-ema-beta 0..1] [--neural-categorical-input-l2-boost >=0] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1] [--tier3-fallback-aggressiveness 0..3] [--ogive-min-points N] [--ogive-min-unique N] [--box-min-points N] [--box-min-iqr >=0] [--pie-min-categories N] [--pie-max-categories N] [--pie-max-dominance 0..1] [--fit-min-corr 0..1] [--fit-min-samples N] [--time-series-season-period N] [--lof-max-rows N] [--lof-fallback-modified-z-threshold N] [--lof-threshold-floor N] [--gantt-auto true|false] [--gantt-min-tasks N] [--gantt-max-tasks N] [--gantt-duration-hours-threshold >0]");
+        throw Seldon::ConfigurationException("Usage: seldon <dataset.csv> [--config path] [--target col] [--output-dir path] [--report path] [--assets-dir path] [--delimiter ,] [--plots bivariate,univariate,overall] [--plot-univariate true|false] [--plot-overall true|false] [--plot-bivariate true|false] [--plot-theme auto|light|dark] [--plot-grid true|false] [--plot-point-size >0] [--plot-line-width >0] [--generate-html true|false] [--verbose-analysis true|false] [--neural-seed N] [--benchmark-seed N] [--gradient-clip N] [--neural-optimizer sgd|adam|lookahead] [--neural-lookahead-fast-optimizer sgd|adam] [--neural-lookahead-sync-period N] [--neural-lookahead-alpha 0..1] [--neural-use-batch-norm true|false] [--neural-batch-norm-momentum 0..1) [--neural-batch-norm-epsilon >0] [--neural-use-layer-norm true|false] [--neural-layer-norm-epsilon >0] [--neural-lr-decay 0..1] [--neural-lr-plateau-patience N] [--neural-lr-cooldown-epochs N] [--neural-max-lr-reductions N] [--neural-min-learning-rate >=0] [--neural-use-validation-loss-ema true|false] [--neural-validation-loss-ema-beta 0..1] [--neural-categorical-input-l2-boost >=0] [--max-feature-missing-ratio -1|0..1] [--target-strategy auto|quality|max_variance|last_numeric] [--feature-strategy auto|adaptive|aggressive|lenient] [--neural-strategy auto|none|fast|balanced|expressive] [--bivariate-strategy auto|balanced|corr_heavy|importance_heavy] [--fast true|false] [--fast-max-bivariate-pairs N] [--fast-neural-sample-rows N] [--feature-min-variance N] [--feature-leakage-corr-threshold 0..1] [--significance-alpha 0..1] [--outlier-iqr-multiplier N] [--outlier-z-threshold N] [--bivariate-selection-quantile 0..1] [--tier3-fallback-aggressiveness 0..3] [--ogive-min-points N] [--ogive-min-unique N] [--box-min-points N] [--box-min-iqr >=0] [--pie-min-categories N] [--pie-max-categories N] [--pie-max-dominance 0..1] [--fit-min-corr 0..1] [--fit-min-samples N] [--time-series-season-period N] [--lof-max-rows N] [--lof-fallback-modified-z-threshold N] [--lof-threshold-floor N] [--gantt-auto true|false] [--gantt-min-tasks N] [--gantt-max-tasks N] [--gantt-duration-hours-threshold >0] | note: outlier_method=lof is a conservative heuristic fallback (ensemble), not strict LOF");
     }
 
     AutoConfig config;
@@ -645,6 +766,10 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.numericLocaleHint = CommonUtils::toLower(argv[++i]);
         } else if (arg == "--output-dir" && i + 1 < argc) {
             config.outputDir = argv[++i];
+        } else if (arg == "--report" && i + 1 < argc) {
+            config.reportFile = argv[++i];
+        } else if (arg == "--assets-dir" && i + 1 < argc) {
+            config.assetsDir = argv[++i];
         } else if (arg == "--export-preprocessed" && i + 1 < argc) {
             config.exportPreprocessed = CommonUtils::toLower(argv[++i]);
         } else if (arg == "--export-preprocessed-path" && i + 1 < argc) {
@@ -920,10 +1045,24 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
 }
 
 AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig& base) {
+    AutoConfig config = base;
+
+#ifdef SELDON_HAS_NLOHMANN_JSON
+    {
+        const std::string ext = CommonUtils::toLower(std::filesystem::path(configPath).extension().string());
+        if (ext == ".json") {
+            if (parseStructuredJsonConfig(configPath, config)) {
+                config.validate();
+                return config;
+            }
+            throw Seldon::ConfigurationException("Failed to parse JSON config file: " + configPath);
+        }
+    }
+#endif
+
     std::ifstream in(configPath);
     if (!in) throw Seldon::ConfigurationException("Could not open config file: " + configPath);
 
-    AutoConfig config = base;
     std::string line;
     size_t lineNo = 0;
     while (std::getline(in, line)) {
@@ -938,44 +1077,13 @@ AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig&
         size_t sep = findSeparatorOutsideQuotes(line, ':');
         if (sep == std::string::npos) continue;
 
-        std::string key = normalizeConfigKey(maybeUnquote(line.substr(0, sep)));
+        std::string key = maybeUnquote(line.substr(0, sep));
         std::string value = maybeUnquote(line.substr(sep + 1));
 
-        try {
-            assignKeyValue(config, key, value);
-        } catch (const Seldon::SeldonException& ex) {
-            throw Seldon::ConfigurationException(
-                "Config parse error at line " + std::to_string(lineNo) +
-                ": '" + line + "' -> " + ex.what());
-        }
-
-        // per-column imputation syntax: impute.<column>: <strategy>
-        if (key.rfind("impute.", 0) == 0) {
-            const std::string normalized = CommonUtils::toLower(value);
-            if (!isValidImputationStrategy(normalized)) {
-                throw Seldon::ConfigurationException(
-                    "Config parse error at line " + std::to_string(lineNo) +
-                    ": invalid imputation strategy '" + value +
-                    "' (allowed: auto, mean, median, zero, mode, interpolate)");
-            }
-            const std::string columnName = CommonUtils::trim(key.substr(7));
-            if (columnName.empty()) {
-                throw Seldon::ConfigurationException(
-                    "Config parse error at line " + std::to_string(lineNo) +
-                    ": impute.<column> requires a non-empty column name");
-            }
-            config.columnImputation[columnName] = normalized;
-        }
-        if (key.rfind("type.", 0) == 0) {
-            const std::string normalized = CommonUtils::toLower(value);
-            if (!isValidColumnTypeOverride(normalized)) {
-                throw Seldon::ConfigurationException(
-                    "Config parse error at line " + std::to_string(lineNo) +
-                    ": invalid column type override '" + value +
-                    "' (allowed: numeric, categorical, datetime)");
-            }
-            config.columnTypeOverrides[CommonUtils::toLower(key.substr(5))] = normalized;
-        }
+        assignConfigEntry(config,
+                          key,
+                          value,
+                          "Config parse error at line " + std::to_string(lineNo) + ": '" + line + "'");
     }
     config.validate();
 
@@ -1096,8 +1204,8 @@ void AutoConfig::validate() const {
     if (plot.pointSize <= 0.0 || plot.lineWidth <= 0.0) {
         throw Seldon::ConfigurationException("plot_point_size and plot_line_width must be > 0");
     }
-    if (!isIn(outlierMethod, {"iqr", "zscore", "modified_zscore", "adjusted_boxplot", "lof"})) {
-        throw Seldon::ConfigurationException("outlier_method must be one of: iqr, zscore, modified_zscore, adjusted_boxplot, lof");
+    if (!isIn(outlierMethod, {"iqr", "zscore", "modified_zscore", "adjusted_boxplot", "lof", "lof_fallback_modified_zscore"})) {
+        throw Seldon::ConfigurationException("outlier_method must be one of: iqr, zscore, modified_zscore, adjusted_boxplot, lof, lof_fallback_modified_zscore");
     }
     if (!isIn(outlierAction, {"flag", "remove", "cap"})) {
         throw Seldon::ConfigurationException("outlier_action must be flag, remove, or cap");
@@ -1112,10 +1220,19 @@ void AutoConfig::validate() const {
     if (!isIn(featureStrategy, {"auto", "adaptive", "aggressive", "lenient"})) {
         throw Seldon::ConfigurationException("feature_strategy must be one of: auto, adaptive, aggressive, lenient");
     }
-    if (!isIn(neuralStrategy, {"auto", "none", "fast", "balanced", "expressive"})) {
+    if (!isIn(neuralStrategy, {
+            std::string(StrategyKeys::kAuto),
+            std::string(StrategyKeys::kNone),
+            std::string(StrategyKeys::kFast),
+            std::string(StrategyKeys::kBalanced),
+            std::string(StrategyKeys::kExpressive)})) {
         throw Seldon::ConfigurationException("neural_strategy must be one of: auto, none, fast, balanced, expressive");
     }
-    if (!isIn(bivariateStrategy, {"auto", "balanced", "corr_heavy", "importance_heavy"})) {
+    if (!isIn(bivariateStrategy, {
+            std::string(StrategyKeys::kAuto),
+            std::string(StrategyKeys::kBalanced),
+            std::string(StrategyKeys::kCorrHeavy),
+            std::string(StrategyKeys::kImportanceHeavy)})) {
         throw Seldon::ConfigurationException("bivariate_strategy must be one of: auto, balanced, corr_heavy, importance_heavy");
     }
     if (!isIn(neuralOptimizer, {"sgd", "adam", "lookahead"})) {

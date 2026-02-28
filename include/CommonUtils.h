@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,6 +23,18 @@ inline std::string toLower(std::string_view s) {
         return static_cast<char>(std::tolower(c));
     });
     return out;
+}
+
+inline std::optional<double> parseBooleanLikeToken(std::string_view value) {
+    const std::string token = toLower(trim(value));
+    if (token.empty()) return std::nullopt;
+    if (token == "1" || token == "true" || token == "yes" || token == "y" || token == "t" || token == "on") {
+        return 1.0;
+    }
+    if (token == "0" || token == "false" || token == "no" || token == "n" || token == "f" || token == "off") {
+        return 0.0;
+    }
+    return std::nullopt;
 }
 
 inline double medianByNth(std::vector<double> values) {

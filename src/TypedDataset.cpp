@@ -14,10 +14,13 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <spawn.h>
 #include <sstream>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
+
+extern char** environ;
 
 TypedDataset::TypedDataset(std::string filename, char delimiter)
     : filename_(std::move(filename)), delimiter_(delimiter) {}
@@ -243,38 +246,77 @@ bool commandAvailable(const std::string& command) {
 int spawnToFile(const std::string& executable,
                 const std::vector<std::string>& args,
                 const std::string& outputPath) {
-    const int outFd = ::open(outputPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    const int outFd = ::open(outputPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
     if (outFd < 0) return -1;
-
-    pid_t pid = ::fork();
-    if (pid < 0) {
+    const int devNull = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (devNull < 0) {
         ::close(outFd);
         return -1;
     }
 
-    if (pid == 0) {
-        const int devNull = ::open("/dev/null", O_WRONLY);
-        if (devNull >= 0) {
-            ::dup2(devNull, STDERR_FILENO);
-            ::close(devNull);
-        }
-
-        if (::dup2(outFd, STDOUT_FILENO) < 0) {
-            _exit(127);
-        }
+    int outFlags = ::fcntl(outFd, F_GETFD);
+    int devNullFlags = ::fcntl(devNull, F_GETFD);
+    if (outFlags < 0 || devNullFlags < 0 ||
+        ::fcntl(outFd, F_SETFD, outFlags | FD_CLOEXEC) < 0 ||
+        ::fcntl(devNull, F_SETFD, devNullFlags | FD_CLOEXEC) < 0) {
+        ::close(devNull);
         ::close(outFd);
-
-        std::vector<char*> argv;
-        argv.reserve(args.size() + 2);
-        argv.push_back(const_cast<char*>(executable.c_str()));
-        for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
-        argv.push_back(nullptr);
-
-        ::execv(executable.c_str(), argv.data());
-        _exit(127);
+        return -1;
     }
 
+    posix_spawn_file_actions_t actions;
+    if (::posix_spawn_file_actions_init(&actions) != 0) {
+        ::close(devNull);
+        ::close(outFd);
+        return -1;
+    }
+
+    if (::posix_spawn_file_actions_adddup2(&actions, outFd, STDOUT_FILENO) != 0 ||
+        ::posix_spawn_file_actions_adddup2(&actions, devNull, STDERR_FILENO) != 0 ||
+        ::posix_spawn_file_actions_addclose(&actions, outFd) != 0 ||
+        ::posix_spawn_file_actions_addclose(&actions, devNull) != 0) {
+        ::posix_spawn_file_actions_destroy(&actions);
+        ::close(devNull);
+        ::close(outFd);
+        return -1;
+    }
+
+    posix_spawnattr_t attr;
+    if (::posix_spawnattr_init(&attr) != 0) {
+        ::posix_spawn_file_actions_destroy(&actions);
+        ::close(devNull);
+        ::close(outFd);
+        return -1;
+    }
+
+    short spawnFlags = 0;
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    spawnFlags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#endif
+    if (spawnFlags != 0 && ::posix_spawnattr_setflags(&attr, spawnFlags) != 0) {
+        ::posix_spawnattr_destroy(&attr);
+        ::posix_spawn_file_actions_destroy(&actions);
+        ::close(devNull);
+        ::close(outFd);
+        return -1;
+    }
+
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 2);
+    argv.push_back(const_cast<char*>(executable.c_str()));
+    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+
+    pid_t pid = -1;
+    const int spawnRc = ::posix_spawn(&pid, executable.c_str(), &actions, &attr, argv.data(), environ);
+
+    ::posix_spawnattr_destroy(&attr);
+    ::posix_spawn_file_actions_destroy(&actions);
+    ::close(devNull);
     ::close(outFd);
+
+    if (spawnRc != 0 || pid <= 0) return -1;
+
     int status = 0;
     if (::waitpid(pid, &status, 0) < 0) return -1;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
@@ -796,7 +838,7 @@ void TypedDataset::load() {
                 }
 
                 score += semanticFieldScore(i, merged);
-                if (i + 2 < row.size()) {
+                if ((i + 2 < row.size()) && (i + 1 < header.size())) {
                     score += semanticFieldScore(i + 1, row[i + 2]);
                 }
 
@@ -813,9 +855,16 @@ void TypedDataset::load() {
                 bestIndex = std::min(header.size() - 1, row.size() - 2);
             }
 
+            if (bestIndex >= row.size() || (bestIndex + 1) >= row.size()) {
+                break;
+            }
             row[bestIndex] += delimiter_;
             row[bestIndex] += row[bestIndex + 1];
-            row.erase(row.begin() + static_cast<std::ptrdiff_t>(bestIndex + 1));
+            const size_t eraseIndex = bestIndex + 1;
+            if (eraseIndex >= row.size()) {
+                break;
+            }
+            row.erase(row.begin() + static_cast<std::ptrdiff_t>(eraseIndex));
         }
     };
 
@@ -887,44 +936,48 @@ void TypedDataset::load() {
 
     std::vector<double> runningSums(header.size(), 0.0);
 
+    CSVUtils::CSVChunkReader firstPassReader(in, delimiter_, parseLimits);
     while (in.peek() != EOF) {
-        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+        auto chunk = firstPassReader.readChunk(8192, &malformed, &parseLimitExceeded);
         if (parseLimitExceeded) {
             throw Seldon::DatasetException("CSV record exceeds parser safety limits");
         }
-        if (row.empty() || malformed || isSkippableControlRow(row)) continue;
-        reconcileRowWidth(row);
-        repairDateShiftedRow(row);
-        const bool accepted = !isLikelyMetadataRow(row, runningSums, rowCount_);
-        acceptedRowMask.push_back(static_cast<uint8_t>(accepted ? 1 : 0));
-        if (!accepted) continue;
-        ++rowCount_;
+        if (chunk.empty()) break;
+        for (auto& row : chunk) {
+            if (row.empty() || isSkippableControlRow(row)) continue;
+            reconcileRowWidth(row);
+            repairDateShiftedRow(row);
+            const bool accepted = !isLikelyMetadataRow(row, runningSums, rowCount_);
+            acceptedRowMask.push_back(static_cast<uint8_t>(accepted ? 1 : 0));
+            if (!accepted) continue;
+            ++rowCount_;
 
-        const size_t cols = std::min(row.size(), header.size());
-        for (size_t c = 0; c < cols; ++c) {
-            if (isMissingToken(row[c])) continue;
-            ++nonMissing[c];
-            double dv = 0.0;
-            int64_t tv = 0;
-            if (dateLikeHeaderMask[c]) {
-                if (parseDateTime(row[c], tv)) {
-                    ++datetimeHits[c];
-                } else if (parseDouble(row[c], dv)) {
-                    ++numericHits[c];
-                } else if (looksNumericLike(row[c])) {
-                    ++numericLikeHits[c];
-                }
-            } else {
-                if (parseDouble(row[c], dv)) {
-                    ++numericHits[c];
-                } else if (looksNumericLike(row[c])) {
-                    ++numericLikeHits[c];
-                } else if (parseDateTime(row[c], tv)) {
-                    ++datetimeHits[c];
+            const size_t cols = std::min(row.size(), header.size());
+            for (size_t c = 0; c < cols; ++c) {
+                if (isMissingToken(row[c])) continue;
+                ++nonMissing[c];
+                double dv = 0.0;
+                int64_t tv = 0;
+                if (dateLikeHeaderMask[c]) {
+                    if (parseDateTime(row[c], tv)) {
+                        ++datetimeHits[c];
+                    } else if (parseDouble(row[c], dv)) {
+                        ++numericHits[c];
+                    } else if (looksNumericLike(row[c])) {
+                        ++numericLikeHits[c];
+                    }
+                } else {
+                    if (parseDouble(row[c], dv)) {
+                        ++numericHits[c];
+                    } else if (looksNumericLike(row[c])) {
+                        ++numericLikeHits[c];
+                    } else if (parseDateTime(row[c], tv)) {
+                        ++datetimeHits[c];
+                    }
                 }
             }
+            updateRunningSums(row, runningSums);
         }
-        updateRunningSums(row, runningSums);
     }
 
     columns_.clear();
@@ -992,60 +1045,64 @@ void TypedDataset::load() {
     size_t r = 0;
     size_t decisionIdx = 0;
     std::fill(runningSums.begin(), runningSums.end(), 0.0);
+    CSVUtils::CSVChunkReader secondPassReader(in, delimiter_, parseLimits);
     while (in.peek() != EOF) {
-        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+        auto chunk = secondPassReader.readChunk(8192, &malformed, &parseLimitExceeded);
         if (parseLimitExceeded) {
             throw Seldon::DatasetException("CSV record exceeds parser safety limits");
         }
-        if (row.empty() || malformed || isSkippableControlRow(row)) continue;
-        reconcileRowWidth(row);
-        repairDateShiftedRow(row);
-        bool accepted = true;
-        if (decisionIdx < acceptedRowMask.size()) {
-            accepted = (acceptedRowMask[decisionIdx] != 0);
-        } else {
-            accepted = !isLikelyMetadataRow(row, runningSums, r);
-        }
-        ++decisionIdx;
-        if (!accepted) continue;
-        if (r >= rowCount_) break;
-
-        size_t cols = std::min(row.size(), header.size());
-        for (size_t c = 0; c < header.size(); ++c) {
-            std::string s = (c < cols) ? row[c] : "";
-            if (isMissingToken(s)) {
-                columns_[c].missing[r] = static_cast<uint8_t>(1);
-                continue;
-            }
-
-            if (columns_[c].type == ColumnType::NUMERIC) {
-                auto& numericValues = std::get<std::vector<double>>(columns_[c].values);
-                double dv = 0.0;
-                if (parseDouble(s, dv)) {
-                    numericValues[r] = dv;
-                } else {
-                    columns_[c].missing[r] = static_cast<uint8_t>(1);
-                }
-            } else if (columns_[c].type == ColumnType::DATETIME) {
-                auto& datetimeValues = std::get<std::vector<int64_t>>(columns_[c].values);
-                int64_t ts = 0;
-                datetimeObserved[c]++;
-                if (parseDateTime(s, ts)) {
-                    datetimeValues[r] = ts;
-                } else {
-                    datetimeParseFailures[c]++;
-                    columns_[c].missing[r] = static_cast<uint8_t>(1);
-                }
+        if (chunk.empty()) break;
+        for (auto& row : chunk) {
+            if (row.empty() || isSkippableControlRow(row)) continue;
+            reconcileRowWidth(row);
+            repairDateShiftedRow(row);
+            bool accepted = true;
+            if (decisionIdx < acceptedRowMask.size()) {
+                accepted = (acceptedRowMask[decisionIdx] != 0);
             } else {
-                auto& categoricalValues = std::get<std::vector<std::string>>(columns_[c].values);
-                categoricalValues[r] = CommonUtils::trim(s);
-                if (categoricalValues[r].empty()) {
+                accepted = !isLikelyMetadataRow(row, runningSums, r);
+            }
+            ++decisionIdx;
+            if (!accepted) continue;
+            if (r >= rowCount_) break;
+
+            size_t cols = std::min(row.size(), header.size());
+            for (size_t c = 0; c < header.size(); ++c) {
+                std::string s = (c < cols) ? row[c] : "";
+                if (isMissingToken(s)) {
                     columns_[c].missing[r] = static_cast<uint8_t>(1);
+                    continue;
+                }
+
+                if (columns_[c].type == ColumnType::NUMERIC) {
+                    auto& numericValues = std::get<std::vector<double>>(columns_[c].values);
+                    double dv = 0.0;
+                    if (parseDouble(s, dv)) {
+                        numericValues[r] = dv;
+                    } else {
+                        columns_[c].missing[r] = static_cast<uint8_t>(1);
+                    }
+                } else if (columns_[c].type == ColumnType::DATETIME) {
+                    auto& datetimeValues = std::get<std::vector<int64_t>>(columns_[c].values);
+                    int64_t ts = 0;
+                    datetimeObserved[c]++;
+                    if (parseDateTime(s, ts)) {
+                        datetimeValues[r] = ts;
+                    } else {
+                        datetimeParseFailures[c]++;
+                        columns_[c].missing[r] = static_cast<uint8_t>(1);
+                    }
+                } else {
+                    auto& categoricalValues = std::get<std::vector<std::string>>(columns_[c].values);
+                    categoricalValues[r] = CommonUtils::trim(s);
+                    if (categoricalValues[r].empty()) {
+                        columns_[c].missing[r] = static_cast<uint8_t>(1);
+                    }
                 }
             }
+            updateRunningSums(row, runningSums);
+            ++r;
         }
-        updateRunningSums(row, runningSums);
-        ++r;
     }
 
     constexpr double kDatetimeFallbackFailureRatio = 0.15;
@@ -1093,39 +1150,43 @@ void TypedDataset::load() {
     size_t rowIdx = 0;
     size_t fallbackDecisionIdx = 0;
     std::fill(runningSums.begin(), runningSums.end(), 0.0);
+    CSVUtils::CSVChunkReader thirdPassReader(in, delimiter_, parseLimits);
     while (in.peek() != EOF) {
-        auto row = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+        auto chunk = thirdPassReader.readChunk(8192, &malformed, &parseLimitExceeded);
         if (parseLimitExceeded) {
             throw Seldon::DatasetException("CSV record exceeds parser safety limits");
         }
-        if (row.empty() || malformed || isSkippableControlRow(row)) continue;
-        reconcileRowWidth(row);
-        repairDateShiftedRow(row);
-        bool accepted = true;
-        if (fallbackDecisionIdx < acceptedRowMask.size()) {
-            accepted = (acceptedRowMask[fallbackDecisionIdx] != 0);
-        } else {
-            accepted = !isLikelyMetadataRow(row, runningSums, rowIdx);
-        }
-        ++fallbackDecisionIdx;
-        if (!accepted) continue;
-        if (rowIdx >= rowCount_) break;
-
-        const size_t cols = std::min(row.size(), header.size());
-        for (size_t c = 0; c < header.size(); ++c) {
-            if (!fallbackMask[c]) continue;
-            auto& categoricalValues = std::get<std::vector<std::string>>(columns_[c].values);
-            std::string s = (c < cols) ? CommonUtils::trim(row[c]) : std::string();
-            if (isMissingToken(s) || s.empty()) {
-                columns_[c].missing[rowIdx] = static_cast<uint8_t>(1);
-                categoricalValues[rowIdx].clear();
+        if (chunk.empty()) break;
+        for (auto& row : chunk) {
+            if (row.empty() || isSkippableControlRow(row)) continue;
+            reconcileRowWidth(row);
+            repairDateShiftedRow(row);
+            bool accepted = true;
+            if (fallbackDecisionIdx < acceptedRowMask.size()) {
+                accepted = (acceptedRowMask[fallbackDecisionIdx] != 0);
             } else {
-                columns_[c].missing[rowIdx] = static_cast<uint8_t>(0);
-                categoricalValues[rowIdx] = s;
+                accepted = !isLikelyMetadataRow(row, runningSums, rowIdx);
             }
+            ++fallbackDecisionIdx;
+            if (!accepted) continue;
+            if (rowIdx >= rowCount_) break;
+
+            const size_t cols = std::min(row.size(), header.size());
+            for (size_t c = 0; c < header.size(); ++c) {
+                if (!fallbackMask[c]) continue;
+                auto& categoricalValues = std::get<std::vector<std::string>>(columns_[c].values);
+                std::string s = (c < cols) ? CommonUtils::trim(row[c]) : std::string();
+                if (isMissingToken(s) || s.empty()) {
+                    columns_[c].missing[rowIdx] = static_cast<uint8_t>(1);
+                    categoricalValues[rowIdx].clear();
+                } else {
+                    columns_[c].missing[rowIdx] = static_cast<uint8_t>(0);
+                    categoricalValues[rowIdx] = s;
+                }
+            }
+            updateRunningSums(row, runningSums);
+            ++rowIdx;
         }
-        updateRunningSums(row, runningSums);
-        ++rowIdx;
     }
 
     std::vector<size_t> rescuedDatetimeCols;

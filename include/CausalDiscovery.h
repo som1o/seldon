@@ -14,6 +14,9 @@ struct CausalDiscoveryOptions {
     size_t bootstrapSamples = 100;
     uint32_t randomSeed = 1337;
     bool enableLiNGAM = true;
+    bool enableFCI = true;
+    bool enableGES = true;
+    bool markExperimentalHeuristics = true;
     bool enableKernelCiFallback = true;
     bool enableGrangerValidation = true;
     bool enableIcpValidation = true;

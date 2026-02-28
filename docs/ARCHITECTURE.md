@@ -1,692 +1,133 @@
-# Architecture
+# Seldon Architecture
 
-This document describes the runtime architecture of Seldon in operational detail.
-
-It is intended for contributors and operators who need to understand:
-
-- runtime boundaries,
-- module responsibilities,
-- data contracts,
-- resource behavior,
-- and output semantics.
+This document describes the current runtime architecture and component boundaries.
 
 ---
 
-## 1) Architectural Intent
+## 1) High-Level Pipeline
 
-Seldon is a staged analytical pipeline.
+`AutomationPipeline::run` orchestrates the full flow:
 
-The architecture is designed around these goals:
+1. Resolve runtime config and output paths
+2. Cleanup output/artifact directories
+3. Load typed dataset
+4. Target resolution + preprocessing
+5. Univariate profiling
+6. Feature selection + deterministic guards
+7. Benchmarks + neural analysis
+8. Bivariate and advanced analytics
+9. Report assembly
+10. Artifact save + completion summary
 
-- deterministic stage ordering,
-- explicit typed data representation,
-- configurable behavior without code edits,
-- robust handling of real-world malformed tabular data,
-- bounded computational behavior through guardrails,
-- report-first output suitable for batch workflows.
+Main runtime entry:
 
----
-
-## 2) High-Level Runtime Flow
-
-The orchestrated flow is:
-
-1. Parse runtime configuration.
-2. Validate config invariants.
-3. Resolve input source and conversion path.
-4. Load typed dataset.
-5. Apply optional explicit type overrides.
-6. Preprocess data.
-7. Select target and features.
-8. Run baseline benchmarks.
-9. Run neural analysis.
-10. Compute coherent importance.
-11. Perform bivariate analysis and selection.
-12. Generate report artifacts.
-13. Optionally generate HTML artifacts.
-
-The controller for this flow lives in:
-
-- `src/AutomationPipeline.cpp`
+- `src/pipeline_parts/PipelineRuntime.cpp`
 
 ---
 
-## 3) Module Layout
+## 2) Pipeline Part Layout
 
-### 3.1 Orchestration and Configuration
+The pipeline is split into focused implementation units included by `src/AutomationPipeline.cpp`:
 
-- `include/AutomationPipeline.h`
-- `src/AutomationPipeline.cpp`
-- `include/AutoConfig.h`
-- `src/AutoConfig.cpp`
-
-Responsibilities:
-
-- CLI parsing,
-- config file merging,
-- config validation,
-- strategy selection,
-- end-to-end sequencing,
-- final artifact coordination.
-
-### 3.2 Data Representation and Ingestion
-
-- `include/TypedDataset.h`
-- `src/TypedDataset.cpp`
-- `include/CSVUtils.h`
-- `src/CSVUtils.cpp`
-
-Responsibilities:
-
-- source conversion handling,
-- CSV tokenization,
-- row width reconciliation,
-- type inference,
-- typed value storage,
-- missingness masks,
-- explicit type overrides.
-
-### 3.3 Preprocessing
-
-- `include/Preprocessor.h`
-- `src/Preprocessor.cpp`
-
-Responsibilities:
-
-- missing value accounting,
-- imputation,
-- outlier detection,
-- outlier action application,
-- scaling,
-- temporal feature extraction,
-- controlled numeric feature expansion,
-- categorical semantic expansion (boolean-like and multi-select indicator synthesis).
-
-### 3.4 Statistics and Math
-
-- `include/Statistics.h`
-- `src/Statistics.cpp`
-- `include/MathUtils.h`
-- `src/MathUtils.cpp`
-
-Responsibilities:
-
-- descriptive statistics,
-- correlation and significance,
-- numeric summarization,
-- matrix algebra,
-- inversion and regression utilities,
-- runtime numeric tolerance controls.
-
-### 3.5 Modeling and Relevance
-
-- `include/BenchmarkEngine.h`
-- `src/BenchmarkEngine.cpp`
-- `include/NeuralLayer.h`
-- `src/NeuralLayer.cpp`
-- `include/NeuralNet.h`
-- `src/NeuralNet.cpp`
-
-Responsibilities:
-
-- baseline k-fold benchmarks,
-- neural training,
-- explainability,
-- uncertainty estimation,
-- safety limits for topology and parameters.
-
-### 3.6 Reporting and Plotting
-
-- `include/ReportEngine.h`
-- `src/ReportEngine.cpp`
-- `include/GnuplotEngine.h`
-- `src/GnuplotEngine.cpp`
-
-Responsibilities:
-
-- Markdown section composition,
-- table and image insertion,
-- plot script generation and rendering,
-- output artifact placement.
+- `src/pipeline_parts/PipelineUnivariate.cpp`
+  - utility scaffolding, plotting helpers, I/O/report save helpers, path cleanup, target/feature selection helpers
+- `src/pipeline_parts/PipelineModeling.cpp`
+  - neural training strategies, explainability, bivariate scoring policy, feature approval logic
+- `src/pipeline_parts/PipelineBivariate.cpp`
+  - pair analytics, advanced diagnostics (interaction/drift/context)
+- `src/pipeline_parts/PipelineReporting.cpp`
+  - residual narrative and outlier contextualization helpers
+- `src/pipeline_parts/PipelineRuntime.cpp`
+  - end-to-end execution flow and report composition
 
 ---
 
-## 4) Core Data Contracts
+## 3) Core Engines
 
-### 4.1 `TypedColumn`
-
-`TypedColumn` contains:
-
-- `name`,
-- `type` (`NUMERIC|CATEGORICAL|DATETIME`),
-- `values` (variant storage),
-- `missing` mask (`std::vector<uint8_t>`).
-
-Design implications:
-
-- row alignment preserved for all columns,
-- type-safe data access via variant,
-- explicit missingness decoupled from value payload.
-
-### 4.2 `TypedDataset`
-
-`TypedDataset` contains:
-
-- filename,
-- delimiter,
-- locale hints,
-- optional column type override map,
-- row count,
-- typed columns.
-
-Key API behaviors:
-
-- load infers and materializes schema,
-- lookup by name is supported,
-- row filtering preserves alignment across columns.
+- `TypedDataset` (`include/TypedDataset.h`, `src/TypedDataset.cpp`)
+  - typed columns, missing masks, schema inference and overrides
+- `Preprocessor` (`include/Preprocessor.h`, `src/Preprocessor.cpp`)
+  - missing handling, outlier handling, scaling, preprocess report
+- `Statistics` / `MathUtils`
+  - robust descriptive and inferential statistics
+- `NeuralNet` (`include/NeuralNet.h`, `src/NeuralNet.cpp`)
+  - dense network, optimizers, explainability hooks, uncertainty estimates
+- `BenchmarkEngine`
+  - baseline model family and CV summaries
+- `ReportEngine`
+  - markdown report rendering and persistence
 
 ---
 
-## 5) Ingestion Design Details
+## 4) Output Path Resolution Rules
 
-### 5.1 Source Resolution
+Runtime path behavior is centralized in `PipelineRuntime.cpp`:
 
-Input path is resolved by extension.
+- If `outputDir` empty: derive `<dataset_stem>_seldon_outputs`
+- `assetsDir`:
+  - default/empty => `<outputDir>/seldon_report_assets`
+  - relative => `<outputDir>/<assetsDir>`
+  - absolute => unchanged
+- `reportFile`:
+  - default/empty => `<outputDir>/neural_synthesis.md`
+  - relative => `<outputDir>/<reportFile>`
+  - absolute => unchanged
 
-If conversion is required,
-the file is converted to a temporary CSV stream target.
-
-This allows the rest of ingestion logic to stay format-agnostic.
-
-### 5.2 Row Width Reconciliation
-
-Real-world CSV data often contains irregular row width.
-
-Seldon applies reconciliation logic to:
-
-- resize underfull rows,
-- merge overfull token pairs heuristically,
-- handle date-shift anomalies,
-- skip obvious control/metadata rows.
-
-### 5.3 Multi-Pass Inference
-
-The loader performs an inference pass and follow-up passes to:
-
-- infer candidate type,
-- populate typed vectors,
-- fallback datetime columns to categorical when parsing quality is poor,
-- rescue likely datetime semantics when strongly detected.
-
-Explicit type overrides short-circuit fallback behaviors for forced columns.
-
-### 5.4 Categorical Semantic Expansion
-
-During preprocessing, categorical columns are profiled for two semantic patterns:
-
-- boolean-like labels (`yes/no`, `true/false`, `on/off`, `1/0`),
-- multi-select payloads (single-cell lists split by common separators such as `,`, `;`, `|`).
-
-When detected, Seldon synthesizes bounded numeric indicators:
-
-- one normalized boolean indicator per boolean-like source column,
-- for multi-select columns: one selection-count feature and top-token presence indicators.
-
-These engineered columns are appended as numeric features for downstream model selection,
-while original categorical columns remain intact for reporting and contingency analysis.
+HTML neural output path uses configured report file stem (not hardcoded).
 
 ---
 
-## 6) Type Inference and Override Interaction
+## 5) Build and Acceleration Model
 
-Default behavior:
+Build system: CMake (`CMakeLists.txt`)
 
-- infer from observed token distributions and parseability.
+Compile-time toggles:
 
-Override behavior:
+- `SELDON_ENABLE_OPENMP`
+- `SELDON_ENABLE_OPENCL`
+- `SELDON_NEURAL_FLOAT32`
+- `SELDON_ENABLE_CUDA`
 
-- explicit `type.<column>` or `--type` maps take precedence.
+Behavior:
 
-Rationale:
-
-- inference handles common cases,
-- overrides handle domain-specific ambiguities,
-- combined model preserves both convenience and control.
-
----
-
-## 7) Preprocessing Pipeline Details
-
-Preprocessing executes in this order:
-
-1. Date-derived feature synthesis.
-2. Auto numeric feature expansion (bounded).
-3. Outlier flag detection on observed values.
-4. Missing count bookkeeping and imputation.
-5. Outlier action application.
-6. Scaling.
-
-### 7.1 Outlier Detection Scope
-
-Outlier flags are computed prior to imputation,
-so synthetic fill values do not influence anomaly detection.
-
-### 7.2 Memory Guard in Outlier Reporting
-
-Row-level outlier flags can be large.
-
-Storage is now controlled by:
-
-- `storeOutlierFlagsInReport`.
-
-### 7.3 Feature Expansion Guard
-
-Feature expansion can grow quickly.
-
-Seldon enforces:
-
-- `featureEngineeringMaxGeneratedColumns`.
-
-This cap is applied while generating polynomial,
-log,
-interaction,
-and ratio features.
-
-Pairwise discovery is additionally bounded by:
-
-- `featureEngineeringMaxPairwiseDiscovery`.
+- OpenMP and OpenCL are optional and conditionally linked when discovered.
+- CUDA can produce a secondary `seldon_cuda` binary when toolkit is available.
 
 ---
 
-## 8) Feature Selection and Strategy Layer
+## 6) Reporting Stack
 
-Feature selection behavior is strategy-driven.
-
-Inputs include:
-
-- missingness,
-- variance,
-- leakage thresholds,
-- strategy mode (`adaptive|aggressive|lenient|auto`).
-
-Outcome:
-
-- retained feature set,
-- dropped-feature diagnostics,
-- threshold metadata used in reports.
-
----
-
-## 9) Neural Input Encoding Architecture
-
-Neural input matrix is built from:
-
-- selected numeric features,
-- one-hot encoded categorical columns,
-- optional `other` category bucket.
-
-Controls:
-
-- `neuralMaxOneHotPerColumn`.
-
-Memory/perf behavior:
-
-- precomputed encoding plan,
-- row-level reserve by expected encoded width,
-- reduced dynamic reallocation pressure.
-
----
-
-## 10) Benchmark Engine Design
-
-Benchmark engine compares baseline models using fold-based evaluation.
-
-Key outputs:
-
-- RMSE,
-- R²,
-- optional accuracy for binary-like targets,
-- actual/predicted vectors for report surfacing.
-
-Parallel behavior:
-
-- model sections can run concurrently with OpenMP.
-
-Concurrency safety:
-
-- explicit OpenMP sharing clauses are used in parallel sections.
-
----
-
-## 11) Neural Engine Design
-
-### 11.1 Layer Primitive (`DenseLayer`)
-
-Responsibilities:
-
-- forward projection,
-- activation application,
-- dropout masking,
-- optional normalization transforms,
-- gradient storage,
-- parameter updates.
-
-### 11.2 Network Runtime (`NeuralNet`)
-
-Responsibilities:
-
-- training loop,
-- batch stepping,
-- validation path,
-- LR scheduling,
-- early stopping,
-- lookahead/adam/sgd optimization,
-- explainability scoring,
-- uncertainty estimation.
-
-### 11.3 Topology Safety
-
-Two safety layers exist:
-
-- config-level limits in orchestration,
-- hard constructor-level limits in `NeuralNet`.
-
-Limits constrain:
-
-- total node count,
-- trainable parameter count.
-
-This blocks over-allocation risks from malicious or accidental config values.
-
----
-
-## 12) Explainability and Importance Fusion
-
-Modes:
-
-- permutation,
-- integrated gradients,
-- hybrid weighted blend.
-
-Hybrid mode uses configurable weights:
-
-- permutation weight,
-- integrated gradients weight.
-
-Weights are validated and normalized during scoring.
-
----
-
-## 13) Coherent Importance Layer
-
-Seldon computes coherent importance by blending:
-
-- neural feature importance,
-- target-feature correlation signal.
-
-Blend weighting adjusts using:
-
-- dataset size,
-- overfitting proxy,
-- benchmark-vs-neural penalty heuristics.
-
-This stabilizes feature prioritization under noisy conditions.
-
----
-
-## 14) Bivariate Analysis Architecture
-
-Bivariate pair generation evaluates numeric pair statistics:
-
-- Pearson,
-- Spearman,
-- Kendall,
-- significance,
-- regression descriptors,
-- neural relevance score.
-
-Selection process:
-
-- significance filter,
-- neural-score quantile cutoff,
-- capped keep count.
-
-Parallel implementation:
-
-- per-thread pair buffers,
-- post-join vector merge,
-- explicit OpenMP sharing declarations.
-
----
-
-## 15) Plotting and Visual Artifact Layer
-
-Plot generation is delegated to `GnuplotEngine`.
-
-Plot modes include:
-
-- univariate,
-- bivariate significant,
-- overall diagnostics.
-
-Artifacts are written to deterministic subfolders under:
-
-- `seldon_report_assets`.
-
----
-
-## 16) Reporting Architecture
-
-`ReportEngine` acts as a markdown builder.
-
-Report composition pattern:
-
-- add title,
-- add paragraphs,
-- add tables,
-- add image references,
-- save markdown.
-
-Primary report outputs:
-
-- univariate report,
-- bivariate report,
-- neural synthesis report,
-- final analysis report.
-
-Optional HTML conversion is delegated to `pandoc` when enabled.
-
----
-
-## 17) Logging and Terminal UX
-
-Runtime messaging uses:
-
-- stage progress updates,
-- verbose analytics logs,
-- optional spinner updates.
-
-Current behavior avoids mixed-line collisions by enabling spinner only in non-verbose TTY runs.
-
----
-
-## 18) OpenMP Boundaries
-
-OpenMP is conditionally compiled.
-
-Key parallel zones include:
-
-- benchmark model sections,
-- pairwise bivariate evaluation,
-- selected neural importance loops,
-- matrix multiplication paths.
-
-Concurrency hygiene:
-
-- thread-local accumulation where needed,
-- explicit `default(none)` and `shared(...)` in sensitive regions.
-
----
-
-## 19) Numeric Stability Controls
-
-`MathUtils` centralizes runtime numeric controls:
-
-- significance alpha,
-- numeric epsilon,
-- beta function fallback intervals,
-- fallback tolerance.
-
-These controls are used across significance,
-matrix inversion,
-and related numerical routines.
-
----
-
-## 20) Configuration Validation Layer
-
-`AutoConfig::validate` and `HeuristicTuningConfig::validate` enforce:
-
-- option domain correctness,
-- range constraints,
-- cross-field consistency,
-- and now safety limits for neural topology parameters.
-
-Invalid settings fail fast before heavy execution begins.
-
----
-
-## 21) Resource Behavior Summary
-
-Main memory consumers are:
-
-- loaded dataset columns,
-- engineered feature expansions,
-- encoded neural matrix,
-- report intermediate vectors.
-
-Implemented containment controls include:
-
-- generated-feature cap,
-- one-hot-per-column cap,
-- optional outlier-flag retention,
-- neural topology/parameter limits,
-- fast-mode sample caps.
-
----
-
-## 22) Failure Domains
-
-Primary failure categories:
-
-- configuration errors,
-- dataset parse errors,
-- external converter absence,
-- numeric edge cases,
-- unsupported settings combinations.
-
-Seldon surfaces descriptive exceptions with context.
-
----
-
-## 23) Artifact Contract
-
-When successful, Seldon emits a consistent artifact set.
-
-Mandatory markdown artifacts:
+Primary reports emitted per run:
 
 - `univariate.md`
 - `bivariate.md`
-- `neural_synthesis.md`
+- configured neural synthesis markdown (`reportFile`)
 - `final_analysis.md`
+- `report.md`
 
-Asset directory:
+Plot assets live under `assetsDir` with subfolders:
 
-- `seldon_report_assets/`
+- `univariate`
+- `bivariate`
+- `overall`
 
-Optional exports:
-
-- preprocessed CSV/Parquet,
-- optional HTML report counterparts.
-
----
-
-## 24) Extensibility Surface
-
-Most runtime behavior extension points are config-driven:
-
-- parser hints,
-- per-column overrides,
-- per-column imputation,
-- strategy knobs,
-- heuristic thresholds,
-- safety boundaries.
-
-This architecture minimizes source-level changes for common behavior tuning.
+Optional HTML conversion is performed via `pandoc` if enabled.
 
 ---
 
-## 25) Practical Mental Model
+## 7) Runtime Modes
 
-Think of Seldon as five stacked layers:
+- Standard mode: full breadth analysis
+- `fast_mode`: pair caps/sample limits for quicker iteration
+- `low_memory_mode`: stricter limits, reduced heavy operations, plotting reduction
 
-1. **Ingestion layer**
-2. **Transformation layer**
-3. **Analysis layer**
-4. **Selection layer**
-5. **Reporting layer**
-
-Each layer has strict data contracts and bounded responsibilities.
-
-This separation helps maintain predictable behavior as data scale and schema complexity increase.
+These are applied early in `AutomationPipeline::run` and propagate to downstream stages.
 
 ---
 
-## 26) File-Level Quick Index
+## 8) Design Notes
 
-### 26.1 Entry and Pipeline
-
-- `src/main.cpp`
-- `src/AutomationPipeline.cpp`
-
-### 26.2 Config
-
-- `include/AutoConfig.h`
-- `src/AutoConfig.cpp`
-
-### 26.3 Data and Preprocessing
-
-- `include/TypedDataset.h`
-- `src/TypedDataset.cpp`
-- `include/Preprocessor.h`
-- `src/Preprocessor.cpp`
-
-### 26.4 Stats and Math
-
-- `include/Statistics.h`
-- `src/Statistics.cpp`
-- `include/MathUtils.h`
-- `src/MathUtils.cpp`
-
-### 26.5 Modeling
-
-- `include/BenchmarkEngine.h`
-- `src/BenchmarkEngine.cpp`
-- `include/NeuralLayer.h`
-- `src/NeuralLayer.cpp`
-- `include/NeuralNet.h`
-- `src/NeuralNet.cpp`
-
-### 26.6 Report and Plot
-
-- `include/ReportEngine.h`
-- `src/ReportEngine.cpp`
-- `include/GnuplotEngine.h`
-- `src/GnuplotEngine.cpp`
-
----
-
-## 27) Cross-Document Links
-
-- [README](../README.md)
-- [USAGE](USAGE.md)
+- Keep data processing deterministic first, neural second.
+- Keep reporting path behavior config-driven and predictable.
+- Keep optional acceleration (OpenMP/OpenCL/CUDA) non-blocking: missing backends should degrade gracefully.
+- Some analytics modules are intentionally heuristic (including causal discovery guidance and LOF-labeled outlier fallback), and should be interpreted as decision support rather than formal causal/statistical proof.

@@ -1,8 +1,20 @@
 #pragma once
 #include <cstdint>
+#include <array>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
+
+namespace StrategyKeys {
+inline constexpr std::string_view kAuto = "auto";
+inline constexpr std::string_view kFast = "fast";
+inline constexpr std::string_view kBalanced = "balanced";
+inline constexpr std::string_view kExpressive = "expressive";
+inline constexpr std::string_view kNone = "none";
+inline constexpr std::string_view kCorrHeavy = "corr_heavy";
+inline constexpr std::string_view kImportanceHeavy = "importance_heavy";
+}
 
 struct PlotConfig {
     std::string format = "png";
@@ -194,7 +206,7 @@ struct AutoConfig {
     std::unordered_map<std::string, std::string> columnImputation;
     std::unordered_map<std::string, std::string> columnTypeOverrides;
 
-    std::string outlierMethod = "iqr";      // iqr|zscore|modified_zscore|adjusted_boxplot|lof
+    std::string outlierMethod = "iqr";      // iqr|zscore|modified_zscore|adjusted_boxplot|lof(heuristic modified-Z fallback)|lof_fallback_modified_zscore
     std::string outlierAction = "flag";     // flag|remove|cap
 
     std::string scalingMethod = "auto";     // auto|zscore|minmax|none

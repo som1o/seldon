@@ -13,10 +13,13 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <spawn.h>
 #include <sstream>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
+
+extern char** environ;
 
 namespace {
 std::string trimAsciiSpaces(const std::string& value) {
@@ -279,6 +282,60 @@ std::vector<double> finiteValues(const std::vector<double>& values) {
         if (std::isfinite(v)) out.push_back(v);
     }
     return out;
+}
+
+std::vector<size_t> greedyClusteredOrder(const std::vector<std::vector<double>>& matrix) {
+    const size_t n = matrix.size();
+    if (n == 0) return {};
+    std::vector<size_t> order;
+    order.reserve(n);
+    std::vector<uint8_t> used(n, static_cast<uint8_t>(0));
+
+    // Choose a seed with the highest aggregate absolute similarity so the walk
+    // starts from a dense region of the matrix.
+    size_t seed = 0;
+    double bestRowDispersion = -1.0;
+    for (size_t i = 0; i < n; ++i) {
+        if (i >= matrix[i].size()) continue;
+        double s = 0.0;
+        for (size_t j = 0; j < matrix[i].size(); ++j) {
+            if (i == j) continue;
+            s += std::abs(matrix[i][j]);
+        }
+        if (s > bestRowDispersion) {
+            bestRowDispersion = s;
+            seed = i;
+        }
+    }
+
+    order.push_back(seed);
+    used[seed] = static_cast<uint8_t>(1);
+    // Greedily append the most similar unused neighbor to keep related rows/cols adjacent.
+    while (order.size() < n) {
+        const size_t last = order.back();
+        size_t next = static_cast<size_t>(-1);
+        double best = -1.0;
+        for (size_t j = 0; j < n; ++j) {
+            if (used[j]) continue;
+            if (last >= matrix.size() || j >= matrix[last].size()) continue;
+            const double sim = std::abs(matrix[last][j]);
+            if (sim > best) {
+                best = sim;
+                next = j;
+            }
+        }
+        if (next == static_cast<size_t>(-1)) {
+            for (size_t j = 0; j < n; ++j) {
+                if (!used[j]) {
+                    next = j;
+                    break;
+                }
+            }
+        }
+        order.push_back(next);
+        used[next] = static_cast<uint8_t>(1);
+    }
+    return order;
 }
 
 struct AxisRange {
@@ -617,26 +674,57 @@ std::string findExecutableInPath(const std::string& command) {
 int spawnGnuplot(const std::string& executable,
                  const std::string& scriptPath,
                  const std::string& stderrPath) {
-    const int errFd = ::open(stderrPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    const int errFd = ::open(stderrPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
     if (errFd < 0) return -1;
 
-    pid_t pid = ::fork();
-    if (pid < 0) {
+    int fdFlags = ::fcntl(errFd, F_GETFD);
+    if (fdFlags < 0 || ::fcntl(errFd, F_SETFD, fdFlags | FD_CLOEXEC) < 0) {
         ::close(errFd);
         return -1;
     }
 
-    if (pid == 0) {
-        if (::dup2(errFd, STDERR_FILENO) < 0) {
-            _exit(127);
-        }
+    posix_spawn_file_actions_t actions;
+    if (::posix_spawn_file_actions_init(&actions) != 0) {
         ::close(errFd);
-        const char* argv[] = {executable.c_str(), scriptPath.c_str(), nullptr};
-        ::execv(executable.c_str(), const_cast<char* const*>(argv));
-        _exit(127);
+        return -1;
     }
 
+    if (::posix_spawn_file_actions_adddup2(&actions, errFd, STDERR_FILENO) != 0 ||
+        ::posix_spawn_file_actions_addclose(&actions, errFd) != 0) {
+        ::posix_spawn_file_actions_destroy(&actions);
+        ::close(errFd);
+        return -1;
+    }
+
+    posix_spawnattr_t attr;
+    if (::posix_spawnattr_init(&attr) != 0) {
+        ::posix_spawn_file_actions_destroy(&actions);
+        ::close(errFd);
+        return -1;
+    }
+
+    short spawnFlags = 0;
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    spawnFlags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#endif
+    if (spawnFlags != 0 && ::posix_spawnattr_setflags(&attr, spawnFlags) != 0) {
+        ::posix_spawnattr_destroy(&attr);
+        ::posix_spawn_file_actions_destroy(&actions);
+        ::close(errFd);
+        return -1;
+    }
+
+    const char* argvRaw[] = {executable.c_str(), scriptPath.c_str(), nullptr};
+    char* const* argv = const_cast<char* const*>(argvRaw);
+    pid_t pid = -1;
+    const int spawnRc = ::posix_spawn(&pid, executable.c_str(), &actions, &attr, argv, environ);
+
+    ::posix_spawnattr_destroy(&attr);
+    ::posix_spawn_file_actions_destroy(&actions);
     ::close(errFd);
+
+    if (spawnRc != 0 || pid <= 0) return -1;
+
     int status = 0;
     if (::waitpid(pid, &status, 0) < 0) return -1;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
@@ -740,29 +828,9 @@ std::string GnuplotEngine::runScript(const std::string& id, const std::string& d
     {
         std::ifstream in(cacheHashFile);
         std::string existing;
-        std::string cachedMtimeRaw;
         if (in && std::getline(in, existing)) {
-            std::getline(in, cachedMtimeRaw);
             if (existing == cacheKey && std::filesystem::exists(outputFile)) {
-                bool useCache = true;
-                if (!cachedMtimeRaw.empty()) {
-                    std::error_code ec;
-                    const auto currentTime = std::filesystem::last_write_time(outputFile, ec);
-                    if (!ec) {
-                        try {
-                            const auto cachedCount = static_cast<std::filesystem::file_time_type::rep>(std::stoll(cachedMtimeRaw));
-                            const auto currentCount = currentTime.time_since_epoch().count();
-                            if (currentCount != cachedCount) {
-                                useCache = false;
-                            }
-                        } catch (...) {
-                            useCache = false;
-                        }
-                    }
-                }
-                if (useCache) {
-                    return outputFile;
-                }
+                return outputFile;
             }
         }
     }
@@ -811,10 +879,13 @@ std::string GnuplotEngine::runScript(const std::string& id, const std::string& d
     std::ofstream hout(cacheHashFile);
     if (hout) {
         hout << cacheKey;
-        std::error_code tec;
-        const auto outTime = std::filesystem::last_write_time(outputFile, tec);
-        if (!tec) {
-            hout << "\n" << outTime.time_since_epoch().count();
+        hout.flush();
+        if (!hout.good()) {
+            std::cerr << "[Seldon][Plot] Failed to flush cache hash file: '" << cacheHashFile << "'\n";
+        }
+        hout.close();
+        if (!hout) {
+            std::cerr << "[Seldon][Plot] Failed to close cache hash file cleanly: '" << cacheHashFile << "'\n";
         }
     }
 
@@ -1106,6 +1177,70 @@ std::string GnuplotEngine::scatter(const std::string& id,
     return runScript(id, data.str(), script.str());
 }
 
+std::string GnuplotEngine::scatter3D(const std::string& id,
+                                     const std::vector<double>& x,
+                                     const std::vector<double>& y,
+                                     const std::vector<double>& z,
+                                     const std::string& title) {
+    const size_t n = std::min({x.size(), y.size(), z.size()});
+    if (n < 4) return "";
+
+    std::ostringstream data;
+    size_t kept = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(x[i]) || !std::isfinite(y[i]) || !std::isfinite(z[i])) continue;
+        data << x[i] << " " << y[i] << " " << z[i] << "\n";
+        ++kept;
+    }
+    if (kept < 4) return "";
+
+    const std::string safeId = sanitizeId(id);
+    std::ostringstream script;
+    script << styledHeader(id, title);
+    script << "set xlabel 'X'\n";
+    script << "set ylabel 'Y'\n";
+    script << "set zlabel 'Z'\n";
+    script << "set ticslevel 0\n";
+    script << "set key off\n";
+    script << "splot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
+           << " using 1:2:3 with points pt 7 ps " << std::max(0.4, cfg_.pointSize)
+           << " lc rgb '#2563eb' notitle\n";
+    return runScript(id, data.str(), script.str());
+}
+
+std::string GnuplotEngine::surface(const std::string& id,
+                                   const std::vector<double>& x,
+                                   const std::vector<double>& y,
+                                   const std::vector<std::vector<double>>& z,
+                                   const std::string& title) {
+    if (x.empty() || y.empty() || z.empty()) return "";
+    if (z.size() != y.size()) return "";
+
+    std::ostringstream data;
+    for (size_t r = 0; r < y.size(); ++r) {
+        if (r >= z.size()) break;
+        const auto& row = z[r];
+        for (size_t c = 0; c < x.size() && c < row.size(); ++c) {
+            if (!std::isfinite(row[c])) continue;
+            data << x[c] << " " << y[r] << " " << row[c] << "\n";
+        }
+        data << "\n";
+    }
+
+    const std::string safeId = sanitizeId(id);
+    std::ostringstream script;
+    script << styledHeader(id, title);
+    script << "set hidden3d\n";
+    script << "set pm3d depthorder\n";
+    script << "set xlabel 'X'\n";
+    script << "set ylabel 'Y'\n";
+    script << "set zlabel 'Value'\n";
+    script << "set palette defined (0 '#1d4ed8', 1 '#60a5fa', 2 '#f59e0b', 3 '#dc2626')\n";
+    script << "splot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
+           << " using 1:2:3 with pm3d title 'Surface'\n";
+    return runScript(id, data.str(), script.str());
+}
+
 std::string GnuplotEngine::residual(const std::string& id,
                                     const std::vector<double>& fitted,
                                     const std::vector<double>& residuals,
@@ -1378,6 +1513,75 @@ std::string GnuplotEngine::categoricalDistribution(const std::string& id,
         script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
                << " using 1:2 title 'Distribution' lc rgb '#2563eb'\n";
     }
+
+    return runScript(id, data.str(), script.str());
+}
+
+std::string GnuplotEngine::violin(const std::string& id,
+                                  const std::vector<std::string>& categories,
+                                  const std::vector<double>& values,
+                                  const std::string& title) {
+    const size_t n = std::min(categories.size(), values.size());
+    if (n < 20) return "";
+
+    std::map<std::string, std::vector<double>> byCat;
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(values[i]) || categories[i].empty()) continue;
+        byCat[categories[i]].push_back(values[i]);
+    }
+    if (byCat.size() < 2) return "";
+
+    std::vector<std::pair<std::string, std::vector<double>>> ordered;
+    for (auto& kv : byCat) ordered.push_back(kv);
+    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+        return a.second.size() > b.second.size();
+    });
+    if (ordered.size() > 10) ordered.resize(10);
+
+    std::ostringstream data;
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        auto vals = ordered[i].second;
+        std::sort(vals.begin(), vals.end());
+        if (vals.size() < 6) continue;
+        const double minV = vals.front();
+        const double maxV = vals.back();
+        const double span = std::max(1e-9, maxV - minV);
+
+        std::vector<double> grid;
+        grid.reserve(100);
+        for (size_t g = 0; g < 100; ++g) {
+            const double t = static_cast<double>(g) / 99.0;
+            grid.push_back(minV + span * t);
+        }
+        const std::vector<double> dens = kdeEvaluate(vals, grid, silvermanBandwidth(vals));
+        const double maxD = dens.empty() ? 0.0 : *std::max_element(dens.begin(), dens.end());
+        const double scale = (maxD <= 1e-12) ? 0.0 : (0.42 / maxD);
+
+        for (size_t g = 0; g < grid.size(); ++g) {
+            const double half = dens[g] * scale;
+            data << grid[g] << " " << ((i + 1) - half) << " " << ((i + 1) + half) << "\n";
+        }
+        data << "\n\n";
+    }
+
+    std::ostringstream script;
+    script << styledHeader(id, title);
+    script << "set ylabel 'Value'\n";
+    script << "set xrange [0.5:" << (ordered.size() + 0.5) << "]\n";
+    script << "set xtics (";
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        if (i > 0) script << ", ";
+        script << quoteForGnuplot(normalizePlotLabel(ordered[i].first, 16)) << " " << (i + 1);
+    }
+    script << ") rotate by -25 font ',10'\n";
+    script << "plot ";
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        if (i > 0) script << ", ";
+        script << quoteForGnuplot(assetsDir_ + "/" + sanitizeId(id) + ".dat")
+               << " index " << i
+               << " using 2:1:3 with filledcurves lc rgb '#93c5fd' fs solid 0.45 notitle";
+    }
+    script << "\n";
 
     return runScript(id, data.str(), script.str());
 }
@@ -1700,7 +1904,7 @@ std::string GnuplotEngine::gantt(const std::string& id,
     for (size_t i = 0; i < n; ++i) {
         const double yLow = static_cast<double>(i + 1) - 0.35;
         const double yHigh = static_cast<double>(i + 1) + 0.35;
-        std::string semantic = taskNames[i];
+        std::string semantic;
         if (i < semantics.size() && !semantics[i].empty()) semantic = semantics[i];
         const std::string color = ganttColorForSemantic(semantic, palette[i % palette.size()]);
         script << "set object " << objectId++
@@ -1750,5 +1954,84 @@ std::string GnuplotEngine::heatmap(const std::string& id,
     }
     script << "unset grid\n";
     script << "splot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat") << " using 1:2:3 with pm3d\n";
+    return runScript(id, data.str(), script.str());
+}
+
+std::string GnuplotEngine::clusteredHeatmap(const std::string& id,
+                                            const std::vector<std::vector<double>>& matrix,
+                                            const std::string& title,
+                                            const std::vector<std::string>& labels,
+                                            bool withDendrogram) {
+    if (matrix.empty() || matrix.front().empty()) return "";
+    const std::vector<size_t> order = greedyClusteredOrder(matrix);
+    if (order.empty()) return "";
+
+    std::vector<std::vector<double>> clustered(order.size(), std::vector<double>(order.size(), 0.0));
+    std::vector<std::string> clusteredLabels;
+    clusteredLabels.reserve(order.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        const size_t ri = order[i];
+        clusteredLabels.push_back((ri < labels.size()) ? labels[ri] : ("f" + std::to_string(ri + 1)));
+        for (size_t j = 0; j < order.size(); ++j) {
+            const size_t cj = order[j];
+            if (ri < matrix.size() && cj < matrix[ri].size()) {
+                clustered[i][j] = matrix[ri][cj];
+            }
+        }
+    }
+
+    if (!withDendrogram) {
+        return heatmap(id, clustered, title, clusteredLabels);
+    }
+
+    std::ostringstream data;
+    for (size_t r = 0; r < clustered.size(); ++r) {
+        for (size_t c = 0; c < clustered[r].size(); ++c) {
+            data << c << " " << r << " " << clustered[r][c] << "\n";
+        }
+        data << "\n";
+    }
+    data << "\n\n";
+    for (size_t i = 1; i < clustered.size(); ++i) {
+        const double d = 1.0 - std::abs(clustered[i - 1][i]);
+        data << d << " " << i << "\n";
+    }
+
+    const std::string safeId = sanitizeId(id);
+    std::ostringstream script;
+    script << styledHeader(id, title + " (clustered with dendrogram)");
+    script << "set multiplot layout 1,2 columnsfirst title ''\n";
+
+    script << "unset key\n";
+    script << "set size ratio -1\n";
+    script << "set lmargin 6\nset rmargin 2\nset tmargin 3\nset bmargin 4\n";
+    script << "set xlabel 'Distance'\nset ylabel ''\n";
+    script << "set ytics (";
+    for (size_t i = 0; i < clusteredLabels.size(); ++i) {
+        if (i > 0) script << ", ";
+        script << quoteForGnuplot(normalizePlotLabel(clusteredLabels[i], 12)) << " " << i;
+    }
+    script << ") font ',8'\n";
+    script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
+           << " index 1 using 1:2 with impulses lc rgb '#374151' lw 2 notitle\n";
+
+    script << "set view map\nset pm3d at b\nunset key\n";
+    script << "set palette defined (-1 '#1e3a8a', 0 '#f3f4f6', 1 '#991b1b')\n";
+    script << "set cbrange [-1:1]\n";
+    script << "set xtics (";
+    for (size_t i = 0; i < clusteredLabels.size(); ++i) {
+        if (i > 0) script << ", ";
+        script << quoteForGnuplot(normalizePlotLabel(clusteredLabels[i], 12)) << " " << i;
+    }
+    script << ") rotate by -35 font ',8'\n";
+    script << "set ytics (";
+    for (size_t i = 0; i < clusteredLabels.size(); ++i) {
+        if (i > 0) script << ", ";
+        script << quoteForGnuplot(normalizePlotLabel(clusteredLabels[i], 12)) << " " << i;
+    }
+    script << ") font ',8'\n";
+    script << "splot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat") << " index 0 using 1:2:3 with pm3d\n";
+    script << "unset multiplot\n";
+
     return runScript(id, data.str(), script.str());
 }

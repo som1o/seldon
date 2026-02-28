@@ -193,4 +193,33 @@ std::vector<std::string> normalizeHeader(const std::vector<std::string>& header)
 
     return out;
 }
+
+CSVChunkReader::CSVChunkReader(std::istream& is, char delimiter, ParseLimits limits)
+    : is_(is), delimiter_(delimiter), limits_(limits) {}
+
+std::vector<std::vector<std::string>> CSVChunkReader::readChunk(size_t maxRows,
+                                                                bool* malformed,
+                                                                bool* limitExceeded) {
+    if (malformed) *malformed = false;
+    if (limitExceeded) *limitExceeded = false;
+
+    std::vector<std::vector<std::string>> rows;
+    rows.reserve(maxRows);
+    while (rows.size() < maxRows && is_.peek() != EOF) {
+        bool rowMalformed = false;
+        bool rowLimitExceeded = false;
+        auto row = parseCSVLine(is_, delimiter_, &rowMalformed, nullptr, &rowLimitExceeded, limits_);
+        if (rowLimitExceeded) {
+            if (limitExceeded) *limitExceeded = true;
+            break;
+        }
+        if (rowMalformed) {
+            if (malformed) *malformed = true;
+            continue;
+        }
+        if (row.empty()) continue;
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
 } // namespace CSVUtils
