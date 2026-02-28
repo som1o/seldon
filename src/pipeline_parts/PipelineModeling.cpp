@@ -1694,6 +1694,8 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     std::vector<PairInsight> pairs;
     const auto numericIdx = data.numericColumnIndices();
     const size_t n = data.rowCount();
+    constexpr double kHardMissingnessPrune = 0.90;
+    constexpr size_t kHardMinNonMissing = 24;
     std::vector<size_t> evalNumericIdx;
     evalNumericIdx.reserve(numericIdx.size());
     for (size_t idx : numericIdx) {
@@ -1705,10 +1707,37 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         const auto& col = data.columns()[idx];
         const size_t miss = std::count(col.missing.begin(), col.missing.end(), static_cast<uint8_t>(1));
         const double missRatio = col.missing.empty() ? 0.0 : static_cast<double>(miss) / static_cast<double>(col.missing.size());
-        if (missRatio > 0.95) continue;
+        const size_t nonMissing = col.missing.size() > miss ? (col.missing.size() - miss) : 0;
+        if (missRatio > kHardMissingnessPrune || nonMissing < kHardMinNonMissing) continue;
         evalNumericIdx.push_back(idx);
     }
     if (evalNumericIdx.size() < 2) return pairs;
+
+    // Two-stage pruning for very wide datasets: keep highest-utility columns before O(n^2) pair expansion.
+    if (maxPairs == 0 && evalNumericIdx.size() > 512) {
+        std::vector<std::pair<size_t, double>> ranked;
+        ranked.reserve(evalNumericIdx.size());
+        for (size_t idx : evalNumericIdx) {
+            double imp = 0.0;
+            if (const auto it = importanceByIndex.find(idx); it != importanceByIndex.end()) imp = it->second;
+            const auto& col = data.columns()[idx];
+            const size_t miss = std::count(col.missing.begin(), col.missing.end(), static_cast<uint8_t>(1));
+            const double missRatio = col.missing.empty() ? 0.0 : static_cast<double>(miss) / static_cast<double>(col.missing.size());
+            const double modeledBoost = (modeledIndices.find(idx) != modeledIndices.end()) ? 0.20 : 0.0;
+            const double quality = std::clamp(1.0 - missRatio, 0.0, 1.0);
+            ranked.push_back({idx, std::max(0.0, imp) * 0.70 + quality * 0.20 + modeledBoost * 0.10});
+        }
+        std::sort(ranked.begin(), ranked.end(), [&](const auto& a, const auto& b) {
+            if (a.second == b.second) return data.columns()[a.first].name < data.columns()[b.first].name;
+            return a.second > b.second;
+        });
+
+        evalNumericIdx.clear();
+        evalNumericIdx.reserve(512);
+        for (size_t i = 0; i < 512 && i < ranked.size(); ++i) {
+            evalNumericIdx.push_back(ranked[i].first);
+        }
+    }
 
     const auto representativeByFeature = buildInformationClusters(data, evalNumericIdx, statsCache, importanceByIndex);
     const auto structuralRelations = detectStructuralRelations(data, evalNumericIdx);
@@ -1805,8 +1834,8 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         evalRankStats[pos] = Statistics::calculateStats(evalRanks[pos]);
     }
 
-    std::vector<double> pearsonMatrix(evalCount * evalCount, 0.0);
-    std::vector<double> spearmanMatrix(evalCount * evalCount, 0.0);
+    std::vector<float> pearsonMatrix(evalCount * evalCount, 0.0f);
+    std::vector<float> spearmanMatrix(evalCount * evalCount, 0.0f);
     if (n > 1 && evalCount > 0) {
         MathUtils::Matrix standardized(n, evalCount);
         MathUtils::Matrix rankStandardized(n, evalCount);
@@ -1832,14 +1861,14 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         const double denom = static_cast<double>(n - 1);
         for (size_t i = 0; i < evalCount; ++i) {
             for (size_t j = 0; j < evalCount; ++j) {
-                pearsonMatrix[pairSlot(i, j)] = pearsonCov.at(i, j) / denom;
-                spearmanMatrix[pairSlot(i, j)] = spearmanCov.at(i, j) / denom;
+                pearsonMatrix[pairSlot(i, j)] = static_cast<float>(pearsonCov.at(i, j) / denom);
+                spearmanMatrix[pairSlot(i, j)] = static_cast<float>(spearmanCov.at(i, j) / denom);
             }
         }
     } else {
         for (size_t i = 0; i < evalCount; ++i) {
-            pearsonMatrix[pairSlot(i, i)] = 1.0;
-            spearmanMatrix[pairSlot(i, i)] = 1.0;
+            pearsonMatrix[pairSlot(i, i)] = 1.0f;
+            spearmanMatrix[pairSlot(i, i)] = 1.0f;
         }
     }
 
@@ -1854,7 +1883,7 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             p.idxB = ib;
             p.featureA = data.columns()[ia].name;
             p.featureB = data.columns()[ib].name;
-            p.r = pearsonMatrix[pairSlot(aPos, bPos)];
+            p.r = static_cast<double>(pearsonMatrix[pairSlot(aPos, bPos)]);
             p.spearman = 0.0;
             p.kendallTau = 0.0;
             p.r2 = p.r * p.r;
@@ -1870,8 +1899,8 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
 
             const double absR = std::abs(p.r);
             if (p.statSignificant || absR >= 0.20) {
-                p.spearman = spearmanMatrix[pairSlot(aPos, bPos)];
-                if (va.size() <= 1200) {
+                p.spearman = static_cast<double>(spearmanMatrix[pairSlot(aPos, bPos)]);
+                if (va.size() <= 256) {
                     p.kendallTau = MathUtils::calculateKendallTau(va, vb).value_or(0.0);
                 } else {
                     const double rho = std::clamp(p.spearman, -1.0, 1.0);
@@ -1965,6 +1994,8 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     };
 
     if (verbose) {
+        const size_t reservePairs = evalNumericIdx.size() < 2 ? 0 : (evalNumericIdx.size() * (evalNumericIdx.size() - 1)) / 2;
+        pairs.reserve(reservePairs);
         for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
             appendPairsForRange(aPos, aPos + 1, pairs, true);
             printProgressBar("pair-generation", aPos + 1, evalNumericIdx.size());
@@ -1973,6 +2004,9 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         #ifdef USE_OPENMP
         const int threadCount = std::max(1, omp_get_max_threads());
         std::vector<std::vector<PairInsight>> threadPairs(static_cast<size_t>(threadCount));
+        const size_t reservePairs = evalNumericIdx.size() < 2 ? 0 : (evalNumericIdx.size() * (evalNumericIdx.size() - 1)) / 2;
+        const size_t reservePerThread = reservePairs / static_cast<size_t>(threadCount) + 16;
+        for (auto& local : threadPairs) local.reserve(reservePerThread);
 
         #pragma omp parallel default(none) shared(threadPairs, evalNumericIdx, appendPairsForRange)
         {

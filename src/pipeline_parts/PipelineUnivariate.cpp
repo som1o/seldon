@@ -3134,37 +3134,52 @@ void exportPreprocessedDatasetIfRequested(const TypedDataset& data, const AutoCo
         : runCfg.exportPreprocessedPath;
     const std::string csvPath = basePath + ".csv";
 
-    std::ofstream out(csvPath);
+    std::ofstream out(csvPath, std::ios::binary);
     if (!out) {
         throw Seldon::IOException("Unable to write preprocessed export: " + csvPath);
     }
+    std::vector<char> ioBuffer(1 << 20, '\0');
+    out.rdbuf()->pubsetbuf(ioBuffer.data(), static_cast<std::streamsize>(ioBuffer.size()));
 
-    for (size_t c = 0; c < data.columns().size(); ++c) {
+    const auto& cols = data.columns();
+    const size_t colCount = cols.size();
+
+    for (size_t c = 0; c < colCount; ++c) {
         if (c) out << ',';
-        out << '"' << data.columns()[c].name << '"';
+        out << '"' << cols[c].name << '"';
     }
     out << '\n';
 
+    std::string chunk;
+    chunk.reserve(1 << 20);
     for (size_t r = 0; r < data.rowCount(); ++r) {
-        for (size_t c = 0; c < data.columns().size(); ++c) {
-            if (c) out << ',';
-            if (data.columns()[c].missing[r]) {
-                out << "";
+        for (size_t c = 0; c < colCount; ++c) {
+            if (c) chunk.push_back(',');
+            if (cols[c].missing[r]) {
                 continue;
             }
-            if (data.columns()[c].type == ColumnType::NUMERIC) {
-                const auto& vals = std::get<std::vector<double>>(data.columns()[c].values);
-                out << vals[r];
-            } else if (data.columns()[c].type == ColumnType::DATETIME) {
-                const auto& vals = std::get<std::vector<int64_t>>(data.columns()[c].values);
-                out << vals[r];
+            if (cols[c].type == ColumnType::NUMERIC) {
+                const auto& vals = std::get<std::vector<double>>(cols[c].values);
+                chunk += std::to_string(vals[r]);
+            } else if (cols[c].type == ColumnType::DATETIME) {
+                const auto& vals = std::get<std::vector<int64_t>>(cols[c].values);
+                chunk += std::to_string(vals[r]);
             } else {
-                std::string s = std::get<std::vector<std::string>>(data.columns()[c].values)[r];
+                std::string s = std::get<std::vector<std::string>>(cols[c].values)[r];
                 std::replace(s.begin(), s.end(), '"', '\'');
-                out << '"' << s << '"';
+                chunk.push_back('"');
+                chunk += s;
+                chunk.push_back('"');
             }
         }
-        out << '\n';
+        chunk.push_back('\n');
+        if (chunk.size() >= (1 << 20)) {
+            out.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+            chunk.clear();
+        }
+    }
+    if (!chunk.empty()) {
+        out.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
     }
 
     if (runCfg.exportPreprocessed == "parquet") {

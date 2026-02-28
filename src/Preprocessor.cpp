@@ -1733,6 +1733,9 @@ std::vector<bool> detectOutliersLofObserved(const NumVec& values,
 
     std::vector<std::vector<size_t>> knn(n);
     std::vector<double> kDistance(n, 0.0);
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
     for (size_t obs = 0; obs < n; ++obs) {
         const size_t centerPos = pos[obs];
         size_t left = centerPos;
@@ -1772,6 +1775,9 @@ std::vector<bool> detectOutliersLofObserved(const NumVec& values,
     }
 
     std::vector<double> lrd(n, 0.0);
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
     for (size_t obs = 0; obs < n; ++obs) {
         double reachSum = 0.0;
         for (size_t neighbor : knn[obs]) {
@@ -1785,6 +1791,9 @@ std::vector<bool> detectOutliersLofObserved(const NumVec& values,
         }
     }
 
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
     for (size_t obs = 0; obs < n; ++obs) {
         if (lrd[obs] <= kNumericEpsilon) continue;
         double ratioSum = 0.0;
@@ -1823,7 +1832,10 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
 
     // Outlier flags are computed from observed raw numeric values before imputation.
     std::unordered_map<std::string, std::vector<bool>> detectedFlags;
-    const std::string selectedOutlierMethod = CommonUtils::toLower(config.outlierMethod);
+    std::string selectedOutlierMethod = CommonUtils::toLower(config.outlierMethod);
+    if (config.lowMemoryMode && (selectedOutlierMethod == "lof" || selectedOutlierMethod == "lof_fallback_modified_zscore")) {
+        selectedOutlierMethod = "iqr";
+    }
     for (const auto& col : data.columns()) {
         if (col.type != ColumnType::NUMERIC) continue;
         const auto& values = std::get<NumVec>(col.values);
@@ -1863,6 +1875,13 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
         if (it != config.columnImputation.end()) strategies[colIdx] = it->second;
         validateImputationStrategy(strategies[colIdx], col.type, col.name);
         normalizedStrategies[colIdx] = CommonUtils::toLower(strategies[colIdx]);
+        if (config.lowMemoryMode &&
+            (normalizedStrategies[colIdx] == "knn" ||
+             normalizedStrategies[colIdx] == "mice" ||
+             normalizedStrategies[colIdx] == "matrix_completion")) {
+            normalizedStrategies[colIdx] = "mean";
+            strategies[colIdx] = "mean";
+        }
     }
 
     const std::vector<size_t> numericCols = data.numericColumnIndices();

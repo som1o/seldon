@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.10)
 project(Seldon VERSION 0.1.0 LANGUAGES CXX)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -17,7 +21,9 @@ option(SELDON_ENABLE_OPENCL "Enable OpenCL backend hooks when OpenCL is availabl
 option(SELDON_ENABLE_CUDA "Build optional CUDA-enabled binary target when CUDA toolkit is available" OFF)
 option(SELDON_ENABLE_NATIVE_ARCH "Enable -march=native for CPU-specific optimization" ON)
 option(SELDON_ENABLE_FAST_MATH "Enable -ffast-math for faster floating-point kernels" OFF)
-option(SELDON_ENABLE_LTO "Enable interprocedural optimization (LTO/IPO)" OFF)
+option(SELDON_ENABLE_LTO "Enable interprocedural optimization (LTO/IPO)" ON)
+option(SELDON_ENABLE_PGO_GENERATE "Build with -fprofile-generate instrumentation" OFF)
+option(SELDON_ENABLE_PGO_USE "Build with -fprofile-use profile feedback" OFF)
 option(SELDON_ENABLE_GUI "Build GTK4 desktop dashboard interface" ON)
 
 if(SELDON_ENABLE_GUI)
@@ -34,12 +40,28 @@ if(SELDON_ENABLE_NATIVE_ARCH)
     target_compile_options(seldon PRIVATE -march=native)
 endif()
 
+target_compile_options(seldon PRIVATE
+    $<$<CONFIG:Release>:-O3>
+)
+
 if(SELDON_ENABLE_FAST_MATH)
     target_compile_options(seldon PRIVATE -ffast-math)
 endif()
 
 if(SELDON_ENABLE_LTO)
     set_property(TARGET seldon PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+
+if(SELDON_ENABLE_PGO_GENERATE AND SELDON_ENABLE_PGO_USE)
+    message(FATAL_ERROR "SELDON_ENABLE_PGO_GENERATE and SELDON_ENABLE_PGO_USE are mutually exclusive")
+endif()
+
+if(SELDON_ENABLE_PGO_GENERATE)
+    target_compile_options(seldon PRIVATE -fprofile-generate)
+    target_link_options(seldon PRIVATE -fprofile-generate)
+elseif(SELDON_ENABLE_PGO_USE)
+    target_compile_options(seldon PRIVATE -fprofile-use -fprofile-correction)
+    target_link_options(seldon PRIVATE -fprofile-use -fprofile-correction)
 endif()
 
 if(SELDON_NEURAL_FLOAT32)
@@ -97,6 +119,16 @@ if(SELDON_ENABLE_CUDA)
         endif()
         if(SELDON_ENABLE_LTO)
             set_property(TARGET seldon_cuda PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        endif()
+        target_compile_options(seldon_cuda PRIVATE
+            $<$<CONFIG:Release>:-O3>
+        )
+        if(SELDON_ENABLE_PGO_GENERATE)
+            target_compile_options(seldon_cuda PRIVATE -fprofile-generate)
+            target_link_options(seldon_cuda PRIVATE -fprofile-generate)
+        elseif(SELDON_ENABLE_PGO_USE)
+            target_compile_options(seldon_cuda PRIVATE -fprofile-use -fprofile-correction)
+            target_link_options(seldon_cuda PRIVATE -fprofile-use -fprofile-correction)
         endif()
         message(STATUS "Seldon: CUDA target enabled (binary: seldon_cuda)")
     else()

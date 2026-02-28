@@ -127,6 +127,10 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     const bool autoFastMode = (data.rowCount() > 100000) || (data.numericColumnIndices().size() > 50);
     const bool fastModeEnabled = runCfg.fastMode || autoFastMode;
+    if (data.rowCount() > 100000) {
+        runCfg.neuralStreamingMode = true;
+        runCfg.neuralStreamingChunkRows = std::max<size_t>(runCfg.neuralStreamingChunkRows, 2048);
+    }
     if (fastModeEnabled && CommonUtils::toLower(runCfg.neuralStrategy) == "auto") {
         runCfg.neuralStrategy = "fast";
     }

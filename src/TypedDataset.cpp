@@ -14,8 +14,12 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <spawn.h>
 #include <sstream>
+#include <streambuf>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -26,6 +30,65 @@ TypedDataset::TypedDataset(std::string filename, char delimiter)
     : filename_(std::move(filename)), delimiter_(delimiter) {}
 
 namespace {
+class MemoryViewStreamBuf : public std::streambuf {
+public:
+    MemoryViewStreamBuf(const char* data, size_t size) {
+        char* begin = const_cast<char*>(data);
+        setg(begin, begin, begin + static_cast<std::ptrdiff_t>(size));
+    }
+};
+
+class MemoryViewIStream : public std::istream {
+public:
+    MemoryViewIStream(const char* data, size_t size)
+        : std::istream(nullptr), buffer_(data, size) {
+        rdbuf(&buffer_);
+    }
+
+private:
+    MemoryViewStreamBuf buffer_;
+};
+
+class MappedFileView {
+public:
+    ~MappedFileView() {
+        if (data_ != MAP_FAILED && data_ != nullptr && size_ > 0) {
+            ::munmap(data_, size_);
+        }
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+
+    bool map(const std::string& path) {
+        fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd_ < 0) return false;
+
+        struct stat st {};
+        if (::fstat(fd_, &st) != 0 || st.st_size <= 0 || !S_ISREG(st.st_mode)) {
+            return false;
+        }
+
+        size_ = static_cast<size_t>(st.st_size);
+        data_ = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        if (data_ == MAP_FAILED || data_ == nullptr) {
+            data_ = MAP_FAILED;
+            size_ = 0;
+            return false;
+        }
+        return true;
+    }
+
+    bool valid() const { return data_ != MAP_FAILED && data_ != nullptr && size_ > 0; }
+    const char* data() const { return valid() ? static_cast<const char*>(data_) : nullptr; }
+    size_t size() const { return size_; }
+
+private:
+    int fd_ = -1;
+    void* data_ = MAP_FAILED;
+    size_t size_ = 0;
+};
+
 class TempFile {
 public:
     TempFile() = default;
@@ -721,14 +784,23 @@ void TypedDataset::load() {
     auto [resolvedPath, isTemporary] = resolveDatasetInputPath(filename_);
     TempFile tempGuard(resolvedPath, isTemporary);
 
-    std::ifstream in(resolvedPath, std::ios::binary);
-    if (!in) throw Seldon::IOException("Could not open file: " + resolvedPath);
+    MappedFileView mappedFile;
+    const bool mapped = mappedFile.map(resolvedPath);
+    auto makeInputStream = [&]() -> std::unique_ptr<std::istream> {
+        if (mapped && mappedFile.valid()) {
+            return std::make_unique<MemoryViewIStream>(mappedFile.data(), mappedFile.size());
+        }
+        auto fileIn = std::make_unique<std::ifstream>(resolvedPath, std::ios::binary);
+        if (!(*fileIn)) throw Seldon::IOException("Could not open file: " + resolvedPath);
+        return fileIn;
+    };
 
-    CSVUtils::skipBOM(in);
+    auto in = makeInputStream();
+    CSVUtils::skipBOM(*in);
 
     bool malformed = false;
     bool parseLimitExceeded = false;
-    auto header = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+    auto header = CSVUtils::parseCSVLine(*in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
     if (parseLimitExceeded) {
         throw Seldon::DatasetException("CSV header exceeds parser safety limits");
     }
@@ -936,8 +1008,8 @@ void TypedDataset::load() {
 
     std::vector<double> runningSums(header.size(), 0.0);
 
-    CSVUtils::CSVChunkReader firstPassReader(in, delimiter_, parseLimits);
-    while (in.peek() != EOF) {
+    CSVUtils::CSVChunkReader firstPassReader(*in, delimiter_, parseLimits);
+    while (in->peek() != EOF) {
         auto chunk = firstPassReader.readChunk(8192, &malformed, &parseLimitExceeded);
         if (parseLimitExceeded) {
             throw Seldon::DatasetException("CSV record exceeds parser safety limits");
@@ -1030,13 +1102,20 @@ void TypedDataset::load() {
 
     std::vector<size_t> datetimeObserved(columns_.size(), 0);
     std::vector<size_t> datetimeParseFailures(columns_.size(), 0);
+    std::unordered_map<size_t, std::vector<std::string>> datetimeRawValues;
+    datetimeRawValues.reserve(columns_.size());
+    for (size_t c = 0; c < columns_.size(); ++c) {
+        if (forcedTypeMask[c]) continue;
+        if (columns_[c].type == ColumnType::DATETIME) {
+            datetimeRawValues.emplace(c, std::vector<std::string>(rowCount_));
+        }
+    }
 
-    in.clear();
-    in.seekg(0, std::ios::beg);
-    CSVUtils::skipBOM(in);
+    in = makeInputStream();
+    CSVUtils::skipBOM(*in);
     malformed = false;
     parseLimitExceeded = false;
-    auto headerSecondPass = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
+    auto headerSecondPass = CSVUtils::parseCSVLine(*in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
     if (parseLimitExceeded) {
         throw Seldon::DatasetException("CSV header exceeds parser safety limits");
     }
@@ -1045,8 +1124,8 @@ void TypedDataset::load() {
     size_t r = 0;
     size_t decisionIdx = 0;
     std::fill(runningSums.begin(), runningSums.end(), 0.0);
-    CSVUtils::CSVChunkReader secondPassReader(in, delimiter_, parseLimits);
-    while (in.peek() != EOF) {
+    CSVUtils::CSVChunkReader secondPassReader(*in, delimiter_, parseLimits);
+    while (in->peek() != EOF) {
         auto chunk = secondPassReader.readChunk(8192, &malformed, &parseLimitExceeded);
         if (parseLimitExceeded) {
             throw Seldon::DatasetException("CSV record exceeds parser safety limits");
@@ -1085,8 +1164,13 @@ void TypedDataset::load() {
                 } else if (columns_[c].type == ColumnType::DATETIME) {
                     auto& datetimeValues = std::get<std::vector<int64_t>>(columns_[c].values);
                     int64_t ts = 0;
+                    const std::string trimmed = CommonUtils::trim(s);
+                    auto rawIt = datetimeRawValues.find(c);
+                    if (rawIt != datetimeRawValues.end() && r < rawIt->second.size()) {
+                        rawIt->second[r] = trimmed;
+                    }
                     datetimeObserved[c]++;
-                    if (parseDateTime(s, ts)) {
+                    if (parseDateTime(trimmed, ts)) {
                         datetimeValues[r] = ts;
                     } else {
                         datetimeParseFailures[c]++;
@@ -1131,61 +1215,21 @@ void TypedDataset::load() {
         return;
     }
 
-    std::vector<uint8_t> fallbackMask(columns_.size(), static_cast<uint8_t>(0));
-    for (size_t idx : datetimeFallbackCols) {
-        fallbackMask[idx] = static_cast<uint8_t>(1);
-    }
-
-    in.clear();
-    in.seekg(0, std::ios::beg);
-    CSVUtils::skipBOM(in);
-    malformed = false;
-    parseLimitExceeded = false;
-    auto headerThirdPass = CSVUtils::parseCSVLine(in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
-    if (parseLimitExceeded) {
-        throw Seldon::DatasetException("CSV header exceeds parser safety limits");
-    }
-    if (malformed || headerThirdPass.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
-
-    size_t rowIdx = 0;
-    size_t fallbackDecisionIdx = 0;
-    std::fill(runningSums.begin(), runningSums.end(), 0.0);
-    CSVUtils::CSVChunkReader thirdPassReader(in, delimiter_, parseLimits);
-    while (in.peek() != EOF) {
-        auto chunk = thirdPassReader.readChunk(8192, &malformed, &parseLimitExceeded);
-        if (parseLimitExceeded) {
-            throw Seldon::DatasetException("CSV record exceeds parser safety limits");
-        }
-        if (chunk.empty()) break;
-        for (auto& row : chunk) {
-            if (row.empty() || isSkippableControlRow(row)) continue;
-            reconcileRowWidth(row);
-            repairDateShiftedRow(row);
-            bool accepted = true;
-            if (fallbackDecisionIdx < acceptedRowMask.size()) {
-                accepted = (acceptedRowMask[fallbackDecisionIdx] != 0);
+    for (size_t c : datetimeFallbackCols) {
+        auto rawIt = datetimeRawValues.find(c);
+        if (rawIt == datetimeRawValues.end()) continue;
+        auto& categoricalValues = std::get<std::vector<std::string>>(columns_[c].values);
+        const auto& raw = rawIt->second;
+        const size_t limit = std::min(raw.size(), rowCount_);
+        for (size_t rowIdx = 0; rowIdx < limit; ++rowIdx) {
+            const std::string& s = raw[rowIdx];
+            if (isMissingToken(s) || s.empty()) {
+                columns_[c].missing[rowIdx] = static_cast<uint8_t>(1);
+                categoricalValues[rowIdx].clear();
             } else {
-                accepted = !isLikelyMetadataRow(row, runningSums, rowIdx);
+                columns_[c].missing[rowIdx] = static_cast<uint8_t>(0);
+                categoricalValues[rowIdx] = s;
             }
-            ++fallbackDecisionIdx;
-            if (!accepted) continue;
-            if (rowIdx >= rowCount_) break;
-
-            const size_t cols = std::min(row.size(), header.size());
-            for (size_t c = 0; c < header.size(); ++c) {
-                if (!fallbackMask[c]) continue;
-                auto& categoricalValues = std::get<std::vector<std::string>>(columns_[c].values);
-                std::string s = (c < cols) ? CommonUtils::trim(row[c]) : std::string();
-                if (isMissingToken(s) || s.empty()) {
-                    columns_[c].missing[rowIdx] = static_cast<uint8_t>(1);
-                    categoricalValues[rowIdx].clear();
-                } else {
-                    columns_[c].missing[rowIdx] = static_cast<uint8_t>(0);
-                    categoricalValues[rowIdx] = s;
-                }
-            }
-            updateRunningSums(row, runningSums);
-            ++rowIdx;
         }
     }
 

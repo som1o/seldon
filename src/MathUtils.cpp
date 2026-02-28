@@ -535,14 +535,28 @@ MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>&
     out.max = *std::max_element(finiteValues.begin(), finiteValues.end());
     out.range = out.max - out.min;
 
-    out.q1 = CommonUtils::quantileByNth(finiteValues, 0.25);
-    out.q3 = CommonUtils::quantileByNth(finiteValues, 0.75);
-    out.iqr = out.q3 - out.q1;
-    out.p05 = CommonUtils::quantileByNth(finiteValues, 0.05);
-    out.p95 = CommonUtils::quantileByNth(finiteValues, 0.95);
+    auto buildQuantileInput = [&](const std::vector<double>& source) {
+        constexpr size_t kApproxQuantileSample = 8192;
+        if (source.size() <= kApproxQuantileSample) return source;
+        std::vector<double> sampled;
+        sampled.reserve(kApproxQuantileSample);
+        const size_t step = std::max<size_t>(1, source.size() / kApproxQuantileSample);
+        for (size_t i = 0; i < source.size() && sampled.size() < kApproxQuantileSample; i += step) {
+            sampled.push_back(source[i]);
+        }
+        return sampled;
+    };
 
-    std::vector<double> absDev(finiteValues.size(), 0.0);
-    std::vector<double> sorted = finiteValues;
+    const std::vector<double> quantileInput = buildQuantileInput(finiteValues);
+
+    out.q1 = CommonUtils::quantileByNth(quantileInput, 0.25);
+    out.q3 = CommonUtils::quantileByNth(quantileInput, 0.75);
+    out.iqr = out.q3 - out.q1;
+    out.p05 = CommonUtils::quantileByNth(quantileInput, 0.05);
+    out.p95 = CommonUtils::quantileByNth(quantileInput, 0.95);
+
+    std::vector<double> absDev(quantileInput.size(), 0.0);
+    std::vector<double> sorted = quantileInput;
     std::sort(sorted.begin(), sorted.end());
     const size_t trimN = static_cast<size_t>(std::floor(trimQ * static_cast<double>(sorted.size())));
     const size_t keepStart = std::min(trimN, sorted.size());
@@ -575,8 +589,11 @@ MathUtils::NumericSummary MathUtils::summarizeNumeric(const std::vector<double>&
     size_t positiveCount = 0;
     double logSum = 0.0;
     double invSum = 0.0;
+    for (size_t i = 0; i < quantileInput.size(); ++i) {
+        absDev[i] = std::abs(quantileInput[i] - out.median);
+    }
+
     for (size_t i = 0; i < finiteValues.size(); ++i) {
-        absDev[i] = std::abs(finiteValues[i] - out.median);
         out.sum += finiteValues[i];
         if (std::abs(finiteValues[i]) > 1e-12) out.nonZero++;
         if (finiteValues[i] < 0.0) {

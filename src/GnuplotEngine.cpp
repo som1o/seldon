@@ -808,6 +808,11 @@ bool GnuplotEngine::isAvailable() const {
 }
 
 std::string GnuplotEngine::runScript(const std::string& id, const std::string& dataContent, const std::string& scriptContent) {
+    static const std::string gnuplotExeCached = findExecutableInPath("gnuplot");
+    if (gnuplotExeCached.empty()) {
+        return "";
+    }
+
     const std::string safeId = sanitizeId(id);
     const std::string dataFile = assetsDir_ + "/" + safeId + ".dat";
     const std::string scriptFile = assetsDir_ + "/" + safeId + ".plt";
@@ -835,23 +840,23 @@ std::string GnuplotEngine::runScript(const std::string& id, const std::string& d
         }
     }
 
-    std::ofstream dout(dataFile);
+    std::ofstream dout(dataFile, std::ios::binary);
     if (!dout) return "";
+    std::vector<char> dBuf(256 * 1024, '\0');
+    dout.rdbuf()->pubsetbuf(dBuf.data(), static_cast<std::streamsize>(dBuf.size()));
     dout << dataContent;
     if (!dout.good()) return "";
     dout.close();
 
-    std::ofstream sout(scriptFile);
+    std::ofstream sout(scriptFile, std::ios::binary);
     if (!sout) return "";
+    std::vector<char> sBuf(64 * 1024, '\0');
+    sout.rdbuf()->pubsetbuf(sBuf.data(), static_cast<std::streamsize>(sBuf.size()));
     sout << scriptContent;
     if (!sout.good()) return "";
     sout.close();
 
-    const std::string gnuplotExe = findExecutableInPath("gnuplot");
-    if (gnuplotExe.empty()) {
-        return "";
-    }
-    const int rc = spawnGnuplot(gnuplotExe, scriptFile, errFile);
+    const int rc = spawnGnuplot(gnuplotExeCached, scriptFile, errFile);
 
     std::error_code ec;
     std::filesystem::remove(dataFile, ec);
