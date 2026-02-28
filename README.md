@@ -65,16 +65,39 @@ If not found, Seldon builds normally without OpenCL acceleration hooks.
 
 ## 4) Run
 
+### 4.0 GUI Dashboard (default)
+
+Seldon now launches a GTK4 desktop dashboard by default:
+
+```bash
+./build/seldon
+```
+
+The dashboard exposes core pipeline controls in dedicated tabs and includes:
+
+- `Extra CLI flags` input (supports any existing CLI switch),
+- `Config overlay` input (supports any config key via `key: value` lines),
+
+so every CLI/config capability remains accessible from the GUI.
+
+### 4.0.1 CLI fallback mode
+
+Use CLI mode explicitly with:
+
+```bash
+./build/seldon --cli /path/to/data.csv [other flags]
+```
+
 ### 4.1 Minimal
 
 ```bash
-./build/seldon /path/to/data.csv
+./build/seldon --cli /path/to/data.csv
 ```
 
 ### 4.2 Custom output + report paths
 
 ```bash
-./build/seldon /path/to/data.csv \
+./build/seldon --cli /path/to/data.csv \
   --output-dir /tmp/seldon_out \
   --report custom_neural_report.md \
   --assets-dir custom_assets
@@ -90,7 +113,7 @@ Notes:
 ### 4.3 With config file
 
 ```bash
-./build/seldon /path/to/data.csv --config config.json
+./build/seldon --cli /path/to/data.csv --config config.json
 ```
 
 ---

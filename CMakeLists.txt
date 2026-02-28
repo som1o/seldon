@@ -18,6 +18,17 @@ option(SELDON_ENABLE_CUDA "Build optional CUDA-enabled binary target when CUDA t
 option(SELDON_ENABLE_NATIVE_ARCH "Enable -march=native for CPU-specific optimization" ON)
 option(SELDON_ENABLE_FAST_MATH "Enable -ffast-math for faster floating-point kernels" OFF)
 option(SELDON_ENABLE_LTO "Enable interprocedural optimization (LTO/IPO)" OFF)
+option(SELDON_ENABLE_GUI "Build GTK4 desktop dashboard interface" ON)
+
+if(SELDON_ENABLE_GUI)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
+    target_link_libraries(seldon PRIVATE PkgConfig::GTK4)
+    target_compile_definitions(seldon PRIVATE SELDON_ENABLE_GUI)
+    message(STATUS "Seldon: GTK4 GUI enabled")
+else()
+    message(STATUS "Seldon: GUI disabled (SELDON_ENABLE_GUI=OFF); CLI-only mode")
+endif()
 
 if(SELDON_ENABLE_NATIVE_ARCH)
     target_compile_options(seldon PRIVATE -march=native)

@@ -56,6 +56,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
     auto advance = [&](const std::string& label) {
         ++currentStep;
         progress.update(label, currentStep, totalSteps);
+        if (AutomationPipeline::onProgress)
+            AutomationPipeline::onProgress(label, static_cast<int>(currentStep),
+                                           static_cast<int>(totalSteps));
     };
 
     cleanupOutputs(runCfg);

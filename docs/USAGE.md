@@ -20,9 +20,24 @@ Expected configure output when available:
 
 ### 1.2 Run
 
+GUI (default):
+
 ```bash
-./build/seldon /path/to/data.csv
+./build/seldon
 ```
+
+CLI fallback:
+
+```bash
+./build/seldon --cli /path/to/data.csv
+```
+
+The GTK4 dashboard includes dedicated control tabs plus:
+
+- an `Extra CLI flags` editor for arbitrary CLI switches,
+- a `Config overlay` editor (`key: value` lines) for any config key.
+
+This keeps all existing CLI/config functionality available from the GUI.
 
 ---
 
@@ -50,7 +65,7 @@ Path rules:
 Example:
 
 ```bash
-./build/seldon data.csv \
+./build/seldon --cli data.csv \
   --output-dir /tmp/seldon_out \
   --report reports/model_card.md \
   --assets-dir viz
@@ -145,7 +160,7 @@ If CUDA is available, `seldon_cuda` is built in addition to `seldon`.
 ### 6.1 Full analysis with HTML export
 
 ```bash
-./build/seldon /data/input.csv \
+./build/seldon --cli /data/input.csv \
   --output-dir /tmp/seldon_output \
   --generate-html true \
   --verbose-analysis true
@@ -154,13 +169,13 @@ If CUDA is available, `seldon_cuda` is built in addition to `seldon`.
 ### 6.2 Fast iteration mode
 
 ```bash
-./build/seldon /data/input.csv --fast true --verbose-analysis false
+./build/seldon --cli /data/input.csv --fast true --verbose-analysis false
 ```
 
 ### 6.3 Low-memory execution
 
 ```bash
-./build/seldon /data/input.csv --low-memory true
+./build/seldon --cli /data/input.csv --low-memory true
 ```
 
 ---
