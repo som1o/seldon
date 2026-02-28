@@ -1031,7 +1031,8 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
 
     if (!configPath.empty()) {
         config = fromFile(configPath, config);
-        if (config.datasetPath.empty()) config.datasetPath = argv[1];
+        // Positional dataset argument is authoritative for this run.
+        config.datasetPath = argv[1];
     }
 
     applyProfile(config, config.profile);

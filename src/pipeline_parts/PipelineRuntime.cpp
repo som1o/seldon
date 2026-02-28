@@ -68,7 +68,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                 runCfg.tuning.betaFallbackIntervalsMax,
                                 runCfg.tuning.betaFallbackTolerance);
 
-    TypedDataset data(config.datasetPath, config.delimiter);
+    TypedDataset data(runCfg.datasetPath, runCfg.delimiter);
     if (runCfg.numericLocaleHint == "us") {
         data.setNumericSeparatorPolicy(TypedDataset::NumericSeparatorPolicy::US_THOUSANDS);
     } else if (runCfg.numericLocaleHint == "eu") {
@@ -543,6 +543,23 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                                 runCfg.tuning,
                                                 fastModeEnabled ? runCfg.fastMaxBivariatePairs : 0,
                                                 std::max<size_t>(8, std::min<size_t>(120, neuralApprovedNumericFeatures.size() * 6)));
+
+    size_t datasetMismatchSuppressedPairs = 0;
+    bivariatePairs.erase(std::remove_if(bivariatePairs.begin(), bivariatePairs.end(), [&](const PairInsight& p) {
+        if (p.idxA >= data.columns().size() || p.idxB >= data.columns().size()) {
+            ++datasetMismatchSuppressedPairs;
+            return true;
+        }
+        if (data.columns()[p.idxA].name != p.featureA || data.columns()[p.idxB].name != p.featureB) {
+            ++datasetMismatchSuppressedPairs;
+            return true;
+        }
+        return false;
+    }), bivariatePairs.end());
+    if (datasetMismatchSuppressedPairs > 0) {
+        std::cout << "[Seldon][Bivariate] Suppressed " << datasetMismatchSuppressedPairs
+                  << " pair rows with dataset-mismatched feature identifiers; run state was re-synchronized.\n";
+    }
 
     std::unordered_set<std::string> targetContaminatedNames;
     targetContaminatedNames.reserve(targetContaminationIndices.size());
