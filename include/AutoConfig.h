@@ -206,7 +206,7 @@ struct AutoConfig {
     std::unordered_map<std::string, std::string> columnImputation;
     std::unordered_map<std::string, std::string> columnTypeOverrides;
 
-    std::string outlierMethod = "iqr";      // iqr|zscore|modified_zscore|adjusted_boxplot|lof(heuristic modified-Z fallback)|lof_fallback_modified_zscore
+    std::string outlierMethod = "iqr";      // iqr|zscore|modified_zscore|adjusted_boxplot|lof|lof_fallback_modified_zscore(legacy alias to lof)
     std::string outlierAction = "flag";     // flag|remove|cap
 
     std::string scalingMethod = "auto";     // auto|zscore|minmax|none

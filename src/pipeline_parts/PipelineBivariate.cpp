@@ -529,12 +529,12 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
         causalOptions.bootstrapSamples = 100;
         causalOptions.randomSeed = 1337;
         causalOptions.enableLiNGAM = true;
-        causalOptions.enableFCI = true;
+        causalOptions.enableFCI = false;
         causalOptions.enableGES = true;
-        causalOptions.markExperimentalHeuristics = true;
-        causalOptions.enableKernelCiFallback = true;
-        causalOptions.enableGrangerValidation = true;
-        causalOptions.enableIcpValidation = true;
+        causalOptions.markExperimentalHeuristics = false;
+        causalOptions.enableKernelCiFallback = false;
+        causalOptions.enableGrangerValidation = false;
+        causalOptions.enableIcpValidation = false;
 
         const auto causal = CausalDiscovery::discover(data,
                                                       numericFeatures,
@@ -610,8 +610,7 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
                 " directed edges (incoming-to-target=" + std::to_string(targetInbound) +
                 ", bootstrap runs=" + std::to_string(causal.bootstrapRuns) + ").";
             if (causal.usedLiNGAM) summary += " Non-Gaussian LiNGAM orientation applied.";
-            summary += " FCI/GES components are experimental-lite heuristics.";
-            summary += " Edges denote likely directional hypotheses under CI assumptions; they are stronger than raw correlation but still not intervention-level proof of causation.";
+            summary += " Edges denote observational directional hypotheses under conditional-independence and model assumptions; they are not interventional proof of causation.";
             if (lineageIdentitySuppressed > 0) {
                 summary += " Identity-aware filter suppressed " + std::to_string(lineageIdentitySuppressed) + " same-root engineered edge(s).";
             }

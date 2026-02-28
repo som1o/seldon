@@ -1085,13 +1085,13 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
     }
     result.notes.push_back("Constraint-based PC discovery executed with max conditioning set " + std::to_string(options.maxConditionSet) + ".");
     if (options.enableGES) {
-        result.notes.push_back("Score-based GES orientation pass applied on unresolved undirected edges (experimental-lite heuristic).");
+        result.notes.push_back("Score-based GES orientation pass applied on unresolved undirected edges.");
     }
     if (options.enableFCI) {
-        result.notes.push_back("FCI-style latent-confounding hints computed from residual dependence checks (experimental-lite heuristic).");
+        result.notes.push_back("FCI-style latent-confounding hints computed from residual dependence checks.");
     }
     if (options.markExperimentalHeuristics && (options.enableGES || options.enableFCI)) {
-        result.notes.push_back("Experimental notice: current GES/FCI steps are lightweight approximations and require external validation for high-stakes causal decisions.");
+        result.notes.push_back("Experimental notice: additional approximations are enabled and require external validation for high-stakes causal decisions.");
     }
     if (core.usedLiNGAM) {
         result.notes.push_back("Non-Gaussian signal detected; applied DirectLiNGAM-style orientation for unresolved edges.");

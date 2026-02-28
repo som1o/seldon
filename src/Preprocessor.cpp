@@ -1520,29 +1520,106 @@ std::vector<bool> detectOutliersAdjustedBoxplotObserved(const NumVec& values, co
     return flags;
 }
 
-std::vector<bool> detectOutliersLofHeuristicFallbackObserved(const NumVec& values,
-                                                             const MissingMask& missing,
-                                                             const HeuristicTuningConfig& tuning) {
-    const double mzThreshold = std::max(tuning.lofFallbackModifiedZThreshold, tuning.lofThresholdFloor);
-    const std::vector<bool> mzFlags = detectOutliersModifiedZObserved(values, missing, mzThreshold);
-    const std::vector<bool> zFlags = detectOutliersZObserved(values,
-                                                             missing,
-                                                             std::max(tuning.outlierZThreshold, tuning.lofThresholdFloor));
-    const std::vector<bool> adjFlags = detectOutliersAdjustedBoxplotObserved(values,
-                                                                              missing,
-                                                                              std::max(1.2, tuning.outlierIqrMultiplier));
+std::vector<bool> detectOutliersLofObserved(const NumVec& values,
+                                            const MissingMask& missing,
+                                            const HeuristicTuningConfig& tuning) {
+    std::vector<bool> flags(values.size(), false);
 
-    std::vector<bool> combined(values.size(), false);
-    for (size_t i = 0; i < combined.size() && i < missing.size(); ++i) {
-        if (missing[i]) continue;
-        size_t votes = 0;
-        if (i < mzFlags.size() && mzFlags[i]) ++votes;
-        if (i < zFlags.size() && zFlags[i]) ++votes;
-        if (i < adjFlags.size() && adjFlags[i]) ++votes;
-        combined[i] = votes >= 2;
+    std::vector<double> observed;
+    std::vector<size_t> obsIdx;
+    observed.reserve(values.size());
+    obsIdx.reserve(values.size());
+    for (size_t i = 0; i < values.size() && i < missing.size(); ++i) {
+        if (missing[i] || !std::isfinite(values[i])) continue;
+        observed.push_back(values[i]);
+        obsIdx.push_back(i);
     }
 
-    return combined;
+    const size_t n = observed.size();
+    if (n < 6) return flags;
+
+    const size_t k = std::min<size_t>(20, n - 1);
+    const double lofThreshold = std::max(1.5, tuning.lofThresholdFloor);
+
+    std::vector<size_t> order(n);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        if (observed[a] == observed[b]) return a < b;
+        return observed[a] < observed[b];
+    });
+
+    std::vector<size_t> pos(n);
+    for (size_t rank = 0; rank < n; ++rank) {
+        pos[order[rank]] = rank;
+    }
+
+    std::vector<std::vector<size_t>> knn(n);
+    std::vector<double> kDistance(n, 0.0);
+    for (size_t obs = 0; obs < n; ++obs) {
+        const size_t centerPos = pos[obs];
+        size_t left = centerPos;
+        size_t right = centerPos + 1;
+        knn[obs].reserve(k);
+
+        while (knn[obs].size() < k) {
+            const bool leftAvailable = left > 0;
+            const bool rightAvailable = right < n;
+
+            if (!leftAvailable && !rightAvailable) break;
+
+            if (!rightAvailable) {
+                --left;
+                knn[obs].push_back(order[left]);
+            } else if (!leftAvailable) {
+                knn[obs].push_back(order[right]);
+                ++right;
+            } else {
+                const double dl = std::abs(observed[obs] - observed[order[left - 1]]);
+                const double dr = std::abs(observed[obs] - observed[order[right]]);
+                if (dl <= dr) {
+                    --left;
+                    knn[obs].push_back(order[left]);
+                } else {
+                    knn[obs].push_back(order[right]);
+                    ++right;
+                }
+            }
+        }
+
+        double kd = 0.0;
+        for (size_t neighbor : knn[obs]) {
+            kd = std::max(kd, std::abs(observed[obs] - observed[neighbor]));
+        }
+        kDistance[obs] = kd;
+    }
+
+    std::vector<double> lrd(n, 0.0);
+    for (size_t obs = 0; obs < n; ++obs) {
+        double reachSum = 0.0;
+        for (size_t neighbor : knn[obs]) {
+            const double dist = std::abs(observed[obs] - observed[neighbor]);
+            reachSum += std::max(kDistance[neighbor], dist);
+        }
+        if (reachSum <= kNumericEpsilon) {
+            lrd[obs] = 0.0;
+        } else {
+            lrd[obs] = static_cast<double>(knn[obs].size()) / reachSum;
+        }
+    }
+
+    for (size_t obs = 0; obs < n; ++obs) {
+        if (lrd[obs] <= kNumericEpsilon) continue;
+        double ratioSum = 0.0;
+        for (size_t neighbor : knn[obs]) {
+            ratioSum += lrd[neighbor] / lrd[obs];
+        }
+        const double lof = ratioSum / static_cast<double>(knn[obs].size());
+        if (lof > lofThreshold) {
+            flags[obsIdx[obs]] = true;
+        }
+    }
+
+    return flags;
 }
 
 void capOutliers(NumVec& values, const std::vector<bool>& flags) {
@@ -1569,10 +1646,6 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
     // Outlier flags are computed from observed raw numeric values before imputation.
     std::unordered_map<std::string, std::vector<bool>> detectedFlags;
     const std::string selectedOutlierMethod = CommonUtils::toLower(config.outlierMethod);
-    if ((selectedOutlierMethod == "lof" || selectedOutlierMethod == "lof_fallback_modified_zscore") && config.verboseAnalysis) {
-        std::cout << "[Seldon][Preprocessor] outlier_method='" << selectedOutlierMethod
-                  << "' uses a modified Z-score fallback heuristic (not a strict Local Outlier Factor implementation).\n";
-    }
     for (const auto& col : data.columns()) {
         if (col.type != ColumnType::NUMERIC) continue;
         const auto& values = std::get<NumVec>(col.values);
@@ -1583,8 +1656,8 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
             {"zscore", [&]() { return detectOutliersZObserved(values, col.missing, config.tuning.outlierZThreshold); }},
             {"modified_zscore", [&]() { return detectOutliersModifiedZObserved(values, col.missing, config.tuning.outlierZThreshold); }},
             {"adjusted_boxplot", [&]() { return detectOutliersAdjustedBoxplotObserved(values, col.missing, config.tuning.outlierIqrMultiplier); }},
-            {"lof", [&]() { return detectOutliersLofHeuristicFallbackObserved(values, col.missing, config.tuning); }},
-            {"lof_fallback_modified_zscore", [&]() { return detectOutliersLofHeuristicFallbackObserved(values, col.missing, config.tuning); }}
+            {"lof", [&]() { return detectOutliersLofObserved(values, col.missing, config.tuning); }},
+            {"lof_fallback_modified_zscore", [&]() { return detectOutliersLofObserved(values, col.missing, config.tuning); }}
         };
 
         const auto itFactory = outlierFactory.find(method);

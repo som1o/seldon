@@ -213,9 +213,9 @@ Optional HTML:
 
 ## 9) Heuristic Components and Interpretation
 
-Some Seldon modules are intentionally heuristic for runtime practicality. Treat these as discovery aids, not rigorous statistical proof.
+Seldon prioritizes strict statistical implementations for core analytical paths. Treat outputs as observational evidence, and apply formal inferential/experimental validation in high-stakes decisions.
 
-- Causal graph candidates are heuristic/constraint-guided and require domain validation.
-- `outlier_method=lof` (or `lof_fallback_modified_zscore`) uses a modified Z-score fallback heuristic rather than strict LOF.
+- Causal graph candidates use constraint/score-based observational methods and require domain/intervention validation for causal claims.
+- `outlier_method=lof` runs strict Local Outlier Factor; `lof_fallback_modified_zscore` is retained as a legacy alias to the same LOF path.
 
 For high-stakes use cases, validate findings with formal statistical or experimental methods.

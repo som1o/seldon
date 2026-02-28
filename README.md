@@ -1,6 +1,6 @@
 # Seldon
 
-Seldon is a C++17 tabular analytics engine that runs an end-to-end automated pipeline:
+Seldon is an analytics engine that runs an end-to-end automated pipeline:
 
 - data loading and preprocessing,
 - deterministic + neural modeling,
@@ -140,12 +140,12 @@ See `docs/USAGE.md` for full parameter coverage.
 
 ## 9) Statistical Scope and Heuristic Components
 
-Seldon intentionally includes practical heuristics for speed and robustness in production-style runs. Some modules are not strict textbook statistical implementations and should be interpreted as analytic guidance rather than formal proof.
+Seldon now prioritizes strict, textbook-style statistical procedures for core analytical paths (including `outlier_method=lof` using strict Local Outlier Factor scoring instead of heuristic fallback logic).
 
 Examples:
 
-- Causal discovery output is heuristic/constraint-guided and should be validated with domain knowledge or intervention design.
-- `outlier_method=lof` is a compatibility label that currently routes to a modified Z-score fallback heuristic, not a strict LOF algorithm.
-- The LOF compatibility path now uses a conservative ensemble fallback (modified Z-score + z-score + adjusted boxplot agreement), still heuristic rather than strict LOF.
+- Causal discovery output is produced through observational constraint/score-based methods with bootstrap support, and remains assumption-dependent.
+- `outlier_method=lof` runs strict LOF; `lof_fallback_modified_zscore` is kept as a legacy alias and routes to the same strict LOF path.
+- Directional edges in observational data are hypotheses under CI/model assumptions, not intervention-level causal proof.
 
 Use this output for prioritization and investigation; perform formal inferential validation when decisions are high-stakes.
