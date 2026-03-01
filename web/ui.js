@@ -29,13 +29,14 @@ export function showToast(message, type = 'info') {
   const container = el('toastContainer');
   const toast = document.createElement('div');
   const styles = type === 'error'
-    ? 'background:#1a0b0b; border-color:#7f1d1d; color:#fca5a5;'
+    ? 'background:rgba(204,51,51,0.12); border-color:rgba(204,51,51,0.40); color:#cc5555;'
     : type === 'success'
-      ? 'background:#0a1f18; border-color:#065f46; color:#6ee7b7;'
-      : 'background:#13161e; border-color:#2a3347; color:#cbd5e1;';
+      ? 'background:rgba(26,158,90,0.10); border-color:rgba(26,158,90,0.40); color:#1fa864;'
+      : 'background:rgba(8,10,18,0.90); border-color:rgba(255,255,255,0.10); color:#6b7485;';
   toast.setAttribute('style',
-    `border:1px solid; padding:8px 14px; font-size:12px; font-weight:500;
-     font-family:'Inter',sans-serif; pointer-events:none; max-width:320px; ${styles}`);
+    `border:1px solid; padding:6px 11px; font-size:12px; font-weight:500;
+     font-family:'Inter',sans-serif; pointer-events:none; max-width:300px;
+     backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px); ${styles}`);
   toast.textContent = message;
   container.appendChild(toast);
   setTimeout(() => {
@@ -46,11 +47,22 @@ export function showToast(message, type = 'info') {
 export function setWsStatus(text, mode) {
   el('wsStatus').textContent = `WS: ${text}`;
   const dot = el('wsStatusDot');
-  const color = mode === 'connected' ? '#34d399'
-    : mode === 'error' ? '#f87171'
-    : '#fbbf24';
+  const liveIndicator = el('wsLiveIndicator');
+  const color = mode === 'connected' ? '#1a9e5a'
+    : mode === 'error' ? '#cc3333'
+    : '#d4820a';
+  const glow = mode === 'connected' ? 'rgba(26,158,90,0.55)'
+    : mode === 'error' ? 'rgba(204,51,51,0.55)'
+    : 'rgba(212,130,10,0.55)';
   dot.style.background = color;
-  dot.style.boxShadow = `0 0 5px ${color}`;
+  dot.style.color = color;
+  dot.style.boxShadow = `0 0 6px 1px ${glow}`;
+  dot.classList.toggle('ws-live', mode === 'connected');
+  if (liveIndicator) {
+    liveIndicator.textContent = mode === 'connected' ? 'LIVE' : mode === 'error' ? 'ERR' : 'IDLE';
+    liveIndicator.style.color = color;
+    liveIndicator.style.textShadow = mode === 'connected' ? `0 0 6px ${glow}` : 'none';
+  }
 }
 
 export function setButtonLoading(button, loading, loadingText) {
@@ -151,54 +163,50 @@ export function renderAnalyses(analyses, { onOpen, onDelete, onDownload }) {
 
     const idTd = document.createElement('td');
     idTd.className = 'mono';
-    idTd.style.cssText = 'font-size:11px; padding:4px 10px; border-bottom:1px solid var(--c-border); border-right:1px solid var(--c-border); color:var(--c-cyan); max-width:110px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+    idTd.style.cssText = 'font-size:11px; padding:3px 8px; border-bottom:1px solid var(--c-border); border-right:1px solid var(--c-border); color:var(--c-cyan); max-width:110px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
     idTd.textContent = analysis.id;
     idTd.title = analysis.id;
 
     const statusTd = document.createElement('td');
-    statusTd.style.cssText = 'font-size:12px; padding:4px 10px; border-bottom:1px solid var(--c-border); border-right:1px solid var(--c-border); color:var(--c-dim);';
+    statusTd.style.cssText = 'font-size:12px; padding:3px 8px; border-bottom:1px solid var(--c-border); border-right:1px solid var(--c-border); color:var(--c-dim);';
     const statusLower = String(analysis.status || '').toLowerCase();
-    const statusColor = statusLower === 'completed' ? 'var(--c-green)'
-      : statusLower === 'running' ? 'var(--c-cyan)'
-      : statusLower === 'failed' ? 'var(--c-red)'
+    const statusColor = statusLower === 'completed' ? '#1a9e5a'
+      : statusLower === 'running' ? '#e8940a'
+      : statusLower === 'failed' ? '#cc3333'
       : 'var(--c-dim)';
     statusTd.innerHTML = `<span style="color:${statusColor};font-weight:500;">${analysis.status}</span>`;
 
     const stepTd = document.createElement('td');
     stepTd.className = 'mono';
-    stepTd.style.cssText = 'font-size:11px; padding:4px 10px; border-bottom:1px solid var(--c-border); border-right:1px solid var(--c-border); color:var(--c-muted);';
+    stepTd.style.cssText = 'font-size:11px; padding:3px 8px; border-bottom:1px solid var(--c-border); border-right:1px solid var(--c-border); color:var(--c-muted);';
     const isCompleted = statusLower === 'completed' &&
       Number(analysis.total_steps) > 0 &&
       Number(analysis.step) >= Number(analysis.total_steps);
     stepTd.textContent = isCompleted ? '—' : `${analysis.step}/${analysis.total_steps}`;
 
     const actionsTd = document.createElement('td');
-    actionsTd.style.cssText = 'padding:4px 8px; border-bottom:1px solid var(--c-border); white-space:nowrap;';
+    actionsTd.style.cssText = 'padding:2px 6px; border-bottom:1px solid var(--c-border); white-space:nowrap;';
 
     const mkBtn = (label, style) => {
       const b = document.createElement('button');
       b.className = 'btn';
-      b.style.cssText = `padding:4px 10px; font-size:12px; margin-right:4px; ${style}`;
+      b.style.cssText = `padding:3px 8px; font-size:11px; margin-right:3px; ${style}`;
       b.textContent = label;
       return b;
     };
 
-    const inspectButton = mkBtn('Inspect', 'background:var(--c-raised); border-color:var(--c-line); color:var(--c-dim);');
+    const inspectButton = mkBtn('Inspect', 'background:rgba(255,255,255,0.03); border-color:rgba(255,255,255,0.08); color:var(--c-dim);');
     inspectButton.onclick = () => onOpen(analysis.id, false);
 
-    const openButton = mkBtn('Open', 'background:var(--c-cyan-dk); border-color:var(--c-cyan); color:#fff;');
-    openButton.onclick = () => onOpen(analysis.id, true);
-
-    const downloadButton = mkBtn('Export', 'background:#0a1f18; border-color:#065f46; color:#6ee7b7;');
+    const downloadButton = mkBtn('Export', 'background:rgba(26,158,90,0.10); border-color:rgba(26,158,90,0.35); color:#1a9e5a;');
     downloadButton.setAttribute('aria-label', `Download analysis ${analysis.id} bundle`);
     downloadButton.onclick = () => onDownload(analysis.id);
 
-    const deleteButton = mkBtn('Delete', 'background:#1a0b0b; border-color:#7f1d1d; color:#fca5a5;');
+    const deleteButton = mkBtn('Delete', 'background:rgba(204,51,51,0.10); border-color:rgba(204,51,51,0.35); color:#cc4444;');
     deleteButton.setAttribute('aria-label', `Delete analysis ${analysis.id}`);
     deleteButton.onclick = () => onDelete(analysis.id);
 
     actionsTd.appendChild(inspectButton);
-    actionsTd.appendChild(openButton);
     actionsTd.appendChild(downloadButton);
     actionsTd.appendChild(deleteButton);
 
@@ -286,8 +294,9 @@ function renderResultStats() {
   statsNode.innerHTML = '';
   data.forEach((item) => {
     const card = document.createElement('div');
-    card.style.cssText = 'border:1px solid var(--c-border); background:var(--c-panel); padding:8px 12px;';
-    card.innerHTML = `<div style="font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--c-muted);">${item.label}</div><div class="mono" style="font-size:22px;font-weight:500;color:var(--c-cyan);line-height:1.1;margin-top:2px;">${item.value}</div><div style="font-size:10px;color:var(--c-muted);margin-top:1px;">${item.sub}</div>`;
+    card.setAttribute('role', 'listitem');
+    card.style.cssText = 'border-right:1px solid var(--c-border); background:rgba(255,255,255,0.015); padding:7px 10px;';
+    card.innerHTML = `<div style="font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--c-muted);">${item.label}</div><div class="mono" style="font-size:22px;font-weight:500;color:var(--c-cyan);line-height:1.1;margin-top:2px;text-shadow:0 0 10px rgba(232,148,10,0.45);">${item.value}</div><div style="font-size:11px;color:var(--c-muted);margin-top:1px;">${item.sub}</div>`;
     statsNode.appendChild(card);
   });
 }
@@ -353,8 +362,8 @@ function renderReportSwitches() {
     const active = state.selectedReportKey === key;
     btn.className = 'btn';
     btn.style.cssText = active
-      ? 'padding:5px 11px; font-size:12px; background:var(--c-cyan-dk); border-color:var(--c-cyan); color:#fff;'
-      : 'padding:5px 11px; font-size:12px; background:var(--c-raised); border-color:var(--c-line); color:var(--c-dim);';
+      ? 'padding:4px 10px; font-size:12px; background:rgba(185,114,8,0.20); border-color:rgba(232,148,10,0.50); color:#e8940a;'
+      : 'padding:4px 10px; font-size:12px; background:rgba(255,255,255,0.03); border-color:rgba(255,255,255,0.07); color:var(--c-dim);';
     btn.disabled = !hasContent;
     if (!hasContent) {
       btn.style.opacity = '0.35';
@@ -412,7 +421,7 @@ export function renderTables() {
 
   const status = document.createElement('div');
   status.className = 'mono';
-  status.style.cssText = 'font-size:12px; color:var(--c-muted); margin-bottom:6px; letter-spacing:.04em;';
+  status.style.cssText = 'font-size:12px; color:var(--c-muted); margin-bottom:5px; letter-spacing:.05em;';
   const totalLabel = tableTotalRows > 0 ? tableTotalRows : tableRows.length;
   status.textContent = `// ${tableRows.length} of ${totalLabel} rows loaded`;
   container.appendChild(status);
@@ -432,7 +441,7 @@ export function renderTables() {
   container.appendChild(table);
 
   const controls = document.createElement('div');
-  controls.style.cssText = 'margin-top:8px; display:flex; flex-wrap:wrap; gap:6px;';
+  controls.style.cssText = 'margin-top:6px; display:flex; flex-wrap:wrap; gap:4px;';
 
   if (tableRows.length > tableVisibleCount) {
     const loadMoreButton = document.createElement('button');
@@ -483,24 +492,24 @@ export function renderCharts() {
   grouped.forEach((group) => {
     const wrap = document.createElement('section');
     const heading = document.createElement('h4');
-    heading.style.cssText = 'font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--c-muted); margin-bottom:6px;';
+    heading.style.cssText = 'font-size:11px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; color:var(--c-muted); margin-bottom:5px;';
     heading.textContent = group.title;
     wrap.appendChild(heading);
 
     const grid = document.createElement('div');
-    grid.style.cssText = 'display:grid; grid-template-columns:repeat(3,1fr); gap:6px;';
+    grid.style.cssText = 'display:grid; grid-template-columns:repeat(3,1fr); gap:1px; border:1px solid var(--c-border);';
 
     group.charts.slice(0, chartsVisibleCount).forEach((url) => {
       const card = document.createElement('a');
       card.href = url;
       card.target = '_blank';
       card.rel = 'noopener noreferrer';
-      card.style.cssText = 'display:block; border:1px solid var(--c-border); overflow:hidden; background:var(--c-surface);';
+      card.style.cssText = 'display:block; border:1px solid var(--c-border); overflow:hidden; background:rgba(255,255,255,0.018);';
 
       const image = document.createElement('img');
       image.alt = `${group.title} chart`;
       image.loading = 'lazy';
-      image.style.cssText = 'width:100%; height:160px; object-fit:contain; background:var(--c-surface); display:block;';
+      image.style.cssText = 'width:100%; height:150px; object-fit:contain; background:rgba(255,255,255,0.018); display:block;';
       image.dataset.src = url;
       chartObserver.observe(image);
 
@@ -511,7 +520,7 @@ export function renderCharts() {
     if (!group.charts.length) {
       const empty = document.createElement('div');
       empty.className = 'mono';
-      empty.style.cssText = 'font-size:11px; color:var(--c-muted); padding:4px 0;';
+      empty.style.cssText = 'font-size:11px; color:var(--c-muted); padding:3px 0;';
       empty.textContent = '// no charts for this section';
       grid.appendChild(empty);
     }
@@ -524,7 +533,7 @@ export function renderCharts() {
   if (allChartsCount > chartsVisibleCount) {
     const more = document.createElement('button');
     more.className = 'btn btn-secondary';
-    more.style.cssText += 'margin-top:6px;';
+    more.style.cssText += 'margin-top:5px;';
     more.textContent = `Load more charts (${allChartsCount - chartsVisibleCount} remaining)`;
     more.onclick = () => {
       updateState({ chartsVisibleCount: chartsVisibleCount + 12 });
@@ -554,7 +563,7 @@ export async function renderDatasetPreview(file) {
   const lowerName = file.name.toLowerCase();
   if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls')) {
     const msg = document.createElement('p');
-    msg.style.cssText = 'font-size:13px; color:var(--c-muted); margin:4px 0;';
+    msg.style.cssText = 'font-size:12px; color:var(--c-dim); margin:3px 0;';
     msg.textContent = `Excel file selected (${file.name}) — preview not available in the browser. The engine will convert it server-side before analysis.`;
     previewContainer.appendChild(msg);
     return;
