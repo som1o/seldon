@@ -1646,24 +1646,32 @@ double computeFoldStabilityFromCorrelation(const std::vector<double>& a,
     const size_t foldCount = std::min(folds, n / 6);
     if (foldCount < 2) return 0.0;
 
+    // Compute per-fold Pearson in a single pass per fold (no heap allocation,
+    // no separate calculateStats calls — inline Welford-style sum/sq sums).
     std::vector<double> foldScores;
     foldScores.reserve(foldCount);
     for (size_t f = 0; f < foldCount; ++f) {
         const size_t s = (f * n) / foldCount;
         const size_t e = ((f + 1) * n) / foldCount;
-        std::vector<double> xa;
-        std::vector<double> xb;
-        xa.reserve(e - s);
-        xb.reserve(e - s);
+        double sumA = 0.0, sumB = 0.0, sumAB = 0.0, sumA2 = 0.0, sumB2 = 0.0;
+        size_t cnt = 0;
         for (size_t i = s; i < e; ++i) {
             if (!std::isfinite(a[i]) || !std::isfinite(b[i])) continue;
-            xa.push_back(a[i]);
-            xb.push_back(b[i]);
+            sumA  += a[i];
+            sumB  += b[i];
+            sumAB += a[i] * b[i];
+            sumA2 += a[i] * a[i];
+            sumB2 += b[i] * b[i];
+            ++cnt;
         }
-        if (xa.size() < 8) continue;
-        const ColumnStats sa = Statistics::calculateStats(xa);
-        const ColumnStats sb = Statistics::calculateStats(xb);
-        const double r = std::abs(MathUtils::calculatePearson(xa, xb, sa, sb).value_or(0.0));
+        if (cnt < 8) continue;
+        const double nd = static_cast<double>(cnt);
+        const double covAB = sumAB - sumA * sumB / nd;
+        const double varA  = sumA2  - sumA * sumA  / nd;
+        const double varB  = sumB2  - sumB * sumB  / nd;
+        const double denom = std::sqrt(std::max(0.0, varA) * std::max(0.0, varB));
+        if (denom <= 1e-12) continue;
+        const double r = std::clamp(std::abs(covAB / denom), 0.0, 1.0);
         if (std::isfinite(r)) foldScores.push_back(r);
     }
     if (foldScores.size() < 2) return 0.0;
@@ -1917,7 +1925,12 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
 
             const double absR = std::abs(p.r);
             if (p.statSignificant || absR >= 0.20) {
+                // Spearman is a single O(1) lookup into the pre-computed matrix.
                 p.spearman = static_cast<double>(spearmanMatrix[pairSlot(aPos, bPos)]);
+            }
+            // Kendall tau is O(n²) for n≤256; only compute for associations strong
+            // enough to appear in the report — saves significant time on wide datasets.
+            if (p.statSignificant || absR >= 0.30) {
                 if (va.size() <= 256) {
                     p.kendallTau = MathUtils::calculateKendallTau(va, vb).value_or(0.0);
                 } else {

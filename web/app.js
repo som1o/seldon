@@ -11,6 +11,7 @@ import {
   getWorkspaceNotes,
   openFullAnalysisPage,
   renderAnalyses,
+  renderAnalysisSummary,
   renderDatasetPreview,
   renderProgress,
   renderResults,
@@ -222,6 +223,7 @@ async function loadAllTableRows() {
 
 async function selectAnalysis(analysisId) {
   updateState({ currentAnalysisId: analysisId });
+  renderAnalysisSummary();
   progressSocket?.subscribeToAnalysis(analysisId);
   await refreshAnalysis(analysisId);
 

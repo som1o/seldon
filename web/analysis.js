@@ -39,8 +39,8 @@ function renderChartGroup(containerId, charts, label) {
   container.innerHTML = '';
   if (!charts.length) {
     const empty = document.createElement('div');
-    empty.className = 'text-xs text-slate-500';
-    empty.textContent = `No ${label.toLowerCase()} charts available.`;
+    empty.style.cssText = 'font-size:13px; color:var(--c-muted); font-family:\'JetBrains Mono\',monospace; padding:4px 0;';
+    empty.textContent = `// no ${label.toLowerCase()} charts available`;
     container.appendChild(empty);
     return;
   }
@@ -50,13 +50,13 @@ function renderChartGroup(containerId, charts, label) {
     card.href = chartUrl;
     card.target = '_blank';
     card.rel = 'noopener noreferrer';
-    card.className = 'block rounded-lg border border-slate-700 bg-slate-900/70 overflow-hidden';
+    card.style.cssText = 'display:block; border:1px solid var(--c-border); overflow:hidden; background:var(--c-surface);';
 
     const image = document.createElement('img');
     image.src = chartUrl;
     image.loading = 'lazy';
     image.alt = `${label} chart`;
-    image.className = 'w-full h-44 object-contain bg-slate-900';
+    image.style.cssText = 'width:100%; height:160px; object-fit:contain; background:var(--c-surface); display:block;';
 
     card.appendChild(image);
     container.appendChild(card);
@@ -86,12 +86,14 @@ function renderReports(reports) {
     Object.entries(reportLabels).forEach(([key, label]) => {
       const hasContent = Boolean(reports[key] && reports[key].trim());
       const btn = document.createElement('button');
-      btn.className = key === selectedKey
-        ? 'px-3 py-2 rounded-lg bg-indigo-600/80 text-sm min-h-11'
-        : 'px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm min-h-11';
+      btn.className = 'btn';
+      btn.style.cssText = key === selectedKey
+        ? 'padding:5px 11px; font-size:12px; font-family:\'Inter\',sans-serif; font-weight:500; letter-spacing:.04em; text-transform:uppercase; border:1px solid var(--c-cyan); background:var(--c-cyan-dk); color:#fff; cursor:pointer; min-height:30px;'
+        : 'padding:5px 11px; font-size:12px; font-family:\'Inter\',sans-serif; font-weight:500; letter-spacing:.04em; text-transform:uppercase; border:1px solid var(--c-line); background:var(--c-raised); color:var(--c-dim); cursor:pointer; min-height:30px;';
       btn.disabled = !hasContent;
       if (!hasContent) {
-        btn.classList.add('opacity-40', 'cursor-not-allowed');
+        btn.style.opacity = '0.35';
+        btn.style.cursor = 'not-allowed';
       }
       btn.textContent = label;
       btn.onclick = () => setActive(key);

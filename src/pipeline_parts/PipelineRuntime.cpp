@@ -639,11 +639,10 @@ int AutomationPipeline::run(const AutoConfig& config) {
     ReportEngine bivariate;
     bivariate.addTitle("Bivariate Analysis");
     if (totalPossiblePairs > bivariatePairs.size()) {
-        bivariate.addParagraph("Fast mode active: pair evaluation was capped for runtime safety. Results below cover the highest-priority numeric columns only.");
+        bivariate.addParagraph("Fast mode: pair evaluation capped to highest-priority numeric columns.");
     } else {
-        bivariate.addParagraph("All numeric pair combinations are included below (nC2). Significant table is dynamically filtered using a multi-tier gate: statistical significance, neural relevance, and a bounded fallback for high-effect stable pairs.");
+        bivariate.addParagraph("All numeric pair combinations (nC2) evaluated. Significant table filtered by statistical significance, neural relevance, and domain fallback.");
     }
-    bivariate.addParagraph("Neural relevance score prioritizes practical effect size over raw p-value magnitude; when neural filtering is too strict, statistically robust pairs can be promoted as Tier-3 domain findings.");
 
     std::vector<std::vector<std::string>> allRows;
     std::vector<std::vector<std::string>> sigRows;
@@ -866,31 +865,36 @@ int AutomationPipeline::run(const AutoConfig& config) {
         }
     }
 
-    bivariate.addParagraph("Total pairs evaluated: " + std::to_string(bivariatePairs.size()));
-    bivariate.addParagraph("Statistically significant pairs (p<" + toFixed(MathUtils::getSignificanceAlpha(), 4) + "): " + std::to_string(statSigCount));
-    bivariate.addParagraph("Final selected significant pairs: " + std::to_string(sigRows.size()));
     const size_t tier2Count = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) {
         return p.selected && p.significanceTier == 2;
     }));
     const size_t tier3Count = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) {
         return p.selected && p.significanceTier == 3;
     }));
-    bivariate.addParagraph("Selection tiers: Tier-2(neural+stat)=" + std::to_string(tier2Count) + ", Tier-3(domain fallback)=" + std::to_string(tier3Count) + ".");
     const size_t redundantPairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.filteredAsRedundant; }));
     const size_t structuralPairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.filteredAsStructural; }));
     const size_t leakagePairs = static_cast<size_t>(std::count_if(bivariatePairs.begin(), bivariatePairs.end(), [](const PairInsight& p) { return p.leakageRisk; }));
-    bivariate.addParagraph("Information-theoretic filtering: redundant=" + std::to_string(redundantPairs) + ", structural=" + std::to_string(structuralPairs) + ", leakage-risk=" + std::to_string(leakagePairs) + ".");
+
+    // Single compact summary paragraph instead of five separate lines.
+    {
+        std::ostringstream bivSummary;
+        bivSummary << "Pairs: evaluated=" << bivariatePairs.size()
+            << ", sig(p<" << toFixed(MathUtils::getSignificanceAlpha(), 4) << ")=" << statSigCount
+            << ", selected=" << sigRows.size()
+            << " (T2=" << tier2Count << " T3=" << tier3Count << ")"
+            << " | filtered: redundant=" << redundantPairs
+            << ", structural=" << structuralPairs
+            << ", leakage=" << leakagePairs << ".";
+        if (strictFeatureReporting)
+            bivSummary << " Engineered-feature pairs suppressed: " << strictSuppressedPairs << ".";
+        if (contaminationSuppressedPairs > 0)
+            bivSummary << " Target-contamination guard removed " << contaminationSuppressedPairs << " pairs.";
+        if (identitySuppressedPairs > 0)
+            bivSummary << " Identity block removed " << identitySuppressedPairs << " near-identical pairs.";
+        bivariate.addParagraph(bivSummary.str());
+    }
     if (!canPlot) {
-        bivariate.addParagraph("Plot columns are marked 'n/a' because visual generation is omitted (environment/runtime mode), not because relationships failed quality checks.");
-    }
-    if (strictFeatureReporting) {
-        bivariate.addParagraph("Strict feature-reporting mode: suppressed " + std::to_string(strictSuppressedPairs) + " engineered-feature pairs (" + std::to_string(strictSuppressedSelected) + " were otherwise selected). See Univariate 'Feature Engineering Insights'.");
-    }
-    if (contaminationSuppressedPairs > 0) {
-        bivariate.addParagraph("Target-contamination guard: suppressed " + std::to_string(contaminationSuppressedPairs) + " bivariate pairs involving near-target-clone features (|corr(target)|>0.99). These are excluded from statistical findings.");
-    }
-    if (identitySuppressedPairs > 0) {
-        bivariate.addParagraph("Identity block: suppressed " + std::to_string(identitySuppressedPairs) + " near-identical pairs (|r|>0.98); lower-variance duplicates were excluded to stabilize downstream neural importance.");
+        bivariate.addParagraph("Plot columns are 'n/a': visual generation is disabled in this run mode.");
     }
     addExecutiveDashboard(
         bivariate,
@@ -911,16 +915,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         },
         "Quick map of relationship strength before detailed pair evidence."
     );
-    bivariate.addParagraph("Causal interpretation guardrail: strong correlations indicate statistical dependence, while directed DAG edges are observational causal hypotheses that remain sensitive to hidden confounding and should not be treated as intervention-proof causation.");
-    bivariate.addTable("Metric Glossary", {"Metric", "Interpretation"}, {
-        {"neural_score", "Composite relevance score blending effect size, stability, modeled-feature coverage, and statistical reliability."},
-        {"fold_stability", "Cross-fold consistency of pairwise correlation (1.0 is highly stable; near 0 is unstable)."},
-        {"significance_tier", "Tier-2: statistical + neural confirmation; Tier-3: statistical + domain fallback promotion."},
-        {"relation_label", "Human-readable relationship descriptor derived from correlation direction/strength or deterministic relation checks."},
-        {"fit_line", "Whether a fitted linear overlay is rendered for the selected scatter plot (n/a when plotting is unavailable or pair not plotted)."},
-        {"confidence_band", "Whether confidence interval band is rendered around the fitted line for the selected scatter plot (n/a when unavailable)."},
-        {"scatter_plot", "Path to generated scatter visualization for selected pairs; '-' means no plot artifact for that row."}
-    });
+    bivariate.addParagraph("Note: correlations show statistical dependence; directed DAG edges are observational causal hypotheses, not intervention-grade causation.");
 
     {
         std::vector<std::string> adminDominatedPairs;
@@ -1158,9 +1153,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     ReportEngine neuralReport;
     neuralReport.addTitle("Neural Synthesis");
-    neuralReport.addParagraph("This synthesis captures neural network training traces and how neural relevance influenced bivariate selection.");
-    neuralReport.addParagraph(std::string("Task type inferred from target: ") + targetContext.semantics.inferredTask);
-    neuralReport.addParagraph("Bivariate significance now uses a three-tier gate: Tier-1 statistical evidence, Tier-2 neural confirmation, Tier-3 domain fallback for high-effect stable relationships when neural yield is sparse.");
+    neuralReport.addParagraph("Neural training traces and relevance-driven bivariate selection. Task: " + targetContext.semantics.inferredTask + ". Tiered gate: T1=statistical, T2=neural+stat, T3=domain fallback.");
     addExecutiveDashboard(
         neuralReport,
         "Executive Dashboard",
@@ -1397,8 +1390,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     ReportEngine finalAnalysis;
     finalAnalysis.addTitle("Final Analysis - Significant Findings Only");
-    finalAnalysis.addParagraph("This report contains statistically significant findings selected by a tiered engine: Tier-2 (statistical + neural) and Tier-3 fallback (statistical + domain effect). Non-selected findings are excluded by design.");
-    finalAnalysis.addParagraph("Data Health Score: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + "). This score estimates discovered signal strength using completeness, retained feature coverage, significant-pair yield, selected-pair yield, and neural training stability.");
+    finalAnalysis.addParagraph("Significant findings only (T2: stat+neural, T3: stat+domain). Data Health: " + toFixed(dataHealth.score, 1) + "/100 (" + dataHealth.band + ").");
 
     size_t adminSelectedCount = 0;
     bool targetAdminPredictableExec = false;
@@ -1455,7 +1447,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     if (!advancedOutputs.causalDagRows.empty()) {
-        finalAnalysis.addParagraph("Causal interpretation note: each DAG edge is a model-derived directional hypothesis from observational dependence tests. Use these as candidates for follow-up validation, not as guaranteed intervention effects.");
+        finalAnalysis.addParagraph("DAG edges: observational hypotheses from CI tests, not interventional proof.");
         finalAnalysis.addTable("Causal Discovery Graph Candidates",
                                {"From", "To", "Confidence", "Evidence", "Interpretation"},
                                advancedOutputs.causalDagRows);
@@ -1524,7 +1516,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     if (advancedOutputs.causalDagMermaid.has_value()) {
         finalAnalysis.addParagraph("Causal discovery visual sketch (PC/Meek/LiNGAM + bootstrap support):\n" + *advancedOutputs.causalDagMermaid);
-        finalAnalysis.addParagraph("Guardrail: graph edges are discovery hypotheses under CI assumptions and should be validated against interventions or external design constraints.");
+
     }
 
     if (!advancedOutputs.mahalanobisRows.empty()) {
@@ -1826,9 +1818,6 @@ int AutomationPipeline::run(const AutoConfig& config) {
     };
 
     univariate.addTable("Subsystem Readiness Matrix", {"Subsystem", "Readiness", "Implementation Status", "Guardrail"}, readinessRows);
-    bivariate.addTable("Subsystem Readiness Matrix", {"Subsystem", "Readiness", "Implementation Status", "Guardrail"}, readinessRows);
-    neuralReport.addTable("Subsystem Readiness Matrix", {"Subsystem", "Readiness", "Implementation Status", "Guardrail"}, readinessRows);
-    finalAnalysis.addTable("Subsystem Readiness Matrix", {"Subsystem", "Readiness", "Implementation Status", "Guardrail"}, readinessRows);
     heuristicsReport.addTable("Subsystem Readiness Matrix", {"Subsystem", "Readiness", "Implementation Status", "Guardrail"}, readinessRows);
 
     if (runCfg.benchmarkMode) {

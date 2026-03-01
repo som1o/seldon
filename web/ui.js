@@ -28,12 +28,14 @@ export function el(id) {
 export function showToast(message, type = 'info') {
   const container = el('toastContainer');
   const toast = document.createElement('div');
-  const typeClass = type === 'error'
-    ? 'bg-rose-800 border-rose-600'
+  const styles = type === 'error'
+    ? 'background:#1a0b0b; border-color:#7f1d1d; color:#fca5a5;'
     : type === 'success'
-      ? 'bg-emerald-800 border-emerald-600'
-      : 'bg-slate-800 border-slate-600';
-  toast.className = `border text-slate-100 px-3 py-2 rounded-lg shadow-lg ${typeClass}`;
+      ? 'background:#0a1f18; border-color:#065f46; color:#6ee7b7;'
+      : 'background:#13161e; border-color:#2a3347; color:#cbd5e1;';
+  toast.setAttribute('style',
+    `border:1px solid; padding:8px 14px; font-size:12px; font-weight:500;
+     font-family:'Inter',sans-serif; pointer-events:none; max-width:320px; ${styles}`);
   toast.textContent = message;
   container.appendChild(toast);
   setTimeout(() => {
@@ -42,16 +44,13 @@ export function showToast(message, type = 'info') {
 }
 
 export function setWsStatus(text, mode) {
-  el('wsStatus').textContent = text;
+  el('wsStatus').textContent = `WS: ${text}`;
   const dot = el('wsStatusDot');
-  dot.classList.remove('bg-emerald-400', 'bg-rose-400', 'bg-amber-400');
-  if (mode === 'connected') {
-    dot.classList.add('bg-emerald-400');
-  } else if (mode === 'error') {
-    dot.classList.add('bg-rose-400');
-  } else {
-    dot.classList.add('bg-amber-400');
-  }
+  const color = mode === 'connected' ? '#34d399'
+    : mode === 'error' ? '#f87171'
+    : '#fbbf24';
+  dot.style.background = color;
+  dot.style.boxShadow = `0 0 5px ${color}`;
 }
 
 export function setButtonLoading(button, loading, loadingText) {
@@ -63,7 +62,7 @@ export function setButtonLoading(button, loading, loadingText) {
       button.dataset.originalText = button.textContent;
     }
     button.disabled = true;
-    button.innerHTML = `<span class="inline-flex items-center gap-2"><span class="inline-block h-4 w-4 border-2 border-slate-200 border-t-transparent rounded-full animate-spin" aria-hidden="true"></span>${loadingText}</span>`;
+    button.innerHTML = `<span style="display:inline-flex;align-items:center;"><span class="spin" aria-hidden="true"></span>${loadingText}</span>`;
     return;
   }
   button.disabled = false;
@@ -149,45 +148,54 @@ export function renderAnalyses(analyses, { onOpen, onDelete, onDownload }) {
   const sorted = [...analyses].sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
   sorted.forEach((analysis) => {
     const tr = document.createElement('tr');
-    tr.className = 'border-t border-slate-800';
 
     const idTd = document.createElement('td');
-    idTd.className = 'py-2 pr-2 font-mono text-xs';
+    idTd.className = 'mono';
+    idTd.style.cssText = 'font-size:11px; padding:4px 10px; border-bottom:1px solid var(--c-border); border-right:1px solid var(--c-border); color:var(--c-cyan); max-width:110px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
     idTd.textContent = analysis.id;
+    idTd.title = analysis.id;
 
     const statusTd = document.createElement('td');
-    statusTd.textContent = analysis.status;
+    statusTd.style.cssText = 'font-size:12px; padding:4px 10px; border-bottom:1px solid var(--c-border); border-right:1px solid var(--c-border); color:var(--c-dim);';
+    const statusLower = String(analysis.status || '').toLowerCase();
+    const statusColor = statusLower === 'completed' ? 'var(--c-green)'
+      : statusLower === 'running' ? 'var(--c-cyan)'
+      : statusLower === 'failed' ? 'var(--c-red)'
+      : 'var(--c-dim)';
+    statusTd.innerHTML = `<span style="color:${statusColor};font-weight:500;">${analysis.status}</span>`;
 
     const stepTd = document.createElement('td');
-    const isCompleted = String(analysis.status || '').toLowerCase() === 'completed' &&
+    stepTd.className = 'mono';
+    stepTd.style.cssText = 'font-size:11px; padding:4px 10px; border-bottom:1px solid var(--c-border); border-right:1px solid var(--c-border); color:var(--c-muted);';
+    const isCompleted = statusLower === 'completed' &&
       Number(analysis.total_steps) > 0 &&
       Number(analysis.step) >= Number(analysis.total_steps);
     stepTd.textContent = isCompleted ? '—' : `${analysis.step}/${analysis.total_steps}`;
 
     const actionsTd = document.createElement('td');
-    actionsTd.className = 'flex flex-wrap gap-2 py-1';
+    actionsTd.style.cssText = 'padding:4px 8px; border-bottom:1px solid var(--c-border); white-space:nowrap;';
 
-    const inspectButton = document.createElement('button');
-    inspectButton.className = 'px-2 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs min-h-11';
-    inspectButton.textContent = 'Inspect';
+    const mkBtn = (label, style) => {
+      const b = document.createElement('button');
+      b.className = 'btn';
+      b.style.cssText = `padding:4px 10px; font-size:12px; margin-right:4px; ${style}`;
+      b.textContent = label;
+      return b;
+    };
+
+    const inspectButton = mkBtn('Inspect', 'background:var(--c-raised); border-color:var(--c-line); color:var(--c-dim);');
     inspectButton.onclick = () => onOpen(analysis.id, false);
 
-    const openButton = document.createElement('button');
-    openButton.className = 'px-2 py-1 rounded-lg bg-indigo-600/80 hover:bg-indigo-500/80 text-xs min-h-11';
-    openButton.textContent = 'Open';
+    const openButton = mkBtn('Open', 'background:var(--c-cyan-dk); border-color:var(--c-cyan); color:#fff;');
     openButton.onclick = () => onOpen(analysis.id, true);
 
-    const deleteButton = document.createElement('button');
-    deleteButton.className = 'px-2 py-1 rounded-lg bg-rose-700/90 hover:bg-rose-600 text-xs min-h-11';
-    deleteButton.textContent = 'Delete';
-    deleteButton.setAttribute('aria-label', `Delete analysis ${analysis.id}`);
-    deleteButton.onclick = () => onDelete(analysis.id);
-
-    const downloadButton = document.createElement('button');
-    downloadButton.className = 'px-2 py-1 rounded-lg bg-emerald-700/90 hover:bg-emerald-600 text-xs min-h-11';
-    downloadButton.textContent = 'Download';
+    const downloadButton = mkBtn('Export', 'background:#0a1f18; border-color:#065f46; color:#6ee7b7;');
     downloadButton.setAttribute('aria-label', `Download analysis ${analysis.id} bundle`);
     downloadButton.onclick = () => onDownload(analysis.id);
+
+    const deleteButton = mkBtn('Delete', 'background:#1a0b0b; border-color:#7f1d1d; color:#fca5a5;');
+    deleteButton.setAttribute('aria-label', `Delete analysis ${analysis.id}`);
+    deleteButton.onclick = () => onDelete(analysis.id);
 
     actionsTd.appendChild(inspectButton);
     actionsTd.appendChild(openButton);
@@ -257,7 +265,8 @@ export function renderResults(results) {
   renderTables();
   renderCharts();
   renderSelectedReport();
-  el('resultsHeading').focus();
+  renderAnalysisSummary();
+  el('resultsHeading')?.focus();
 }
 
 function renderResultStats() {
@@ -268,32 +277,73 @@ function renderResultStats() {
   const state = getState();
   const reportCount = Object.values(state.reports).filter((text) => text && text.trim()).length;
   const data = [
-    { label: 'Stat Rows', value: state.tableRows.length },
-    { label: 'Charts', value: state.charts.length },
-    { label: 'Reports', value: reportCount },
+    { label: 'Univariate', value: state.chartGroups?.univariate?.length ?? 0, sub: 'charts' },
+    { label: 'Bivariate', value: state.chartGroups?.bivariate?.length ?? 0, sub: 'charts' },
+    { label: 'Overall', value: state.chartGroups?.overall?.length ?? 0, sub: 'charts' },
+    { label: 'Reports', value: reportCount, sub: 'generated' },
   ];
 
   statsNode.innerHTML = '';
   data.forEach((item) => {
     const card = document.createElement('div');
-    card.className = 'rounded-lg border border-slate-700 bg-slate-800/80 px-3 py-2';
-    card.innerHTML = `<div class="text-xs text-slate-400">${item.label}</div><div class="text-lg font-semibold text-slate-100">${item.value}</div>`;
+    card.style.cssText = 'border:1px solid var(--c-border); background:var(--c-panel); padding:8px 12px;';
+    card.innerHTML = `<div style="font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--c-muted);">${item.label}</div><div class="mono" style="font-size:22px;font-weight:500;color:var(--c-cyan);line-height:1.1;margin-top:2px;">${item.value}</div><div style="font-size:10px;color:var(--c-muted);margin-top:1px;">${item.sub}</div>`;
     statsNode.appendChild(card);
+  });
+}
+
+export function renderAnalysisSummary() {
+  const emptyNode = el('analysisSummaryEmpty');
+  const reportListNode = el('analysisReportList');
+  const openBtn = el('openFullAnalysisBtn');
+  const state = getState();
+
+  const hasResults =
+    (state.charts?.length ?? 0) > 0 ||
+    Object.values(state.reports ?? {}).some((t) => t && t.trim());
+
+  if (emptyNode) {
+    emptyNode.style.display = hasResults ? 'none' : '';
+  }
+  if (openBtn) {
+    openBtn.disabled = !state.currentAnalysisId;
+    openBtn.onclick = () => openFullAnalysisPage(getState().currentAnalysisId);
+  }
+
+  if (!reportListNode) {
+    return;
+  }
+  reportListNode.innerHTML = '';
+
+  const reportLabels = {
+    report: 'Deterministic',
+    univariate: 'Univariate',
+    bivariate: 'Bivariate',
+    neural_synthesis: 'Neural',
+    final_analysis: 'Final',
+  };
+
+  Object.entries(reportLabels).forEach(([key, label]) => {
+    const hasContent = Boolean(state.reports?.[key]?.trim());
+    const badge = document.createElement('span');
+    badge.className = `report-badge${hasContent ? ' has-content' : ''}`;
+    badge.innerHTML = `<span class="dot"></span>${label}`;
+    reportListNode.appendChild(badge);
   });
 }
 
 function renderReportSwitches() {
   const switcher = el('reportSwitches');
-  if (!switcher) {
+  if (!switcher || switcher.closest('[aria-hidden]')) {
     return;
   }
   const state = getState();
   const reportLabels = {
     univariate: 'Univariate',
     bivariate: 'Bivariate',
-    neural_synthesis: 'Neural Synthesis',
-    final_analysis: 'Final Analysis',
-    report: 'Deterministic Report',
+    neural_synthesis: 'Neural',
+    final_analysis: 'Final',
+    report: 'Deterministic',
   };
 
   switcher.innerHTML = '';
@@ -301,12 +351,14 @@ function renderReportSwitches() {
     const btn = document.createElement('button');
     const hasContent = Boolean(state.reports[key] && state.reports[key].trim());
     const active = state.selectedReportKey === key;
-    btn.className = active
-      ? 'px-3 py-2 rounded-lg text-sm bg-indigo-600/80 text-slate-50 min-h-11'
-      : 'px-3 py-2 rounded-lg text-sm bg-slate-700/90 hover:bg-slate-600 text-slate-200 min-h-11';
+    btn.className = 'btn';
+    btn.style.cssText = active
+      ? 'padding:5px 11px; font-size:12px; background:var(--c-cyan-dk); border-color:var(--c-cyan); color:#fff;'
+      : 'padding:5px 11px; font-size:12px; background:var(--c-raised); border-color:var(--c-line); color:var(--c-dim);';
     btn.disabled = !hasContent;
     if (!hasContent) {
-      btn.classList.add('opacity-40', 'cursor-not-allowed');
+      btn.style.opacity = '0.35';
+      btn.style.cursor = 'not-allowed';
     }
     btn.textContent = label;
     btn.onclick = () => {
@@ -322,7 +374,7 @@ function renderSelectedReport() {
   const { reports, selectedReportKey } = getState();
   const titleNode = el('reportTitle');
   const bodyNode = el('reportMarkdown');
-  if (!bodyNode) {
+  if (!bodyNode || bodyNode.closest('[aria-hidden]')) {
     return;
   }
 
@@ -350,25 +402,28 @@ export function renderTables() {
     tableLoadingAll,
   } = getState();
   const container = el('tablesContainer');
+  if (!container || container.closest('[aria-hidden]')) {
+    return;
+  }
   container.innerHTML = '';
   if (!tableRows.length) {
     return;
   }
 
   const status = document.createElement('div');
-  status.className = 'text-xs text-slate-400 mb-2';
+  status.className = 'mono';
+  status.style.cssText = 'font-size:12px; color:var(--c-muted); margin-bottom:6px; letter-spacing:.04em;';
   const totalLabel = tableTotalRows > 0 ? tableTotalRows : tableRows.length;
-  status.textContent = `Loaded ${tableRows.length} of ${totalLabel} rows`;
+  status.textContent = `// ${tableRows.length} of ${totalLabel} rows loaded`;
   container.appendChild(status);
 
   const table = document.createElement('table');
-  table.className = 'w-full text-xs border border-slate-700';
+  table.className = 'data-table';
   tableRows.slice(0, tableVisibleCount).forEach((row, index) => {
     const tr = document.createElement('tr');
-    tr.className = index % 2 === 0 ? 'bg-slate-950' : 'bg-slate-900';
+    tr.style.background = index % 2 === 0 ? 'var(--c-surface)' : 'var(--c-bg)';
     row.forEach((cell) => {
       const td = document.createElement(index === 0 ? 'th' : 'td');
-      td.className = 'px-2 py-1 border border-slate-800 text-left';
       td.textContent = String(cell ?? '');
       tr.appendChild(td);
     });
@@ -377,11 +432,11 @@ export function renderTables() {
   container.appendChild(table);
 
   const controls = document.createElement('div');
-  controls.className = 'mt-3 flex flex-wrap gap-2';
+  controls.style.cssText = 'margin-top:8px; display:flex; flex-wrap:wrap; gap:6px;';
 
   if (tableRows.length > tableVisibleCount) {
     const loadMoreButton = document.createElement('button');
-    loadMoreButton.className = 'mt-3 px-3 py-2 rounded bg-slate-700 hover:bg-slate-600 min-h-11';
+    loadMoreButton.className = 'btn btn-secondary';
     loadMoreButton.textContent = `Load more rows (${tableRows.length - tableVisibleCount} remaining)`;
     loadMoreButton.onclick = () => {
       updateState({ tableVisibleCount: tableVisibleCount + 40 });
@@ -392,14 +447,14 @@ export function renderTables() {
 
   if (tableHasMore) {
     const fetchMore = document.createElement('button');
-    fetchMore.className = 'px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 min-h-11 disabled:opacity-60';
+    fetchMore.className = 'btn btn-secondary';
     fetchMore.textContent = tableLoading ? 'Loading…' : 'Fetch next chunk';
     fetchMore.disabled = tableLoading || tableLoadingAll;
     fetchMore.onclick = () => tableHandlers.onLoadMore?.();
     controls.appendChild(fetchMore);
 
     const loadAll = document.createElement('button');
-    loadAll.className = 'px-3 py-2 rounded-lg bg-indigo-600/80 hover:bg-indigo-500/80 min-h-11 disabled:opacity-60';
+    loadAll.className = 'btn btn-primary';
     loadAll.textContent = tableLoadingAll ? 'Loading all…' : 'Load all rows';
     loadAll.disabled = tableLoading || tableLoadingAll;
     loadAll.onclick = () => tableHandlers.onLoadAll?.();
@@ -414,6 +469,9 @@ export function renderTables() {
 export function renderCharts() {
   const { chartGroups, chartsVisibleCount } = getState();
   const container = el('chartsContainer');
+  if (!container || container.closest('[aria-hidden]')) {
+    return;
+  }
   container.innerHTML = '';
 
   const grouped = [
@@ -424,26 +482,25 @@ export function renderCharts() {
 
   grouped.forEach((group) => {
     const wrap = document.createElement('section');
-    wrap.className = 'space-y-2';
     const heading = document.createElement('h4');
-    heading.className = 'text-sm text-slate-300 font-medium';
+    heading.style.cssText = 'font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--c-muted); margin-bottom:6px;';
     heading.textContent = group.title;
     wrap.appendChild(heading);
 
     const grid = document.createElement('div');
-    grid.className = 'grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2';
+    grid.style.cssText = 'display:grid; grid-template-columns:repeat(3,1fr); gap:6px;';
 
     group.charts.slice(0, chartsVisibleCount).forEach((url) => {
       const card = document.createElement('a');
       card.href = url;
       card.target = '_blank';
       card.rel = 'noopener noreferrer';
-      card.className = 'block border border-slate-700 rounded-lg overflow-hidden bg-slate-900/80';
+      card.style.cssText = 'display:block; border:1px solid var(--c-border); overflow:hidden; background:var(--c-surface);';
 
       const image = document.createElement('img');
       image.alt = `${group.title} chart`;
       image.loading = 'lazy';
-      image.className = 'w-full h-44 object-contain bg-slate-900';
+      image.style.cssText = 'width:100%; height:160px; object-fit:contain; background:var(--c-surface); display:block;';
       image.dataset.src = url;
       chartObserver.observe(image);
 
@@ -453,8 +510,9 @@ export function renderCharts() {
 
     if (!group.charts.length) {
       const empty = document.createElement('div');
-      empty.className = 'text-xs text-slate-500';
-      empty.textContent = 'No charts found for this section.';
+      empty.className = 'mono';
+      empty.style.cssText = 'font-size:11px; color:var(--c-muted); padding:4px 0;';
+      empty.textContent = '// no charts for this section';
       grid.appendChild(empty);
     }
 
@@ -465,7 +523,8 @@ export function renderCharts() {
   const allChartsCount = grouped.reduce((sum, group) => sum + group.charts.length, 0);
   if (allChartsCount > chartsVisibleCount) {
     const more = document.createElement('button');
-    more.className = 'px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 min-h-11';
+    more.className = 'btn btn-secondary';
+    more.style.cssText += 'margin-top:6px;';
     more.textContent = `Load more charts (${allChartsCount - chartsVisibleCount} remaining)`;
     more.onclick = () => {
       updateState({ chartsVisibleCount: chartsVisibleCount + 12 });
@@ -490,6 +549,17 @@ export async function renderDatasetPreview(file) {
     return;
   }
 
+  // Excel files are binary/ZIP formats; show an info banner instead of
+  // trying to parse them as CSV (which produces garbage).
+  const lowerName = file.name.toLowerCase();
+  if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls')) {
+    const msg = document.createElement('p');
+    msg.style.cssText = 'font-size:13px; color:var(--c-muted); margin:4px 0;';
+    msg.textContent = `Excel file selected (${file.name}) — preview not available in the browser. The engine will convert it server-side before analysis.`;
+    previewContainer.appendChild(msg);
+    return;
+  }
+
   try {
     const text = await file.slice(0, PREVIEW_READ_BYTES).text();
     const rows = parseCsvPreview(text);
@@ -499,13 +569,12 @@ export async function renderDatasetPreview(file) {
     }
 
     const table = document.createElement('table');
-    table.className = 'w-full text-xs border border-slate-700';
+    table.className = 'data-table';
     rows.forEach((row, rowIndex) => {
       const tr = document.createElement('tr');
-      tr.className = rowIndex % 2 === 0 ? 'bg-slate-950' : 'bg-slate-900';
+      tr.style.background = rowIndex % 2 === 0 ? 'var(--c-surface)' : 'var(--c-bg)';
       row.forEach((cell) => {
         const td = document.createElement(rowIndex === 0 ? 'th' : 'td');
-        td.className = 'px-2 py-1 border border-slate-800 text-left';
         td.textContent = cell;
         tr.appendChild(td);
       });

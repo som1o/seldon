@@ -3,143 +3,402 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; img-src 'self' data: blob: http: https:; connect-src 'self' ws: wss:; font-src 'self' data:;" />
-  <title>Seldon Web Workspace</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://fonts.googleapis.com; img-src 'self' data: blob: http: https:; connect-src 'self' ws: wss:; font-src 'self' data: https://fonts.gstatic.com;" />
+  <title>Seldon // Analytics Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
   <style>
-    *::-webkit-scrollbar { width: 10px; height: 10px; }
-    *::-webkit-scrollbar-track { background: rgba(51, 65, 85, 0.35); }
-    *::-webkit-scrollbar-thumb { background: rgba(100, 116, 139, 0.75); border-radius: 999px; }
-    * { scrollbar-color: rgba(100, 116, 139, 0.75) rgba(51, 65, 85, 0.35); scrollbar-width: thin; }
+    :root {
+      --c-bg:       #0d1117;
+      --c-surface:  #161b22;
+      --c-panel:    #1c2333;
+      --c-raised:   #242d40;
+      --c-border:   #30415a;
+      --c-line:     #3d5270;
+      --c-text:     #e6edf3;
+      --c-muted:    #8b9fc4;
+      --c-dim:      #aabdd6;
+      --c-cyan:     #38bdf8;
+      --c-cyan-dk:  #0ea5e9;
+      --c-red:      #f87171;
+      --c-green:    #4ade80;
+      --c-amber:    #fbbf24;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+
+    body {
+      background: var(--c-bg);
+      color: var(--c-text);
+      font-family: 'Inter', system-ui, sans-serif;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    /* scrollbars */
+    * { scrollbar-width: thin; scrollbar-color: var(--c-line) var(--c-surface); }
+    *::-webkit-scrollbar { width: 4px; height: 4px; }
+    *::-webkit-scrollbar-track { background: var(--c-surface); }
+    *::-webkit-scrollbar-thumb { background: var(--c-line); }
+
+    /* typography utilities */
+    .sec-label {
+      font-size: 11px; font-weight: 600;
+      letter-spacing: .1em; text-transform: uppercase;
+      color: var(--c-muted);
+    }
+    .mono { font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; }
+
+    /* fields */
+    .field {
+      background: var(--c-surface);
+      border: 1px solid var(--c-line);
+      color: var(--c-text);
+      padding: 8px 11px;
+      width: 100%;
+      font-family: inherit;
+      font-size: 13px;
+      outline: none;
+      transition: border-color .15s;
+    }
+    .field:focus { border-color: var(--c-cyan-dk); }
+    .field::placeholder { color: var(--c-muted); }
+    select.field option { background: var(--c-panel); }
+
+    /* buttons */
+    .btn {
+      padding: 8px 15px;
+      font-family: 'Inter', sans-serif;
+      font-size: 12px; font-weight: 500;
+      letter-spacing: .04em; text-transform: uppercase;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: background .15s, border-color .15s, color .15s;
+      white-space: nowrap; min-height: 32px;
+    }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+    .btn-primary {
+      background: var(--c-cyan-dk); border-color: var(--c-cyan); color: #fff;
+    }
+    .btn-primary:not(:disabled):hover { background: var(--c-cyan); color: var(--c-bg); }
+
+    .btn-secondary {
+      background: var(--c-raised); border-color: var(--c-line); color: var(--c-dim);
+    }
+    .btn-secondary:not(:disabled):hover { border-color: var(--c-cyan-dk); color: var(--c-cyan); }
+
+    .btn-danger {
+      background: #1a0b0b; border-color: #7f1d1d; color: #fca5a5;
+    }
+    .btn-danger:not(:disabled):hover { background: #450a0a; border-color: var(--c-red); }
+
+    .btn-success {
+      background: #0a1f18; border-color: #065f46; color: #6ee7b7;
+    }
+    .btn-success:not(:disabled):hover { background: #064e3b; }
+
+    /* progress */
+    #progressTrack { height: 2px; background: var(--c-border); width: 100%; }
+    #progressBar { height: 2px; background: var(--c-cyan); transition: width .3s ease; box-shadow: 0 0 6px var(--c-cyan); }
+
+    /* summary report badge */
+    .report-badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 4px 10px; border: 1px solid var(--c-border);
+      background: var(--c-panel); font-size: 11px; font-weight: 600;
+      letter-spacing: .06em; text-transform: uppercase; color: var(--c-muted);
+      white-space: nowrap;
+    }
+    .report-badge.has-content { border-color: var(--c-cyan-dk); color: var(--c-cyan); background: #0c1e2e; }
+    .report-badge .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--c-muted); flex-shrink: 0; }
+    .report-badge.has-content .dot { background: var(--c-cyan); box-shadow: 0 0 4px var(--c-cyan); }
+
+    /* status dot */
+    .status-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+
+    /* data table */
+    .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .data-table th, .data-table td {
+      padding: 6px 12px;
+      border-bottom: 1px solid var(--c-border);
+      border-right: 1px solid var(--c-border);
+      text-align: left;
+    }
+    .data-table th {
+      color: var(--c-muted); font-weight: 600; font-size: 11px;
+      letter-spacing: .07em; text-transform: uppercase;
+      background: var(--c-surface);
+    }
+    .data-table tr:hover td { background: var(--c-raised); }
+
+    /* divider */
+    .h-divider { border: none; border-top: 1px solid var(--c-border); margin: 0; }
+
+    /* file input */
+    input[type="file"] { color: var(--c-dim); font-size: 13px; }
+    input[type="file"]::file-selector-button {
+      background: var(--c-raised); border: 1px solid var(--c-line);
+      color: var(--c-dim); padding: 5px 12px; margin-right: 8px;
+      cursor: pointer; font-size: 13px; font-family: 'Inter', sans-serif;
+    }
+    input[type="file"]::file-selector-button:hover { border-color: var(--c-cyan-dk); color: var(--c-cyan); }
+
+    /* spinner */
+    .spin {
+      display: inline-block; width: 12px; height: 12px;
+      border: 1.5px solid var(--c-line); border-top-color: var(--c-cyan);
+      border-radius: 50%; animation: rotation .6s linear infinite;
+      vertical-align: middle; margin-right: 6px;
+    }
+    @keyframes rotation { to { transform: rotate(360deg); } }
   </style>
 </head>
-<body class="bg-slate-900 text-slate-100 min-h-screen">
-  <div id="toastContainer" class="fixed top-4 right-4 z-50 space-y-2" aria-live="polite" aria-atomic="true"></div>
+<body>
 
-  <main class="w-screen h-screen p-4 md:p-5 flex flex-col gap-4 overflow-hidden">
-    <header class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between rounded-xl border border-slate-700 bg-slate-800/70 px-4 py-3">
-      <div>
-        <h1 class="text-2xl md:text-3xl font-semibold tracking-tight">Seldon Team Dashboard</h1>
-        <p class="text-slate-300/80">Run analyses, inspect statistical outputs, and collaborate across workspaces.</p>
+  <!-- Toast container -->
+  <div id="toastContainer" class="fixed top-3 right-3 z-50 flex flex-col gap-2"
+       style="pointer-events:none;" aria-live="polite" aria-atomic="true"></div>
+
+  <div style="display:grid; grid-template-rows:40px 1fr; height:100vh; overflow:hidden;">
+
+    <!-- HEADER -->
+    <header style="background:var(--c-panel); border-bottom:1px solid var(--c-border);
+                   padding:0 16px; display:flex; align-items:center;
+                   justify-content:space-between; gap:16px; min-height:40px;">
+      <div style="display:flex; align-items:baseline; gap:10px;">
+        <span style="font-size:14px; font-weight:600; letter-spacing:.18em;
+                     text-transform:uppercase; color:var(--c-cyan);">Seldon</span>
+        <span style="font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+                     color:var(--c-muted); font-weight:500;">Dashboard</span>
       </div>
-      <div class="flex items-center gap-2 text-sm text-slate-300" id="wsStatusWrap">
-        <span id="wsStatusDot" class="inline-block h-2.5 w-2.5 rounded-full bg-amber-400" aria-hidden="true"></span>
-        <span id="wsStatus" aria-live="polite">WebSocket: connecting…</span>
+      <div id="wsStatusWrap" style="display:flex; align-items:center; gap:7px;
+                                    font-size:11px; font-weight:500; letter-spacing:.04em;
+                                    text-transform:uppercase; color:var(--c-dim);">
+        <span id="wsStatusDot" class="status-dot" style="background:var(--c-amber);" aria-hidden="true"></span>
+        <span id="wsStatus" aria-live="polite">WS: Connecting</span>
       </div>
     </header>
 
-    <section class="grid grid-cols-1 xl:grid-cols-12 gap-4 min-h-0 flex-1" aria-label="Workspace and analysis launch">
-      <div class="xl:col-span-4 flex flex-col gap-4 min-h-0 overflow-y-auto pr-1 scroll-smooth">
-        <article class="bg-slate-800/70 border border-slate-700 rounded-xl p-4 space-y-3">
-          <h2 class="text-lg font-semibold">Workspace</h2>
-          <div class="flex gap-2">
-            <input id="workspaceName" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2 min-h-11" placeholder="Workspace name" />
-            <button id="createWorkspaceBtn" class="px-3 py-2 rounded-lg bg-indigo-600/80 hover:bg-indigo-500/80 min-h-11 disabled:opacity-60 disabled:cursor-not-allowed">Create</button>
-          </div>
-          <p id="workspaceError" class="text-xs text-rose-400 hidden" role="alert"></p>
-          <div class="flex gap-2">
-            <select id="workspaceSelect" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2 min-h-11" aria-label="Select workspace"></select>
-            <button id="deleteWorkspaceBtn" class="px-3 py-2 rounded-lg bg-rose-700/90 hover:bg-rose-600 min-h-11 disabled:opacity-60 disabled:cursor-not-allowed">Delete</button>
-          </div>
-          <textarea id="workspaceNotes" rows="8" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2" placeholder="Markdown notes for workspace"></textarea>
-          <button id="saveWorkspaceNotesBtn" class="w-full px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 min-h-11 disabled:opacity-60 disabled:cursor-not-allowed">Save Workspace Notes</button>
-        </article>
+    <!-- MAIN GRID -->
+    <main style="display:grid; grid-template-columns:290px 1fr; overflow:hidden;"
+          aria-label="Workspace and analysis launch">
 
-        <article class="bg-slate-800/70 border border-slate-700 rounded-xl p-4 space-y-3">
-          <h2 class="text-lg font-semibold">Launch Analysis</h2>
-          <form id="uploadForm" class="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div>
-              <label class="text-sm text-slate-300">Dataset file</label>
-              <input type="file" id="datasetFile" class="w-full min-h-11" required aria-describedby="datasetFileError" />
-              <p id="datasetFileError" class="text-xs text-rose-400 hidden" role="alert"></p>
+      <!-- LEFT COLUMN -->
+      <aside style="border-right:1px solid var(--c-border); display:flex;
+                    flex-direction:column; overflow-y:auto; overflow-x:hidden;">
+
+        <!-- Workspace -->
+        <section style="padding:10px 12px; border-bottom:1px solid var(--c-border);">
+          <div class="sec-label" style="margin-bottom:6px;">Workspace</div>
+
+          <div style="display:flex; gap:5px; margin-bottom:4px;">
+            <input id="workspaceName" class="field" placeholder="Workspace name" style="flex:1; padding:6px 9px; font-size:12px;" />
+            <button id="createWorkspaceBtn" class="btn btn-primary" style="padding:6px 11px;">Create</button>
+          </div>
+          <p id="workspaceError" class="hidden"
+             style="font-size:12px; color:var(--c-red); margin-bottom:3px;" role="alert"></p>
+
+          <div style="display:flex; gap:5px; margin-bottom:8px;">
+            <select id="workspaceSelect" class="field" aria-label="Select workspace" style="flex:1; padding:6px 9px; font-size:12px;"></select>
+            <button id="deleteWorkspaceBtn" class="btn btn-danger" style="padding:6px 11px;">Delete</button>
+          </div>
+
+          <div class="sec-label" style="margin-bottom:3px;">Notes</div>
+          <textarea id="workspaceNotes" rows="3" class="field"
+                    placeholder="Markdown notes" style="resize:vertical; font-size:12px; padding:6px 9px;"></textarea>
+          <button id="saveWorkspaceNotesBtn" class="btn btn-secondary"
+                  style="width:100%; margin-top:5px; padding:5px 10px;">Save Notes</button>
+        </section>
+
+        <!-- Launch Analysis -->
+        <section style="padding:10px 12px; flex:1;">
+          <div class="sec-label" style="margin-bottom:6px;">Launch Analysis</div>
+          <form id="uploadForm">
+            <div style="display:flex; flex-direction:column; gap:6px;">
+
+              <div>
+                <div class="sec-label" style="margin-bottom:2px; font-size:10px;">Dataset File</div>
+                <input type="file" id="datasetFile" required
+                       accept=".csv,.tsv,.txt,.xlsx,.xls,.gz,.zip"
+                       aria-describedby="datasetFileError"
+                       style="width:100%; padding:4px 0; font-size:12px;" />
+                <p id="datasetFileError" class="hidden"
+                   style="font-size:11px; color:var(--c-red); margin-top:1px;" role="alert"></p>
+              </div>
+
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:5px;">
+                <div>
+                  <div class="sec-label" style="margin-bottom:2px; font-size:10px;">Analysis Name</div>
+                  <input id="analysisName" class="field" placeholder="Model run" style="padding:6px 9px; font-size:12px;" />
+                </div>
+                <div>
+                  <div class="sec-label" style="margin-bottom:2px; font-size:10px;">Target Column</div>
+                  <input id="targetColumn" class="field" placeholder="target"
+                         aria-describedby="targetColumnError" style="padding:6px 9px; font-size:12px;" />
+                  <p id="targetColumnError" class="hidden"
+                     style="font-size:11px; color:var(--c-red); margin-top:1px;" role="alert"></p>
+                </div>
+              </div>
+
+              <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px;">
+                <div>
+                  <div class="sec-label" style="margin-bottom:2px; font-size:10px;">Feature</div>
+                  <select id="featureStrategy" class="field" style="padding:6px 9px; font-size:12px;">
+                    <option>auto</option><option>adaptive</option>
+                    <option>aggressive</option><option>lenient</option>
+                  </select>
+                </div>
+                <div>
+                  <div class="sec-label" style="margin-bottom:2px; font-size:10px;">Neural</div>
+                  <select id="neuralStrategy" class="field" style="padding:6px 9px; font-size:12px;">
+                    <option>auto</option><option>fast</option>
+                    <option>balanced</option><option>expressive</option>
+                  </select>
+                </div>
+                <div>
+                  <div class="sec-label" style="margin-bottom:2px; font-size:10px;">Bivariate</div>
+                  <select id="bivariateStrategy" class="field" style="padding:6px 9px; font-size:12px;">
+                    <option>auto</option><option>balanced</option>
+                    <option>corr_heavy</option><option>importance_heavy</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <div class="sec-label" style="margin-bottom:2px; font-size:10px;">Plots</div>
+                <input id="plots" class="field" value="bivariate,univariate,overall" style="padding:6px 9px; font-size:12px;" />
+              </div>
+
+              <div>
+                <button id="uploadRunBtn" class="btn btn-primary" type="submit"
+                        style="width:100%; padding:8px 12px; font-size:12px; letter-spacing:.06em;">
+                  Analyze Dataset
+                </button>
+                <p id="uploadFormError" class="hidden"
+                   style="font-size:11px; color:var(--c-red); margin-top:3px;" role="alert"></p>
+              </div>
+
             </div>
-            <div>
-              <label class="text-sm text-slate-300">Analysis name</label>
-              <input id="analysisName" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2 min-h-11" placeholder="Quarterly model run" />
-            </div>
-            <div>
-              <label class="text-sm text-slate-300">Target column</label>
-              <input id="targetColumn" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2 min-h-11" placeholder="target" aria-describedby="targetColumnError" />
-              <p id="targetColumnError" class="text-xs text-rose-400 hidden" role="alert"></p>
-            </div>
-            <div>
-              <label class="text-sm text-slate-300">Feature strategy</label>
-              <select id="featureStrategy" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2 min-h-11">
-                <option>auto</option><option>adaptive</option><option>aggressive</option><option>lenient</option>
-              </select>
-            </div>
-            <div>
-              <label class="text-sm text-slate-300">Neural strategy</label>
-              <select id="neuralStrategy" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2 min-h-11">
-                <option>auto</option><option>fast</option><option>balanced</option><option>expressive</option>
-              </select>
-            </div>
-            <div>
-              <label class="text-sm text-slate-300">Bivariate strategy</label>
-              <select id="bivariateStrategy" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2 min-h-11">
-                <option>auto</option><option>balanced</option><option>corr_heavy</option><option>importance_heavy</option>
-              </select>
-            </div>
-            <div>
-              <label class="text-sm text-slate-300">Plots</label>
-              <input id="plots" value="bivariate,univariate,overall" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2 min-h-11" />
-            </div>
-            <div class="flex items-end">
-              <button id="uploadRunBtn" class="w-full px-3 py-2 rounded-lg bg-indigo-600/80 hover:bg-indigo-500/80 min-h-11 disabled:opacity-60 disabled:cursor-not-allowed" type="submit">Upload + Run</button>
-            </div>
-            <p id="uploadFormError" class="text-xs text-rose-400 md:col-span-2 hidden" role="alert"></p>
           </form>
-          <section class="space-y-2" aria-label="Dataset preview">
-            <h3 class="font-medium text-slate-200">Dataset Preview</h3>
-            <div id="datasetPreviewContainer" class="overflow-x-auto text-xs text-slate-200 rounded-lg border border-slate-700 bg-slate-900/70 p-2"></div>
-          </section>
-        </article>
-      </div>
 
-      <div class="xl:col-span-8 flex flex-col gap-4 min-h-0">
-        <section class="grid grid-cols-1 2xl:grid-cols-2 gap-4" aria-label="Analysis monitoring">
-          <article class="bg-slate-800/70 border border-slate-700 rounded-xl p-4 min-h-0 flex flex-col">
-            <h2 class="text-lg font-semibold mb-3">Analyses</h2>
-            <div class="overflow-x-auto overflow-y-auto min-h-0 flex-1 rounded-lg border border-slate-700 bg-slate-900/50 p-2 scroll-smooth">
-              <table class="w-full text-sm">
-                <thead><tr class="text-left text-slate-400"><th class="py-2">ID</th><th>Status</th><th>Step</th><th></th></tr></thead>
+          <div style="margin-top:10px;">
+            <div class="sec-label" style="margin-bottom:3px; font-size:10px;">Dataset Preview</div>
+            <div id="datasetPreviewContainer"
+                 style="overflow-x:auto; border:1px solid var(--c-border);
+                        background:var(--c-surface); padding:4px; min-height:24px; font-size:11px;"></div>
+          </div>
+        </section>
+
+      </aside>
+
+      <!-- RIGHT COLUMN -->
+      <div style="display:grid; grid-template-rows:auto 1fr; overflow:hidden;">
+
+        <!-- TOP: Analyses + Progress -->
+        <section style="display:grid; grid-template-columns:55% 45%;
+                         border-bottom:1px solid var(--c-border); overflow:hidden; max-height:210px;"
+                 aria-label="Analysis monitoring">
+
+          <!-- Analyses table -->
+          <article style="border-right:1px solid var(--c-border); display:flex;
+                          flex-direction:column; overflow:hidden; padding:10px 12px;">
+            <div class="sec-label" style="margin-bottom:6px;">Active Analyses</div>
+            <div style="overflow-y:auto; flex:1;">
+              <table class="data-table" style="font-size:12px;">
+                <thead>
+                  <tr>
+                    <th style="padding:4px 10px;">ID</th>
+                    <th style="padding:4px 10px;">Status</th>
+                    <th style="padding:4px 10px;">Step</th>
+                    <th style="border-right:none; padding:4px 8px;"></th>
+                  </tr>
+                </thead>
                 <tbody id="analysisRows" aria-live="polite"></tbody>
               </table>
             </div>
           </article>
 
-          <article class="bg-slate-800/70 border border-slate-700 rounded-xl p-4 space-y-3">
-            <h2 class="text-lg font-semibold">Live Progress</h2>
-            <div class="w-full bg-slate-800 rounded-full h-3" aria-hidden="true"><div id="progressBar" class="bg-indigo-500 h-3 rounded-full transition-all" style="width:0%"></div></div>
-            <div id="progressText" class="text-sm text-slate-300" aria-live="polite">No active analysis selected.</div>
-            <textarea id="analysisNotes" rows="7" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2" placeholder="Markdown notes for selected analysis"></textarea>
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              <button id="saveAnalysisNotesBtn" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 min-h-11 disabled:opacity-60 disabled:cursor-not-allowed">Save Analysis Notes</button>
-              <button id="shareAnalysisBtn" class="px-3 py-2 rounded-lg bg-indigo-600/80 hover:bg-indigo-500/80 min-h-11 disabled:opacity-60 disabled:cursor-not-allowed">Create Share Link</button>
+          <!-- Live progress + notes -->
+          <article style="display:flex; flex-direction:column; overflow:hidden;
+                          padding:10px 12px; gap:6px;">
+            <div>
+              <div class="sec-label" style="margin-bottom:4px;">Live Progress</div>
+              <div id="progressTrack"><div id="progressBar" style="width:0%;"></div></div>
+              <div id="progressText" class="mono"
+                   style="font-size:11px; color:var(--c-dim); margin-top:4px;" aria-live="polite">
+                No active analysis selected.
+              </div>
             </div>
-            <div class="flex flex-col sm:flex-row gap-2">
-              <input id="shareLink" class="w-full rounded-lg bg-slate-800 border border-slate-600 px-3 py-2 min-h-11" readonly aria-label="Share link" />
-              <button id="copyShareLinkBtn" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 min-h-11 disabled:opacity-60 disabled:cursor-not-allowed" aria-label="Copy share link">Copy</button>
+
+            <hr class="h-divider" />
+
+            <div class="sec-label" style="margin-bottom:2px;">Analysis Notes</div>
+            <textarea id="analysisNotes" rows="2" class="field"
+                      placeholder="Markdown notes for selected analysis"
+                      style="flex:1; resize:none; font-size:12px; padding:5px 8px;"></textarea>
+
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px;">
+              <button id="saveAnalysisNotesBtn" class="btn btn-secondary" style="padding:5px 8px;">Save</button>
+              <button id="shareAnalysisBtn" class="btn btn-primary" style="padding:5px 8px;">Share</button>
+              <button id="copyShareLinkBtn" class="btn btn-secondary"
+                      aria-label="Copy share link" style="padding:5px 8px;">Copy</button>
             </div>
-            <div id="copyHint" class="text-xs text-emerald-400 hidden" role="status">Copied!</div>
+            <input id="shareLink" class="field mono" readonly aria-label="Share link"
+                   style="font-size:11px; padding:5px 8px;" />
+            <div id="copyHint" class="hidden mono"
+                 style="font-size:11px; color:var(--c-green);" role="status">// Copied</div>
           </article>
         </section>
 
-        <section class="bg-slate-800/70 border border-slate-700 rounded-xl p-4 space-y-3 min-h-0 flex-1 overflow-auto" aria-label="Analysis results">
-          <h2 id="resultsHeading" class="text-lg font-semibold" tabindex="-1">Results</h2>
-          <div id="resultStats" class="grid grid-cols-1 sm:grid-cols-3 gap-2"></div>
-          <div id="tablesContainer" class="overflow-x-auto" aria-live="polite"></div>
-          <div id="chartsContainer" class="space-y-3"></div>
-          <section class="rounded-lg border border-slate-700 bg-slate-900/70 p-3 space-y-2">
-            <div id="reportSwitches" class="flex gap-2 overflow-x-auto whitespace-nowrap pb-1"></div>
-            <h3 id="reportTitle" class="font-medium text-slate-200">Deterministic Report</h3>
-            <pre id="reportMarkdown" class="whitespace-pre-wrap text-xs max-h-[420px] overflow-auto"></pre>
-          </section>
+        <!-- BOTTOM: Analysis Summary -->
+        <section style="display:flex; flex-direction:column; overflow:hidden; padding:12px 14px; gap:10px;"
+                 aria-label="Analysis summary">
+
+          <!-- Header row -->
+          <div style="display:flex; align-items:center; justify-content:space-between; flex-shrink:0;">
+            <h2 id="resultsHeading"
+                style="font-size:11px; font-weight:600; letter-spacing:.12em;
+                       text-transform:uppercase; color:var(--c-muted);"
+                tabindex="-1">Analysis Summary</h2>
+            <button id="openFullAnalysisBtn" class="btn btn-primary"
+                    style="padding:5px 13px; font-size:11px; letter-spacing:.05em;"
+                    disabled>Open Full Analysis</button>
+          </div>
+
+          <!-- Stat cards: univariate / bivariate / overall / reports -->
+          <div id="resultStats"
+               style="display:grid; grid-template-columns:repeat(4,1fr); gap:6px; flex-shrink:0;"></div>
+
+          <!-- Available report badges -->
+          <div style="flex-shrink:0;">
+            <div class="sec-label" style="margin-bottom:6px;">Available Reports</div>
+            <div id="analysisReportList" style="display:flex; flex-wrap:wrap; gap:5px;"></div>
+          </div>
+
+          <!-- Empty / hint state -->
+          <div id="analysisSummaryEmpty" class="mono"
+               style="font-size:12px; color:var(--c-muted); padding:4px 0; flex-shrink:0;">
+            // Select or run an analysis to see summary.
+          </div>
+
         </section>
+
       </div>
-    </section>
-  </main>
+    </main>
+
+    <!-- Hidden containers preserved for JS compatibility -->
+    <div aria-hidden="true" style="display:none;">
+      <div id="tablesContainer"></div>
+      <div id="chartsContainer"></div>
+      <h3 id="reportTitle"></h3>
+      <div id="reportSwitches"></div>
+      <pre id="reportMarkdown"></pre>
+    </div>
+  </div>
 
   <script type="module" src="/app.js"></script>
 </body>

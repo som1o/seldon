@@ -1294,8 +1294,7 @@ void addOverallSections(ReportEngine& report,
                         bool canPlotOverall,
                         bool verbose,
                         const NumericStatsCache& statsCache) {
-    report.addParagraph("Overall analysis aggregates dataset health, model baselines, neural training behavior, and optional global visual diagnostics.");
-    report.addParagraph("Data Health summarizes how much usable signal the engine found after preprocessing, feature selection, statistical filtering, and neural convergence checks.");
+    report.addParagraph("Overall: dataset health, model baselines, neural training, and global visual diagnostics.");
     addDatasetHealthTable(report, data, prep, health);
 
     {

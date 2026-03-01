@@ -2,6 +2,7 @@
 
 #include "AutoConfig.h"
 #include "AutomationPipeline.h"
+#include "CommonUtils.h"
 #include "SeldonExceptions.h"
 
 #include <httplib.h>
@@ -52,6 +53,43 @@ std::string sanitizeId(std::string value) {
         if (!ok) c = '_';
     }
     return value;
+}
+
+// Convert a human name into a filesystem/URL-safe slug.
+// Lowercases, collapses runs of invalid chars to a single '_', strips
+// leading/trailing '_', and falls back to `fallback` when nothing remains.
+std::string slugify(const std::string& name, const std::string& fallback) {
+    std::string out;
+    out.reserve(name.size());
+    bool lastWasUnderscore = true; // suppress leading '_'
+    for (unsigned char c : name) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+            out.push_back(static_cast<char>(c));
+            lastWasUnderscore = false;
+        } else if (c >= 'A' && c <= 'Z') {
+            out.push_back(static_cast<char>(std::tolower(c)));
+            lastWasUnderscore = false;
+        } else {
+            if (!lastWasUnderscore) {
+                out.push_back('_');
+                lastWasUnderscore = true;
+            }
+        }
+    }
+    // Strip trailing '_'
+    while (!out.empty() && out.back() == '_') out.pop_back();
+    if (out.empty()) out = fallback;
+    return out;
+}
+
+// Return `base` if it is not present in `existing`, otherwise `base_2`, `base_3`, …
+template<typename Map>
+std::string uniqueId(const std::string& base, const Map& existing) {
+    if (existing.find(base) == existing.end()) return base;
+    for (int n = 2; ; ++n) {
+        const std::string candidate = base + "_" + std::to_string(n);
+        if (existing.find(candidate) == existing.end()) return candidate;
+    }
 }
 
 std::string randomToken(size_t n = 12) {
@@ -711,11 +749,11 @@ private:
         server.Post("/api/workspaces", [&](const httplib::Request& req, httplib::Response& res) {
             const std::string name = req.has_param("name") ? req.get_param_value("name") : "Untitled Workspace";
             WorkspaceInfo ws;
-            ws.id = sanitizeId(makeId("ws"));
-            ws.name = name;
-            ws.createdAt = nowIsoLike();
             {
                 std::lock_guard<std::mutex> lock(mutex);
+                ws.id = uniqueId(slugify(name, "workspace"), workspaces);
+                ws.name = name;
+                ws.createdAt = nowIsoLike();
                 workspaces[ws.id] = ws;
                 persistWorkspace(ws);
             }
@@ -777,7 +815,20 @@ private:
             auto file = req.get_file_value("dataset");
             const fs::path dir = wsRoot / wsId / "uploads";
             fs::create_directories(dir);
-            const fs::path path = dir / (sanitizeId(randomToken(8)) + "_" + sanitizeId(file.filename));
+
+            // Preserve the original file extension so that Excel/gz/zip files
+            // are detected correctly by resolveDatasetInputPath.
+            // Only sanitize the stem; keep the extension as lowercase.
+            const fs::path origName(file.filename);
+            std::string ext = CommonUtils::toLower(origName.extension().string());
+            // Whitelist safe extensions; fall back to .dat for unknown types
+            static const std::vector<std::string> allowedExts{
+                ".csv", ".tsv", ".txt", ".xlsx", ".xls", ".gz", ".zip", ".dat"};
+            if (std::find(allowedExts.begin(), allowedExts.end(), ext) == allowedExts.end()) {
+                ext = ".dat";
+            }
+            const std::string safeStem = sanitizeId(origName.stem().string());
+            const fs::path path = dir / (sanitizeId(randomToken(8)) + "_" + safeStem + ext);
             std::ofstream out(path, std::ios::binary);
             out << file.content;
             json(res, 200, "{\"dataset_path\":\"" + jsonEscape(path.string()) + "\"}");
@@ -828,11 +879,15 @@ private:
             }
 
             AnalysisInfo analysis;
-            analysis.id = sanitizeId(makeId("analysis"));
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                const std::string rawName = req.has_param("name") ? req.get_param_value("name") : "";
+                analysis.name = rawName.empty() ? "analysis" : rawName;
+                analysis.id = uniqueId(slugify(analysis.name, "analysis"), analyses);
+            }
             analysis.workspaceId = req.get_param_value("workspace_id");
             analysis.datasetPath = req.get_param_value("dataset_path");
             analysis.target = req.has_param("target") ? req.get_param_value("target") : "";
-            analysis.name = req.has_param("name") ? req.get_param_value("name") : analysis.id;
             analysis.createdAt = nowIsoLike();
             analysis.startedAt = nowIsoLike();
             analysis.status = "running";

@@ -3,45 +3,145 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; img-src 'self' data: blob: http: https:; connect-src 'self' ws: wss:; font-src 'self' data:;" />
-  <title>Seldon Analysis Viewer</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://fonts.googleapis.com; img-src 'self' data: blob: http: https:; connect-src 'self' ws: wss:; font-src 'self' data: https://fonts.gstatic.com;" />
+  <title>Seldon // Detailed Analysis</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" />
   <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root {
+      --c-bg:       #0d1117;
+      --c-surface:  #161b22;
+      --c-panel:    #1c2333;
+      --c-raised:   #242d40;
+      --c-border:   #30415a;
+      --c-line:     #3d5270;
+      --c-text:     #e6edf3;
+      --c-muted:    #8b9fc4;
+      --c-dim:      #aabdd6;
+      --c-cyan:     #38bdf8;
+      --c-cyan-dk:  #0ea5e9;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+
+    body {
+      background: var(--c-bg);
+      color: var(--c-text);
+      font-family: 'Inter', system-ui, sans-serif;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    * { scrollbar-width: thin; scrollbar-color: var(--c-line) var(--c-surface); }
+    *::-webkit-scrollbar { width: 4px; height: 4px; }
+    *::-webkit-scrollbar-track { background: var(--c-surface); }
+    *::-webkit-scrollbar-thumb { background: var(--c-line); }
+
+    .sec-label {
+      font-size: 11px; font-weight: 600;
+      letter-spacing: .1em; text-transform: uppercase;
+      color: var(--c-muted);
+    }
+    .mono { font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; }
+
+    .btn {
+      padding: 8px 15px;
+      font-family: 'Inter', sans-serif;
+      font-size: 12px; font-weight: 500;
+      letter-spacing: .04em; text-transform: uppercase;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: background .15s, border-color .15s, color .15s;
+      white-space: nowrap; min-height: 32px;
+    }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+    .btn-primary {
+      background: var(--c-cyan-dk); border-color: var(--c-cyan); color: #fff;
+    }
+    .btn-primary:not(:disabled):hover { background: var(--c-cyan); color: var(--c-bg); }
+
+    .btn-secondary {
+      background: var(--c-raised); border-color: var(--c-line); color: var(--c-dim);
+    }
+    .btn-secondary:not(:disabled):hover { border-color: var(--c-cyan-dk); color: var(--c-cyan); }
+
+    .btn-back {
+      background: transparent; border-color: var(--c-line); color: var(--c-dim);
+      text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
+    }
+    .btn-back:hover { border-color: var(--c-cyan-dk); color: var(--c-cyan); }
+  </style>
 </head>
-<body class="bg-slate-900 text-slate-100 min-h-screen">
-  <main class="w-screen h-screen p-4 md:p-5 flex flex-col gap-4 overflow-hidden">
-    <header class="rounded-xl border border-slate-700 bg-slate-800/70 px-4 py-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-      <div>
-        <h1 class="text-2xl font-semibold tracking-tight">Analysis Detail View</h1>
-        <p id="analysisStatus" class="text-sm text-slate-300">Loading analysis...</p>
+<body>
+
+  <div style="display:grid; grid-template-rows:44px 1fr; height:100vh; overflow:hidden;">
+
+    <!-- HEADER -->
+    <header style="background:var(--c-panel); border-bottom:1px solid var(--c-border);
+                   padding:0 16px; display:flex; align-items:center;
+                   justify-content:space-between; gap:16px;">
+      <div style="display:flex; align-items:baseline; gap:10px;">
+        <span style="font-size:15px; font-weight:600; letter-spacing:.18em;
+                     text-transform:uppercase; color:var(--c-cyan);">Seldon</span>
+        <span style="font-size:12px; letter-spacing:.1em; text-transform:uppercase;
+                     color:var(--c-muted); font-weight:500;">Detailed Analysis</span>
       </div>
-      <a href="/" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Back to Dashboard</a>
+      <div style="display:flex; align-items:center; gap:12px;">
+        <span id="analysisStatus" class="mono"
+              style="font-size:13px; color:var(--c-dim);">Loading analysis…</span>
+        <a href="/" class="btn btn-back">&#8592; Dashboard</a>
+      </div>
     </header>
 
-    <section class="grid grid-cols-1 xl:grid-cols-2 gap-4 min-h-0 flex-1">
-      <article class="rounded-xl border border-slate-700 bg-slate-800/70 p-4 overflow-auto space-y-4">
-        <h2 class="text-lg font-semibold">Charts</h2>
-        <section class="space-y-2">
-          <h3 class="text-sm text-slate-300">Univariate</h3>
-          <div id="univariateCharts" class="grid grid-cols-1 md:grid-cols-2 gap-2"></div>
-        </section>
-        <section class="space-y-2">
-          <h3 class="text-sm text-slate-300">Bivariate</h3>
-          <div id="bivariateCharts" class="grid grid-cols-1 md:grid-cols-2 gap-2"></div>
-        </section>
-        <section class="space-y-2">
-          <h3 class="text-sm text-slate-300">Overall</h3>
-          <div id="overallCharts" class="grid grid-cols-1 md:grid-cols-2 gap-2"></div>
-        </section>
+    <!-- MAIN GRID -->
+    <main style="display:grid; grid-template-columns:1fr 1fr; overflow:hidden;">
+
+      <!-- LEFT: Charts -->
+      <article style="border-right:1px solid var(--c-border); display:flex;
+                      flex-direction:column; overflow:hidden; padding:12px 14px; gap:12px;">
+        <div class="sec-label">Charts</div>
+        <div style="overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:14px;">
+
+          <section>
+            <div class="sec-label" style="margin-bottom:6px;">Univariate</div>
+            <div id="univariateCharts"
+                 style="display:grid; grid-template-columns:repeat(2,1fr); gap:6px;"></div>
+          </section>
+
+          <section>
+            <div class="sec-label" style="margin-bottom:6px;">Bivariate</div>
+            <div id="bivariateCharts"
+                 style="display:grid; grid-template-columns:repeat(2,1fr); gap:6px;"></div>
+          </section>
+
+          <section>
+            <div class="sec-label" style="margin-bottom:6px;">Overall</div>
+            <div id="overallCharts"
+                 style="display:grid; grid-template-columns:repeat(2,1fr); gap:6px;"></div>
+          </section>
+
+        </div>
       </article>
 
-      <article class="rounded-xl border border-slate-700 bg-slate-800/70 p-4 overflow-auto space-y-3">
-        <h2 class="text-lg font-semibold">Reports</h2>
-        <div id="reportButtons" class="flex flex-wrap gap-2"></div>
-        <h3 id="activeReportTitle" class="text-sm text-slate-300">Select a report</h3>
-        <pre id="activeReportBody" class="rounded-lg border border-slate-700 bg-slate-900/70 p-3 text-xs whitespace-pre-wrap"></pre>
+      <!-- RIGHT: Reports -->
+      <article style="display:flex; flex-direction:column; overflow:hidden; padding:12px 14px; gap:8px;">
+        <div class="sec-label">Reports</div>
+        <div id="reportButtons" style="display:flex; flex-wrap:wrap; gap:4px;"></div>
+        <div style="border:1px solid var(--c-border); background:var(--c-surface); flex:1; display:flex; flex-direction:column; overflow:hidden;">
+          <div style="padding:8px 12px; border-bottom:1px solid var(--c-border);">
+            <h3 id="activeReportTitle" class="sec-label" style="color:var(--c-dim);">Select a report</h3>
+          </div>
+          <pre id="activeReportBody" class="mono"
+               style="padding:14px; font-size:13px; white-space:pre-wrap;
+                      overflow-y:auto; flex:1; color:var(--c-text); margin:0; line-height:1.7;"></pre>
+        </div>
       </article>
-    </section>
-  </main>
+
+    </main>
+  </div>
 
   <script type="module" src="/analysis.js"></script>
 </body>
