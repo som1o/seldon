@@ -1077,6 +1077,14 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
 
     const TemporalSeries temporal = detectTemporalSeries(data);
     size_t suppressedByEngineeredFamilyGuard = 0;
+    size_t suppressedByConsensusGate = 0;
+    size_t suppressedByValidationGate = 0;
+    size_t suppressedByLatentGate = 0;
+
+    const double minBootstrapSupport = std::clamp(options.minBootstrapSupport, 0.0, 1.0);
+    const double minOrientationMargin = std::clamp(options.minOrientationMargin, 0.0, 1.0);
+    const double minConfidence = std::clamp(options.minConfidence, 0.0, 1.0);
+    const double minAbsCorrelation = std::clamp(options.minAbsCorrelation, 0.0, 1.0);
 
     for (size_t i = 0; i < core.directed.size(); ++i) {
         for (size_t j = 0; j < core.directed.size(); ++j) {
@@ -1100,19 +1108,42 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
             const double support = (result.bootstrapRuns == 0)
                 ? 0.0
                 : static_cast<double>(bootstrapCounts[{i, j}]) / static_cast<double>(result.bootstrapRuns);
+            const double reverseSupport = (result.bootstrapRuns == 0)
+                ? 0.0
+                : static_cast<double>(bootstrapCounts[{j, i}]) / static_cast<double>(result.bootstrapRuns);
+            const double orientationMargin = std::max(0.0, support - reverseSupport);
+
+            if (absR < minAbsCorrelation) {
+                ++suppressedByConsensusGate;
+                continue;
+            }
+
+            if (result.bootstrapRuns > 0 &&
+                (support < minBootstrapSupport || orientationMargin < minOrientationMargin)) {
+                ++suppressedByConsensusGate;
+                continue;
+            }
 
             std::string validation = "no proxy validation";
+            bool grangerPass = false;
+            bool icpPass = false;
+            double grangerScore = 0.0;
+            double icpScore = 0.0;
             if (options.enableGrangerValidation || options.enableIcpValidation) {
                 std::vector<std::string> checks;
                 if (options.enableGrangerValidation) {
                     const auto p = grangerPValue(data, view.nodeColumnIdx[i], view.nodeColumnIdx[j], temporal);
                     if (p.has_value()) {
+                        grangerPass = (*p <= std::max(0.10, options.alpha * 2.0));
+                        grangerScore = std::clamp(1.0 - (*p / std::max(1e-6, options.alpha * 2.0)), 0.0, 1.0);
                         checks.push_back("Granger p=" + std::to_string(*p).substr(0, 6));
                     }
                 }
                 if (options.enableIcpValidation) {
                     const auto inv = icpStabilityScore(data, view.nodeColumnIdx[i], view.nodeColumnIdx[j], temporal);
                     if (inv.has_value()) {
+                        icpPass = (*inv <= 0.45);
+                        icpScore = std::clamp(1.0 - (*inv / 0.45), 0.0, 1.0);
                         checks.push_back("ICP drift=" + std::to_string(*inv).substr(0, 5));
                     }
                 }
@@ -1125,14 +1156,41 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
                 }
             }
 
-            const double confidence = std::clamp(0.20 + 0.35 * absR + 0.45 * support, 0.0, 0.99);
+            const bool proxyValidated = grangerPass || icpPass;
+            if (options.requireProxyValidationWhenTemporal && temporal.valid &&
+                (options.enableGrangerValidation || options.enableIcpValidation) && !proxyValidated) {
+                ++suppressedByValidationGate;
+                continue;
+            }
+
+            const double proxyScore = (grangerScore > 0.0 || icpScore > 0.0)
+                ? std::max(grangerScore, icpScore)
+                : 0.0;
+            double confidence = std::clamp(0.12 + 0.28 * absR + 0.30 * support +
+                                           0.22 * orientationMargin + 0.08 * proxyScore,
+                                           0.0,
+                                           0.995);
             const bool latentHint = options.enableFCI && hasLikelyLatentConfounding(view.rows, i, j);
+            if (latentHint) {
+                confidence *= 0.85;
+            }
+            if (latentHint && support < 0.80) {
+                ++suppressedByLatentGate;
+                continue;
+            }
+            if (confidence < minConfidence) {
+                ++suppressedByConsensusGate;
+                continue;
+            }
             result.edges.push_back({
                 view.nodeColumnIdx[i],
                 view.nodeColumnIdx[j],
                 confidence,
                 support,
-                "|r|=" + std::to_string(absR).substr(0, 5) + ", support=" + std::to_string(100.0 * support).substr(0, 5) + "%" +
+                "|r|=" + std::to_string(absR).substr(0, 5) +
+                    ", support=" + std::to_string(100.0 * support).substr(0, 5) +
+                    "%" +
+                    ", margin=" + std::to_string(100.0 * orientationMargin).substr(0, 5) + "%" +
                     std::string(latentHint ? ", latent_hint=possible" : ""),
                 "PC/Meek" + std::string(options.enableGES ? " + GES" : "") +
                     std::string(core.usedLiNGAM ? " + LiNGAM" : "") +
@@ -1173,6 +1231,18 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
     if (suppressedByEngineeredFamilyGuard > 0) {
         result.notes.push_back("Causal semantic guard suppressed " + std::to_string(suppressedByEngineeredFamilyGuard) +
                                " base/engineered-family edge(s) to avoid identity-lineage causality artifacts.");
+    }
+    if (suppressedByConsensusGate > 0) {
+        result.notes.push_back("Robust consensus gate suppressed " + std::to_string(suppressedByConsensusGate) +
+                               " directed edge(s) due to low bootstrap support, low orientation margin, weak effect, or low confidence.");
+    }
+    if (suppressedByValidationGate > 0) {
+        result.notes.push_back("Temporal proxy validation gate suppressed " + std::to_string(suppressedByValidationGate) +
+                               " directed edge(s) lacking Granger/ICP support.");
+    }
+    if (suppressedByLatentGate > 0) {
+        result.notes.push_back("Latent-confounding gate suppressed " + std::to_string(suppressedByLatentGate) +
+                               " directed edge(s) with unstable latent-confounding hints.");
     }
 
     return result;

@@ -42,6 +42,11 @@
 #include <unistd.h>
 #include <utility>
 #include <cstdlib>
+#ifdef SELDON_USE_NATIVE_PARQUET
+#include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <parquet/arrow/writer.h>
+#endif
 #ifdef USE_OPENMP
 #include <omp.h>
 #endif
@@ -129,6 +134,124 @@ int spawnProcessSilenced(const std::string& executable, const std::vector<std::s
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     return -1;
 }
+
+#ifdef SELDON_USE_NATIVE_PARQUET
+bool exportParquetNative(const TypedDataset& data,
+                        const std::string& parquetPath,
+                        std::string& errorOut) {
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    std::vector<std::shared_ptr<arrow::Array>> arrays;
+    fields.reserve(data.columns().size());
+    arrays.reserve(data.columns().size());
+
+    for (const auto& col : data.columns()) {
+        if (col.type == ColumnType::NUMERIC) {
+            arrow::DoubleBuilder builder;
+            const auto& vals = std::get<std::vector<double>>(col.values);
+            for (size_t r = 0; r < data.rowCount(); ++r) {
+                if (r < col.missing.size() && col.missing[r]) {
+                    if (!builder.AppendNull().ok()) {
+                        errorOut = "Failed to append null for numeric column '" + col.name + "'";
+                        return false;
+                    }
+                    continue;
+                }
+                const double v = (r < vals.size()) ? vals[r] : std::numeric_limits<double>::quiet_NaN();
+                if (!std::isfinite(v)) {
+                    if (!builder.AppendNull().ok()) {
+                        errorOut = "Failed to append NaN-null for numeric column '" + col.name + "'";
+                        return false;
+                    }
+                } else if (!builder.Append(v).ok()) {
+                    errorOut = "Failed to append numeric value for column '" + col.name + "'";
+                    return false;
+                }
+            }
+            std::shared_ptr<arrow::Array> arr;
+            auto status = builder.Finish(&arr);
+            if (!status.ok()) {
+                errorOut = "Failed to finalize numeric Arrow array for column '" + col.name + "': " + status.ToString();
+                return false;
+            }
+            fields.push_back(arrow::field(col.name, arrow::float64(), true));
+            arrays.push_back(arr);
+        } else if (col.type == ColumnType::DATETIME) {
+            arrow::Int64Builder builder;
+            const auto& vals = std::get<std::vector<int64_t>>(col.values);
+            for (size_t r = 0; r < data.rowCount(); ++r) {
+                if (r < col.missing.size() && col.missing[r]) {
+                    if (!builder.AppendNull().ok()) {
+                        errorOut = "Failed to append null for datetime column '" + col.name + "'";
+                        return false;
+                    }
+                    continue;
+                }
+                const int64_t v = (r < vals.size()) ? vals[r] : 0;
+                if (!builder.Append(v).ok()) {
+                    errorOut = "Failed to append datetime value for column '" + col.name + "'";
+                    return false;
+                }
+            }
+            std::shared_ptr<arrow::Array> arr;
+            auto status = builder.Finish(&arr);
+            if (!status.ok()) {
+                errorOut = "Failed to finalize datetime Arrow array for column '" + col.name + "': " + status.ToString();
+                return false;
+            }
+            fields.push_back(arrow::field(col.name, arrow::int64(), true));
+            arrays.push_back(arr);
+        } else {
+            arrow::StringBuilder builder;
+            const auto& vals = std::get<std::vector<std::string>>(col.values);
+            for (size_t r = 0; r < data.rowCount(); ++r) {
+                if (r < col.missing.size() && col.missing[r]) {
+                    if (!builder.AppendNull().ok()) {
+                        errorOut = "Failed to append null for categorical column '" + col.name + "'";
+                        return false;
+                    }
+                    continue;
+                }
+                const std::string v = (r < vals.size()) ? vals[r] : "";
+                if (!builder.Append(v).ok()) {
+                    errorOut = "Failed to append categorical value for column '" + col.name + "'";
+                    return false;
+                }
+            }
+            std::shared_ptr<arrow::Array> arr;
+            auto status = builder.Finish(&arr);
+            if (!status.ok()) {
+                errorOut = "Failed to finalize categorical Arrow array for column '" + col.name + "': " + status.ToString();
+                return false;
+            }
+            fields.push_back(arrow::field(col.name, arrow::utf8(), true));
+            arrays.push_back(arr);
+        }
+    }
+
+    auto schema = std::make_shared<arrow::Schema>(fields);
+    auto table = arrow::Table::Make(schema, arrays, static_cast<int64_t>(data.rowCount()));
+
+    auto outRes = arrow::io::FileOutputStream::Open(parquetPath);
+    if (!outRes.ok()) {
+        errorOut = "Failed to open parquet output path: " + outRes.status().ToString();
+        return false;
+    }
+    std::shared_ptr<arrow::io::FileOutputStream> sink = outRes.ValueOrDie();
+
+    const int64_t chunkRows = std::max<int64_t>(1024, std::min<int64_t>(65536, static_cast<int64_t>(data.rowCount())));
+    auto writeStatus = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, chunkRows);
+    if (!writeStatus.ok()) {
+        errorOut = "Parquet write failed: " + writeStatus.ToString();
+        return false;
+    }
+    auto closeStatus = sink->Close();
+    if (!closeStatus.ok()) {
+        errorOut = "Failed to close parquet output stream: " + closeStatus.ToString();
+        return false;
+    }
+    return true;
+}
+#endif
 
 std::string toFixed(double v, int prec = 4) {
     if (!std::isfinite(v)) return "n/a";
@@ -3061,12 +3184,20 @@ void addUnivariatePlots(ReportEngine& univariate,
     univariate.addParagraph("Categorical and category-numeric univariate plots were skipped because they do not have direct per-column neural significance attribution.");
 }
 
-void saveGeneratedReports(const AutoConfig& runCfg,
+struct ReportSaveSummary {
+    bool htmlRequested = false;
+    bool pandocAvailable = false;
+    size_t htmlAttempted = 0;
+    size_t htmlSucceeded = 0;
+};
+
+ReportSaveSummary saveGeneratedReports(const AutoConfig& runCfg,
                           const ReportEngine& univariate,
                           const ReportEngine& bivariate,
                           const ReportEngine& neuralReport,
                           const ReportEngine& finalAnalysis,
                           const ReportEngine& heuristicsReport) {
+    ReportSaveSummary summary;
     namespace fs = std::filesystem;
     const std::string uniMd = runCfg.outputDir + "/univariate.md";
     const std::string biMd = runCfg.outputDir + "/bivariate.md";
@@ -3082,10 +3213,13 @@ void saveGeneratedReports(const AutoConfig& runCfg,
     heuristicsReport.save(reportMd);
 
     if (runCfg.generateHtml) {
+        summary.htmlRequested = true;
         const std::string pandocExe = findExecutableInPath("pandoc");
         if (pandocExe.empty()) {
-            return;
+            std::cout << "[Seldon][Warning] HTML export requested but 'pandoc' was not found in PATH. Markdown reports were generated only.\n";
+            return summary;
         }
+        summary.pandocAvailable = true;
         const std::vector<std::pair<std::string, std::string>> conversions = {
             {uniMd, runCfg.outputDir + "/univariate.html"},
             {biMd, runCfg.outputDir + "/bivariate.html"},
@@ -3093,13 +3227,25 @@ void saveGeneratedReports(const AutoConfig& runCfg,
             {finalMd, runCfg.outputDir + "/final_analysis.html"},
             {reportMd, runCfg.outputDir + "/report.html"}
         };
+        summary.htmlAttempted = conversions.size();
         for (const auto& [src, dst] : conversions) {
-            spawnProcessSilenced(pandocExe, {src, "-o", dst, "--standalone", "--self-contained"});
+            const int rc = spawnProcessSilenced(pandocExe, {src, "-o", dst, "--standalone", "--self-contained"});
+            if (rc == 0) ++summary.htmlSucceeded;
+        }
+        if (summary.htmlSucceeded < summary.htmlAttempted) {
+            std::cout << "[Seldon][Warning] HTML conversion completed for " << summary.htmlSucceeded
+                      << "/" << summary.htmlAttempted << " files. Check pandoc runtime dependencies.\n";
         }
     }
+
+    return summary;
 }
 
-void printPipelineCompletion(const AutoConfig& runCfg) {
+void printPipelineCompletion(const AutoConfig& runCfg,
+                             bool htmlRequested,
+                             bool pandocAvailable,
+                             size_t htmlAttempted,
+                             size_t htmlSucceeded) {
     namespace fs = std::filesystem;
     const std::string neuralHtml = (fs::path(runCfg.reportFile).parent_path() /
                                     (fs::path(runCfg.reportFile).stem().string() + ".html")).string();
@@ -3111,13 +3257,18 @@ void printPipelineCompletion(const AutoConfig& runCfg) {
               << runCfg.reportFile << ", "
               << runCfg.outputDir << "/final_analysis.md, "
               << runCfg.outputDir << "/report.md\n";
-    if (runCfg.generateHtml) {
+    if (htmlRequested && pandocAvailable && htmlSucceeded > 0) {
         std::cout << "[Seldon] HTML reports (self-contained): "
                   << runCfg.outputDir << "/univariate.html, "
                   << runCfg.outputDir << "/bivariate.html, "
                   << neuralHtml << ", "
                   << runCfg.outputDir << "/final_analysis.html, "
-                  << runCfg.outputDir << "/report.html\n";
+                  << runCfg.outputDir << "/report.html"
+                  << " (" << htmlSucceeded << "/" << htmlAttempted << " succeeded)\n";
+    } else if (htmlRequested && !pandocAvailable) {
+        std::cout << "[Seldon][Warning] HTML export skipped because pandoc is unavailable.\n";
+    } else if (htmlRequested && pandocAvailable && htmlSucceeded == 0) {
+        std::cout << "[Seldon][Warning] HTML export attempted but no HTML files were produced successfully.\n";
     }
     std::cout << "[Seldon] Plot folders: "
               << plotSubdir(runCfg, "univariate") << ", "
@@ -3184,15 +3335,16 @@ void exportPreprocessedDatasetIfRequested(const TypedDataset& data, const AutoCo
 
     if (runCfg.exportPreprocessed == "parquet") {
         const std::string parquetPath = basePath + ".parquet";
-        const std::string pythonExe = findExecutableInPath("python3");
-        if (!pythonExe.empty()) {
-            const std::string code =
-                "import pandas as pd\n"
-                "import sys\n"
-                "df = pd.read_csv(sys.argv[1])\n"
-                "df.to_parquet(sys.argv[2], index=False)\n";
-            spawnProcessSilenced(pythonExe, {"-c", code, csvPath, parquetPath});
+#ifdef SELDON_USE_NATIVE_PARQUET
+        std::string parquetError;
+        if (!exportParquetNative(data, parquetPath, parquetError)) {
+            std::cout << "[Seldon][Warning] Native parquet export failed: " << parquetError
+                      << ". CSV export is available at " << csvPath << "\n";
         }
+#else
+        std::cout << "[Seldon][Warning] Parquet export requested, but this build was compiled without native parquet support. "
+                  << "Rebuild with Arrow/Parquet libraries enabled. CSV export is available at " << csvPath << "\n";
+#endif
     }
 }
 

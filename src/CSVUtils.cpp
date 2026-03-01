@@ -14,15 +14,31 @@ std::string trimUnquotedField(const std::string& value) {
 }
 
 void skipBOM(std::istream& is) {
-    char bom[3];
-    if (is.read(bom, 3)) {
-        if (!((unsigned char)bom[0] == 0xEF && (unsigned char)bom[1] == 0xBB && (unsigned char)bom[2] == 0xBF)) {
-            is.seekg(0);
-        }
-    } else {
-        is.clear();
-        is.seekg(0);
+    if (!is.good()) return;
+
+    const int first = is.peek();
+    if (first == EOF || static_cast<unsigned char>(first) != 0xEF) {
+        return;
     }
+
+    is.get();
+    const int second = is.peek();
+    if (second == EOF || static_cast<unsigned char>(second) != 0xBB) {
+        is.clear(is.rdstate() & ~std::ios::eofbit);
+        is.unget();
+        return;
+    }
+
+    is.get();
+    const int third = is.peek();
+    if (third == EOF || static_cast<unsigned char>(third) != 0xBF) {
+        is.clear(is.rdstate() & ~std::ios::eofbit);
+        is.unget();
+        is.unget();
+        return;
+    }
+
+    is.get();
 }
 
 std::vector<std::string> parseCSVLine(std::istream& is,

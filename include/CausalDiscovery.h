@@ -12,6 +12,11 @@ struct CausalDiscoveryOptions {
     size_t maxConditionSet = 2;
     double alpha = 0.05;
     size_t bootstrapSamples = 100;
+    double minBootstrapSupport = 0.60;
+    double minOrientationMargin = 0.10;
+    double minConfidence = 0.65;
+    double minAbsCorrelation = 0.08;
+    bool requireProxyValidationWhenTemporal = true;
     uint32_t randomSeed = 1337;
     bool enableLiNGAM = true;
     bool enableFCI = false;

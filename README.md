@@ -60,29 +60,25 @@ If not found, Seldon builds normally without OpenCL acceleration hooks.
 - `-DSELDON_ENABLE_OPENCL=ON|OFF`
 - `-DSELDON_NEURAL_FLOAT32=ON|OFF`
 - `-DSELDON_ENABLE_CUDA=ON|OFF` (optional extra target if toolkit is available)
+- `-DSELDON_ENABLE_NATIVE_PARQUET=ON|OFF` (optional Arrow/Parquet-backed native parquet export)
 
 ---
 
 ## 4) Run
 
-### 4.0 GUI Dashboard (default)
+### 4.0 Web Dashboard (recommended UI)
 
-Seldon now launches a GTK4 desktop dashboard by default:
+Seldon provides a web dashboard from the same `seldon` binary:
 
 ```bash
-./build/seldon
+./build/seldon --web --host 0.0.0.0 --port 8090 --ws-port 8091 --threads 8
 ```
 
-The dashboard exposes core pipeline controls in dedicated tabs and includes:
+Open `http://localhost:8090`.
 
-- `Extra CLI flags` input (supports any existing CLI switch),
-- `Config overlay` input (supports any config key via `key: value` lines),
+### 4.0.1 CLI mode
 
-so every CLI/config capability remains accessible from the GUI.
-
-### 4.0.1 CLI fallback mode
-
-Use CLI mode explicitly with:
+Use CLI mode with:
 
 ```bash
 ./build/seldon --cli /path/to/data.csv [other flags]
@@ -135,6 +131,7 @@ Notes:
 - `--assets-dir <path>`
 - `--generate-html true|false`
 - `--verbose-analysis true|false`
+- `--benchmark-mode true|false`
 - `--store-outlier-flags-in-report true|false`
 - `--fast true|false`
 - `--low-memory true|false`
@@ -147,6 +144,7 @@ See `docs/USAGE.md` for full parameter coverage.
 
 - Usage and config reference: `docs/USAGE.md`
 - Pipeline/component design: `docs/ARCHITECTURE.md`
+- Feature maturity and known gaps: `docs/FEATURE_STATUS.md`
 
 ---
 
@@ -172,3 +170,59 @@ Examples:
 - Directional edges in observational data are hypotheses under CI/model assumptions, not intervention-level causal proof.
 
 Use this output for prioritization and investigation; perform formal inferential validation when decisions are high-stakes.
+
+---
+
+## 10) Deployable Prediction Service (REST)
+
+Seldon includes a lightweight REST prediction engine built on `cpp-httplib`.
+
+Build:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSELDON_ENABLE_REST_SERVICE=ON
+cmake --build build -j"$(nproc)"
+```
+
+Run:
+
+```bash
+./build/seldon --serve --registry ./model_registry.json --host 0.0.0.0 --port 8080 --threads 8
+```
+
+Required registry fields per model entry:
+
+- `model_id`
+- `model_path` (binary produced by `saveModelBinary`)
+- `training_timestamp`
+- `metrics` (`rmse`, `accuracy`)
+- `hyperparameters`
+
+Endpoints:
+
+- `POST /predict`
+- `POST /batch_predict`
+
+The service supports concurrent requests via a thread pool and logs request counts, latency, and prediction distribution summaries.
+
+---
+
+## 11) Team Web Dashboard (Integrated)
+
+The same `seldon` binary now provides a web dashboard for team workflows.
+
+Run:
+
+```bash
+./build/seldon --web --host 0.0.0.0 --port 8090 --ws-port 8091 --threads 8
+```
+
+Open `http://localhost:8090` to:
+
+- upload datasets,
+- configure and launch analysis pipelines,
+- view tables and static chart outputs,
+- manage multi-analysis workspaces,
+- annotate with markdown notes,
+- create shareable links,
+- receive real-time progress updates through WebSockets.

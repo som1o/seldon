@@ -524,17 +524,22 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
     {
         CausalDiscoveryOptions causalOptions;
         causalOptions.maxFeatures = 8;
-        causalOptions.maxConditionSet = 2;
-        causalOptions.alpha = 0.05;
-        causalOptions.bootstrapSamples = 100;
+        causalOptions.maxConditionSet = 3;
+        causalOptions.alpha = 0.02;
+        causalOptions.bootstrapSamples = 180;
+        causalOptions.minBootstrapSupport = 0.70;
+        causalOptions.minOrientationMargin = 0.15;
+        causalOptions.minConfidence = 0.72;
+        causalOptions.minAbsCorrelation = 0.10;
+        causalOptions.requireProxyValidationWhenTemporal = true;
         causalOptions.randomSeed = 1337;
         causalOptions.enableLiNGAM = true;
-        causalOptions.enableFCI = false;
+        causalOptions.enableFCI = true;
         causalOptions.enableGES = true;
         causalOptions.markExperimentalHeuristics = false;
-        causalOptions.enableKernelCiFallback = false;
-        causalOptions.enableGrangerValidation = false;
-        causalOptions.enableIcpValidation = false;
+        causalOptions.enableKernelCiFallback = true;
+        causalOptions.enableGrangerValidation = true;
+        causalOptions.enableIcpValidation = true;
 
         const auto causal = CausalDiscovery::discover(data,
                                                       numericFeatures,

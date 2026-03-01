@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; img-src 'self' data: blob: http: https:; connect-src 'self' ws: wss:; font-src 'self' data:;" />
+  <title>Seldon Analysis Viewer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen">
+  <main class="w-screen h-screen p-4 md:p-5 flex flex-col gap-4 overflow-hidden">
+    <header class="rounded-xl border border-slate-700 bg-slate-800/70 px-4 py-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+      <div>
+        <h1 class="text-2xl font-semibold tracking-tight">Analysis Detail View</h1>
+        <p id="analysisStatus" class="text-sm text-slate-300">Loading analysis...</p>
+      </div>
+      <a href="/" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Back to Dashboard</a>
+    </header>
+
+    <section class="grid grid-cols-1 xl:grid-cols-2 gap-4 min-h-0 flex-1">
+      <article class="rounded-xl border border-slate-700 bg-slate-800/70 p-4 overflow-auto space-y-4">
+        <h2 class="text-lg font-semibold">Charts</h2>
+        <section class="space-y-2">
+          <h3 class="text-sm text-slate-300">Univariate</h3>
+          <div id="univariateCharts" class="grid grid-cols-1 md:grid-cols-2 gap-2"></div>
+        </section>
+        <section class="space-y-2">
+          <h3 class="text-sm text-slate-300">Bivariate</h3>
+          <div id="bivariateCharts" class="grid grid-cols-1 md:grid-cols-2 gap-2"></div>
+        </section>
+        <section class="space-y-2">
+          <h3 class="text-sm text-slate-300">Overall</h3>
+          <div id="overallCharts" class="grid grid-cols-1 md:grid-cols-2 gap-2"></div>
+        </section>
+      </article>
+
+      <article class="rounded-xl border border-slate-700 bg-slate-800/70 p-4 overflow-auto space-y-3">
+        <h2 class="text-lg font-semibold">Reports</h2>
+        <div id="reportButtons" class="flex flex-wrap gap-2"></div>
+        <h3 id="activeReportTitle" class="text-sm text-slate-300">Select a report</h3>
+        <pre id="activeReportBody" class="rounded-lg border border-slate-700 bg-slate-900/70 p-3 text-xs whitespace-pre-wrap"></pre>
+      </article>
+    </section>
+  </main>
+
+  <script type="module" src="/analysis.js"></script>
+</body>
+</html>

@@ -61,6 +61,26 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                            static_cast<int>(totalSteps));
     };
 
+    struct StageBenchmarkRow {
+        std::string stage;
+        double seconds = 0.0;
+        std::string notes;
+    };
+    std::vector<StageBenchmarkRow> stageBenchmarks;
+    stageBenchmarks.reserve(totalSteps + 2);
+    auto stageStartedAt = std::chrono::steady_clock::now();
+    auto advanceTimed = [&](const std::string& label,
+                            const std::string& stage,
+                            const std::string& notes = std::string()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (runCfg.benchmarkMode) {
+            const double sec = std::chrono::duration_cast<std::chrono::duration<double>>(now - stageStartedAt).count();
+            stageBenchmarks.push_back({stage, sec, notes});
+        }
+        advance(label);
+        stageStartedAt = std::chrono::steady_clock::now();
+    };
+
     cleanupOutputs(runCfg);
     MathUtils::setSignificanceAlpha(runCfg.tuning.significanceAlpha);
     MathUtils::setNumericTuning(runCfg.tuning.numericEpsilon,
@@ -102,7 +122,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     data.load();
-    advance("Loaded dataset");
+    advanceTimed("Loaded dataset", "load_dataset");
     if (data.rowCount() == 0 || data.colCount() == 0) {
         throw Seldon::DatasetException("Dataset has no usable rows/columns");
     }
@@ -140,12 +160,12 @@ int AutomationPipeline::run(const AutoConfig& config) {
     }
 
     PreprocessReport prep = Preprocessor::run(data, runCfg);
-    advance("Preprocessed dataset");
+    advanceTimed("Preprocessed dataset", "preprocess");
     exportPreprocessedDatasetIfRequested(data, runCfg);
     normalizeBinaryTarget(data, targetIdx, targetContext.semantics);
     const NumericStatsCache statsCache = buildNumericStatsCache(data);
     const NumericStatsCache rawStatsCache = buildNumericStatsCache(reportingData);
-    advance("Prepared stats cache");
+    advanceTimed("Prepared stats cache", "stats_cache");
 
     if (runCfg.verboseAnalysis) {
         std::cout << "[Seldon][Univariate] Preparing deeply detailed univariate analysis...\n";
@@ -265,7 +285,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         "Quick non-technical view before deep descriptive tables."
     );
     addUnivariateDetailedSection(univariate, reportingData, prep, runCfg.verboseAnalysis, rawStatsCache);
-    advance("Built univariate tables");
+    advanceTimed("Built univariate tables", "univariate_tables");
 
     GnuplotEngine plotterBivariate(plotSubdir(runCfg, "bivariate"), runCfg.plot);
     GnuplotEngine plotterUnivariate(plotSubdir(runCfg, "univariate"), runCfg.plot);
@@ -460,7 +480,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                           runCfg.kfold,
                                           runCfg.benchmarkSeed ^ 0x6a09e667U)
         : MultiTargetBenchmarkSummary{};
-    advance("Finished benchmarks");
+    advanceTimed("Finished benchmarks", "benchmark_models");
 
     if (runCfg.verboseAnalysis) {
         std::cout << "[Seldon][Neural] Starting neural network training with verbose trace...\n";
@@ -475,7 +495,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                               runCfg,
                                               fastModeEnabled,
                                               runCfg.fastNeuralSampleRows);
-    advance("Completed neural analysis");
+    advanceTimed("Completed neural analysis", "neural_analysis");
     neural.featureImportance = buildCoherentImportance(data, targetIdx, featureIdx, neural, benchmarks, runCfg, statsCache);
     const std::unordered_set<size_t> neuralApprovedNumericFeatures = computeNeuralApprovedNumericFeatures(data,
                                                                                                            targetIdx,
@@ -488,7 +508,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
                        canPlot,
                        plotterUnivariate,
                        neuralApprovedNumericFeatures);
-    advance("Generated univariate plots");
+    advanceTimed("Generated univariate plots", "univariate_plots");
 
     BivariateScoringPolicy bivariatePolicy = chooseBivariatePolicy(runCfg, neural);
 
@@ -536,6 +556,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     const size_t totalPossiblePairs = numeric.size() < 2
         ? 0
         : (numeric.size() * (numeric.size() - 1)) / 2;
+    const auto pairStageStart = std::chrono::steady_clock::now();
     auto bivariatePairs = analyzeBivariatePairs(data,
                                                 importanceByIndex,
                                                 modeledIndices,
@@ -547,6 +568,12 @@ int AutomationPipeline::run(const AutoConfig& config) {
                                                 runCfg.tuning,
                                                 fastModeEnabled ? runCfg.fastMaxBivariatePairs : 0,
                                                 std::max<size_t>(8, std::min<size_t>(120, neuralApprovedNumericFeatures.size() * 6)));
+    const auto pairStageEnd = std::chrono::steady_clock::now();
+    const double pairStageSeconds = std::chrono::duration_cast<std::chrono::duration<double>>(pairStageEnd - pairStageStart).count();
+    const size_t analyzedPairsBeforeSuppression = bivariatePairs.size();
+    const double pairThroughput = (pairStageSeconds > 1e-12)
+        ? static_cast<double>(analyzedPairsBeforeSuppression) / pairStageSeconds
+        : 0.0;
 
     size_t datasetMismatchSuppressedPairs = 0;
     bivariatePairs.erase(std::remove_if(bivariatePairs.begin(), bivariatePairs.end(), [&](const PairInsight& p) {
@@ -605,7 +632,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
         }), bivariatePairs.end());
         contaminationSuppressedPairs = before - bivariatePairs.size();
     }
-    advance("Analyzed bivariate pairs");
+    const std::string bivariateNotes = "pairs=" + std::to_string(analyzedPairsBeforeSuppression) +
+        ", throughput_pairs_per_sec=" + toFixed(pairThroughput, 2);
+    advanceTimed("Analyzed bivariate pairs", "bivariate_and_advanced", bivariateNotes);
 
     ReportEngine bivariate;
     bivariate.addTitle("Bivariate Analysis");
@@ -1364,7 +1393,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
                        canPlot && runCfg.plotOverall,
                        runCfg.verboseAnalysis,
                        statsCache);
-    advance("Built overall sections");
+    advanceTimed("Built overall sections", "overall_sections");
 
     ReportEngine finalAnalysis;
     finalAnalysis.addTitle("Final Analysis - Significant Findings Only");
@@ -1783,11 +1812,61 @@ int AutomationPipeline::run(const AutoConfig& config) {
         heuristicsReport.addTable("Residual Discovery", {"Insight"}, {{deterministic.residualNarrative}});
     }
 
-    saveGeneratedReports(runCfg, univariate, bivariate, neuralReport, finalAnalysis, heuristicsReport);
+    const std::vector<std::vector<std::string>> readinessRows = {
+        {"Core tabular pipeline", "stable", "Typed data load, preprocessing, deterministic + neural orchestration", "Primary production path."},
+        {"Bivariate pair analytics", "stable", "Optimized pair scoring with redundancy/leakage guards", "Tiered statistical+neural selection."},
+        {"Causal orientation outputs", "experimental", "Robust algorithmic consensus (PC/Meek + GES + LiNGAM + bootstrap + temporal proxy validation)", "Directional edges are observational guidance, not intervention-grade proof."},
+#ifdef SELDON_USE_NATIVE_PARQUET
+        {"Native parquet export", "stable", "Built with Arrow/Parquet C++ backend", "No Python bridge required."},
+#else
+        {"Native parquet export", "best-effort", "Current binary lacks Arrow/Parquet linkage", "Rebuild with native parquet dependencies to enable parquet output."},
+#endif
+        {"HTML export", "best-effort", "External pandoc dependency", "Gracefully falls back to markdown when unavailable."},
+        {"GPU acceleration (OpenCL/CUDA)", "best-effort", "Environment and driver dependent optional backends", "CPU path remains authoritative fallback."}
+    };
+
+    univariate.addTable("Subsystem Readiness Matrix", {"Subsystem", "Readiness", "Implementation Status", "Guardrail"}, readinessRows);
+    bivariate.addTable("Subsystem Readiness Matrix", {"Subsystem", "Readiness", "Implementation Status", "Guardrail"}, readinessRows);
+    neuralReport.addTable("Subsystem Readiness Matrix", {"Subsystem", "Readiness", "Implementation Status", "Guardrail"}, readinessRows);
+    finalAnalysis.addTable("Subsystem Readiness Matrix", {"Subsystem", "Readiness", "Implementation Status", "Guardrail"}, readinessRows);
+    heuristicsReport.addTable("Subsystem Readiness Matrix", {"Subsystem", "Readiness", "Implementation Status", "Guardrail"}, readinessRows);
+
+    if (runCfg.benchmarkMode) {
+        double totalSeconds = 0.0;
+        for (const auto& row : stageBenchmarks) totalSeconds += std::max(0.0, row.seconds);
+
+        std::vector<std::vector<std::string>> stageRows;
+        stageRows.reserve(stageBenchmarks.size());
+        for (const auto& row : stageBenchmarks) {
+            const double share = (totalSeconds > 1e-12) ? (100.0 * row.seconds / totalSeconds) : 0.0;
+            stageRows.push_back({
+                row.stage,
+                toFixed(row.seconds, 6),
+                toFixed(share, 2) + "%",
+                row.notes.empty() ? "-" : row.notes
+            });
+        }
+
+        std::vector<std::vector<std::string>> throughputRows = {
+            {"pair_analysis", std::to_string(analyzedPairsBeforeSuppression), toFixed(pairStageSeconds, 6), toFixed(pairThroughput, 2)}
+        };
+
+        neuralReport.addTable("Runtime Benchmark - Stage Timings", {"Stage", "Seconds", "Share", "Notes"}, stageRows);
+        neuralReport.addTable("Runtime Benchmark - Throughput", {"Operation", "Work Items", "Seconds", "Items/Sec"}, throughputRows);
+        finalAnalysis.addTable("Runtime Benchmark - Stage Timings", {"Stage", "Seconds", "Share", "Notes"}, stageRows);
+        finalAnalysis.addTable("Runtime Benchmark - Throughput", {"Operation", "Work Items", "Seconds", "Items/Sec"}, throughputRows);
+        heuristicsReport.addTable("Runtime Benchmark - Stage Timings", {"Stage", "Seconds", "Share", "Notes"}, stageRows);
+    }
+
+    const auto saveSummary = saveGeneratedReports(runCfg, univariate, bivariate, neuralReport, finalAnalysis, heuristicsReport);
     cleanupPlotCacheArtifacts(runCfg);
-    advance("Saved reports");
+    advanceTimed("Saved reports", "report_persist");
     progress.done("Pipeline complete");
-    printPipelineCompletion(runCfg);
+    printPipelineCompletion(runCfg,
+                            saveSummary.htmlRequested,
+                            saveSummary.pandocAvailable,
+                            saveSummary.htmlAttempted,
+                            saveSummary.htmlSucceeded);
 
     return 0;
 }

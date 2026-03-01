@@ -1741,11 +1741,13 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
 
     const auto representativeByFeature = buildInformationClusters(data, evalNumericIdx, statsCache, importanceByIndex);
     const auto structuralRelations = detectStructuralRelations(data, evalNumericIdx);
-    std::unordered_map<std::string, std::string> structuralPairLabel;
+    const size_t structuralKeyScale = std::max<size_t>(1, data.columns().size());
+    std::unordered_map<size_t, std::string> structuralPairLabel;
+    structuralPairLabel.reserve(structuralRelations.size());
     for (const auto& sr : structuralRelations) {
         const size_t x = std::min(sr.a, sr.b);
         const size_t y = std::max(sr.a, sr.b);
-        const std::string key = std::to_string(x) + "|" + std::to_string(y);
+        const size_t key = x * structuralKeyScale + y;
         const std::string label = (sr.op == "sum")
             ? (data.columns()[sr.a].name + " + " + data.columns()[sr.b].name + " ≈ " + data.columns()[sr.c].name)
             : (data.columns()[sr.a].name + " × " + data.columns()[sr.b].name + " ≈ " + data.columns()[sr.c].name);
@@ -1796,6 +1798,16 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     std::vector<ColumnStats> evalStats(evalCount);
     std::vector<std::vector<double>> evalRanks(evalCount);
     std::vector<ColumnStats> evalRankStats(evalCount);
+    std::vector<std::string> evalLowerNames(evalCount);
+    std::vector<double> evalImportance(evalCount, 0.0);
+    std::vector<uint8_t> evalModeled(evalCount, 0);
+    static constexpr std::array<const char*, 6> kLeakageTokens = {"future", "post", "outcome", "label", "resolved", "actual"};
+    auto hasLeakageNameHint = [&](const std::string& lowerName) {
+        for (const char* token : kLeakageTokens) {
+            if (lowerName.find(token) != std::string::npos) return true;
+        }
+        return false;
+    };
 
     auto computeAverageRanks = [](const std::vector<double>& values) {
         std::vector<double> ranks(values.size(), 0.0);
@@ -1821,6 +1833,12 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
 
     for (size_t pos = 0; pos < evalCount; ++pos) {
         const size_t colIdx = evalNumericIdx[pos];
+        evalLowerNames[pos] = CommonUtils::toLower(data.columns()[colIdx].name);
+        if (const auto it = importanceByIndex.find(colIdx); it != importanceByIndex.end()) {
+            evalImportance[pos] = it->second;
+        }
+        evalModeled[pos] = (modeledIndices.find(colIdx) != modeledIndices.end()) ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+
         const auto cacheIt = statsCache.find(colIdx);
         if (cacheIt != statsCache.end()) {
             evalStats[pos] = cacheIt->second;
@@ -1931,33 +1949,28 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
 
             const size_t kx = std::min(ia, ib);
             const size_t ky = std::max(ia, ib);
-            const std::string structuralKey = std::to_string(kx) + "|" + std::to_string(ky);
+            const size_t structuralKey = kx * structuralKeyScale + ky;
             auto sit = structuralPairLabel.find(structuralKey);
             if (sit != structuralPairLabel.end()) {
                 p.filteredAsStructural = true;
                 p.relationLabel = sit->second;
             }
 
-            double impA = 0.0;
-            double impB = 0.0;
-            auto ita = importanceByIndex.find(ia);
-            auto itb = importanceByIndex.find(ib);
-            if (ita != importanceByIndex.end()) impA = ita->second;
-            if (itb != importanceByIndex.end()) impB = itb->second;
+            const double impA = evalImportance[aPos];
+            const double impB = evalImportance[bPos];
             double impScore = std::clamp((impA + impB) / 2.0, 0.0, 1.0);
             p.effectSize = std::clamp(p.r2, 0.0, 1.0);
             p.foldStability = (p.statSignificant || absR >= 0.25)
                 ? computeFoldStabilityFromCorrelation(va, vb, 5)
                 : 0.0;
-            bool aModeled = modeledIndices.find(ia) != modeledIndices.end();
-            bool bModeled = modeledIndices.find(ib) != modeledIndices.end();
+            const bool aModeled = evalModeled[aPos] != 0;
+            const bool bModeled = evalModeled[bPos] != 0;
             double coverageFactor = (aModeled && bModeled) ? policy.coverageBoth : ((aModeled || bModeled) ? policy.coverageOne : policy.coverageNone);
             const double effectWeighted = 0.60 * p.effectSize + 0.40 * std::clamp(std::abs(p.r), 0.0, 1.0);
             p.neuralScore = (policy.wImportance * impScore + policy.wCorrelation * effectWeighted + policy.wSignificance * p.foldStability) * coverageFactor;
 
             const bool leakageNameHint =
-                containsToken(CommonUtils::toLower(p.featureA), {"future", "post", "outcome", "label", "resolved", "actual"}) ||
-                containsToken(CommonUtils::toLower(p.featureB), {"future", "post", "outcome", "label", "resolved", "actual"});
+                hasLeakageNameHint(evalLowerNames[aPos]) || hasLeakageNameHint(evalLowerNames[bPos]);
             p.leakageRisk = (std::abs(p.r) >= 0.995 && (leakageNameHint || p.filteredAsStructural));
             if (p.leakageRisk && p.relationLabel.empty()) {
                 p.relationLabel = "Potential leakage proxy";
