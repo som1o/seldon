@@ -84,12 +84,6 @@ public:
                           const std::vector<double>& z,
                           const std::string& title);
 
-    std::string surface(const std::string& id,
-                        const std::vector<double>& x,
-                        const std::vector<double>& y,
-                        const std::vector<std::vector<double>>& z,
-                        const std::string& title);
-
     /**
      * @brief Generates residual-vs-fitted plot image.
      */
@@ -115,17 +109,12 @@ public:
                           const std::string& yLabel = "Value");
 
     /**
-     * @brief Generates auto-selected violin-like or boxen-like plot for categorical-numeric distributions.
+     * @brief Generates boxen-like plot for categorical-numeric distributions.
      */
     std::string categoricalDistribution(const std::string& id,
                                         const std::vector<std::string>& categories,
                                         const std::vector<double>& values,
                                         const std::string& title);
-
-    std::string violin(const std::string& id,
-                       const std::vector<std::string>& categories,
-                       const std::vector<double>& values,
-                       const std::string& title);
 
     /**
      * @brief Generates faceted scatter plot split by category.
@@ -136,14 +125,6 @@ public:
                                const std::vector<std::string>& facets,
                                const std::string& title,
                                size_t maxFacets = 6);
-
-    /**
-     * @brief Generates parallel coordinates plot for normalized numeric dimensions.
-     */
-    std::string parallelCoordinates(const std::string& id,
-                                    const std::vector<std::vector<double>>& matrix,
-                                    const std::vector<std::string>& axisLabels,
-                                    const std::string& title);
 
     /**
      * @brief Generates time-series plot with automatic trend-line selection.

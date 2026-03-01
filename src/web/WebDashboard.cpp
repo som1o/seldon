@@ -1,6 +1,5 @@
 #include "WebDashboard.h"
 
-#include "AutoConfig.h"
 #include "AutomationPipeline.h"
 #include "CommonUtils.h"
 #include "SeldonExceptions.h"
@@ -10,7 +9,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -19,15 +20,18 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <netinet/in.h>
 #include <optional>
 #include <random>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
@@ -600,7 +604,7 @@ private:
     std::mutex mutex;
     std::unordered_map<std::string, WorkspaceInfo> workspaces;
     std::unordered_map<std::string, AnalysisInfo> analyses;
-    std::atomic<bool> pipelineRunning{false};
+    std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> analysisCancelFlags;
     ProgressWebSocketHub wsHub;
 
     void loadState() {
@@ -636,7 +640,20 @@ private:
                 info.outputDir = readKv(ameta, "output_dir", (anDir.path() / "output").string());
                 info.notesPath = (anDir.path() / "notes.md").string();
                 info.shareToken = readKv(ameta, "share_token", "");
+
+                const bool interruptedRun = (info.status == "running" || info.status == "queued");
+                if (interruptedRun) {
+                    info.status = "failed";
+                    info.message = "Interrupted: app stopped during analysis";
+                    if (info.finishedAt.empty()) {
+                        info.finishedAt = nowIsoLike();
+                    }
+                }
+
                 analyses[info.id] = info;
+                if (interruptedRun) {
+                    persistAnalysis(info);
+                }
             }
         }
     }
@@ -873,12 +890,9 @@ private:
                 json(res, 400, "{\"error\":\"workspace_id and dataset_path are required\"}");
                 return;
             }
-            if (pipelineRunning.exchange(true, std::memory_order_acq_rel)) {
-                json(res, 409, "{\"error\":\"another analysis is currently running\"}");
-                return;
-            }
 
             AnalysisInfo analysis;
+            auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 const std::string rawName = req.has_param("name") ? req.get_param_value("name") : "";
@@ -900,6 +914,7 @@ private:
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 analyses[analysis.id] = analysis;
+                analysisCancelFlags[analysis.id] = cancelFlag;
                 persistAnalysis(analysis);
             }
 
@@ -918,6 +933,7 @@ private:
                             analysis.datasetPath,
                             analysis.outputDir,
                             analysis.target,
+                            cancelFlag,
                             featureStrategy,
                             neuralStrategy,
                             bivariateStrategy,
@@ -943,6 +959,31 @@ private:
             std::ostringstream out;
             appendAnalysisJson(out, it->second);
             json(res, 200, out.str());
+        });
+
+        server.Post(R"(/api/analyses/([A-Za-z0-9_\-]+)/cancel)", [&](const httplib::Request& req, httplib::Response& res) {
+            const std::string id = req.matches[1];
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = analyses.find(id);
+            if (it == analyses.end()) {
+                json(res, 404, "{\"error\":\"analysis not found\"}");
+                return;
+            }
+            if (it->second.status != "running") {
+                json(res, 409, "{\"error\":\"analysis is not running\"}");
+                return;
+            }
+            auto tokenIt = analysisCancelFlags.find(id);
+            if (tokenIt == analysisCancelFlags.end() || !tokenIt->second) {
+                json(res, 409, "{\"error\":\"analysis cannot be canceled\"}");
+                return;
+            }
+
+            tokenIt->second->store(true, std::memory_order_release);
+            it->second.message = "Cancel requested";
+            persistAnalysis(it->second);
+            publishProgress(it->second);
+            json(res, 200, "{\"ok\":true}");
         });
 
         server.Get(R"(/api/analyses/([A-Za-z0-9_\-]+)/download)", [&](const httplib::Request& req, httplib::Response& res) {
@@ -1297,6 +1338,7 @@ private:
                      const std::string& datasetPath,
                      const std::string& outputDir,
                      const std::string& target,
+                     const std::shared_ptr<std::atomic<bool>>& cancelFlag,
                      const std::string& featureStrategy,
                      const std::string& neuralStrategy,
                      const std::string& bivariateStrategy,
@@ -1306,6 +1348,31 @@ private:
                      const std::string& plotBivariate,
                      const std::string& benchmarkMode,
                      const std::string& generateHtml) {
+        auto isCancelRequested = [&]() {
+            return cancelFlag && cancelFlag->load(std::memory_order_acquire);
+        };
+
+        auto parseBool = [](const std::string& value, bool fallback) {
+            if (value.empty()) return fallback;
+            const std::string lowered = CommonUtils::toLower(CommonUtils::trim(value));
+            if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on") return true;
+            if (lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off") return false;
+            return fallback;
+        };
+
+        auto splitCsv = [](const std::string& raw) {
+            std::vector<std::string> parts;
+            std::stringstream ss(raw);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                const std::string normalized = CommonUtils::toLower(CommonUtils::trim(item));
+                if (!normalized.empty()) {
+                    parts.push_back(normalized);
+                }
+            }
+            return parts;
+        };
+
         auto updateState = [&](const std::string& status,
                                const std::string& message,
                                int step,
@@ -1315,51 +1382,71 @@ private:
             if (it == analyses.end()) return;
             it->second.status = status;
             it->second.message = message;
-            it->second.step = step;
-            it->second.totalSteps = total;
+            it->second.step = std::max(0, step);
+            it->second.totalSteps = std::max(0, total);
             persistAnalysis(it->second);
             publishProgress(it->second);
         };
 
+        auto markCanceled = [&]() {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = analyses.find(analysisId);
+            if (it == analyses.end()) return;
+            it->second.status = "canceled";
+            it->second.message = "Canceled by user";
+            it->second.finishedAt = nowIsoLike();
+            persistAnalysis(it->second);
+            publishProgress(it->second);
+        };
+
+        AutoConfig pipelineCfg;
+        pipelineCfg.datasetPath = datasetPath;
+        pipelineCfg.outputDir = outputDir;
+        pipelineCfg.targetColumn = target;
+        pipelineCfg.featureStrategy = CommonUtils::toLower(CommonUtils::trim(featureStrategy.empty() ? "auto" : featureStrategy));
+        pipelineCfg.neuralStrategy = CommonUtils::toLower(CommonUtils::trim(neuralStrategy.empty() ? "auto" : neuralStrategy));
+        pipelineCfg.bivariateStrategy = CommonUtils::toLower(CommonUtils::trim(bivariateStrategy.empty() ? "auto" : bivariateStrategy));
+        pipelineCfg.benchmarkMode = parseBool(benchmarkMode, true);
+        pipelineCfg.generateHtml = parseBool(generateHtml, false);
+        pipelineCfg.verboseAnalysis = false;
+
+        const auto requestedPlotModes = splitCsv(plots);
+        const bool plotListHasUnivariate = std::find(requestedPlotModes.begin(), requestedPlotModes.end(), "univariate") != requestedPlotModes.end();
+        const bool plotListHasOverall = std::find(requestedPlotModes.begin(), requestedPlotModes.end(), "overall") != requestedPlotModes.end();
+        const bool plotListHasBivariate = std::find(requestedPlotModes.begin(), requestedPlotModes.end(), "bivariate") != requestedPlotModes.end();
+        pipelineCfg.plotModesExplicit = true;
+        pipelineCfg.plotUnivariate = parseBool(plotUnivariate, plotListHasUnivariate);
+        pipelineCfg.plotOverall = parseBool(plotOverall, plotListHasOverall);
+        pipelineCfg.plotBivariateSignificant = parseBool(plotBivariate, plotListHasBivariate);
+
+        if (pipelineCfg.plotUnivariate || pipelineCfg.plotOverall || pipelineCfg.plotBivariateSignificant) {
+            pipelineCfg.plot.format = "png";
+        }
+
+        updateState("running", "Running", 0, 10);
+
+        AutomationPipeline pipeline;
         try {
-            std::vector<std::string> args = {
-                "seldon",
-                datasetPath,
-                "--output-dir", outputDir,
-                "--feature-strategy", featureStrategy,
-                "--neural-strategy", neuralStrategy,
-                "--bivariate-strategy", bivariateStrategy,
-                "--plots", plots,
-                "--plot-univariate", plotUnivariate,
-                "--plot-overall", plotOverall,
-                "--plot-bivariate", plotBivariate,
-                "--benchmark-mode", benchmarkMode,
-                "--generate-html", generateHtml,
-                "--verbose-analysis", "false"
-            };
-            if (!target.empty()) {
-                args.push_back("--target");
-                args.push_back(target);
-            }
-
-            std::vector<char*> argv;
-            argv.reserve(args.size());
-            for (auto& arg : args) argv.push_back(arg.data());
-
             AutomationPipeline::onProgress = [&](const std::string& label, int step, int total) {
-                updateState("running", label, step, total);
+                const int normalizedTotal = total > 0 ? total : 10;
+                const int normalizedStep = std::max(0, std::min(step, normalizedTotal));
+                const std::string message = label.empty() ? "Running" : label;
+                updateState("running", message, normalizedStep, normalizedTotal);
+            };
+            AutomationPipeline::shouldCancel = [&]() {
+                return isCancelRequested();
             };
 
-            updateState("running", "Preparing", 0, 10);
-
-            AutoConfig cfg = AutoConfig::fromArgs(static_cast<int>(argv.size()), argv.data());
-            AutomationPipeline pipeline;
-            const int code = pipeline.run(cfg);
-
-            if (code == 0) {
+            const int exitCode = pipeline.run(pipelineCfg);
+            if (isCancelRequested()) {
+                markCanceled();
+            } else if (exitCode == 0) {
                 std::lock_guard<std::mutex> lock(mutex);
                 auto it = analyses.find(analysisId);
                 if (it != analyses.end()) {
+                    if (it->second.totalSteps <= 0) {
+                        it->second.totalSteps = 10;
+                    }
                     it->second.status = "completed";
                     it->second.message = "Completed";
                     it->second.step = it->second.totalSteps;
@@ -1368,14 +1455,23 @@ private:
                     publishProgress(it->second);
                 }
             } else {
-                updateState("failed", "Pipeline exited with code " + std::to_string(code), 0, 0);
+                updateState("failed", "Pipeline exited with code " + std::to_string(exitCode), 0, 10);
             }
-        } catch (const std::exception& e) {
-            updateState("failed", e.what(), 0, 0);
+        } catch (const std::exception& ex) {
+            if (isCancelRequested()) {
+                markCanceled();
+            } else {
+                updateState("failed", ex.what(), 0, 10);
+            }
         }
 
         AutomationPipeline::onProgress = nullptr;
-        pipelineRunning.store(false, std::memory_order_release);
+        AutomationPipeline::shouldCancel = nullptr;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            analysisCancelFlags.erase(analysisId);
+        }
     }
 };
 } // namespace

@@ -1,5 +1,14 @@
 int AutomationPipeline::run(const AutoConfig& config) {
     AutoConfig runCfg = config;
+    static const std::string kCancellationSignal = "__seldon_cancelled__";
+
+    auto throwIfCanceled = [&]() {
+        if (AutomationPipeline::shouldCancel && AutomationPipeline::shouldCancel()) {
+            throw std::runtime_error(kCancellationSignal);
+        }
+    };
+
+    throwIfCanceled();
 
     if (runCfg.lowMemoryMode) {
         runCfg.fastMode = true;
@@ -54,11 +63,13 @@ int AutomationPipeline::run(const AutoConfig& config) {
     size_t currentStep = 0;
 
     auto advance = [&](const std::string& label) {
+        throwIfCanceled();
         ++currentStep;
         progress.update(label, currentStep, totalSteps);
         if (AutomationPipeline::onProgress)
             AutomationPipeline::onProgress(label, static_cast<int>(currentStep),
                                            static_cast<int>(totalSteps));
+        throwIfCanceled();
     };
 
     struct StageBenchmarkRow {
@@ -81,6 +92,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         stageStartedAt = std::chrono::steady_clock::now();
     };
 
+    throwIfCanceled();
     cleanupOutputs(runCfg);
     MathUtils::setSignificanceAlpha(runCfg.tuning.significanceAlpha);
     MathUtils::setNumericTuning(runCfg.tuning.numericEpsilon,
@@ -121,6 +133,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         data.setColumnTypeOverrides(std::move(typeOverrides));
     }
 
+    throwIfCanceled();
     data.load();
     advanceTimed("Loaded dataset", "load_dataset");
     if (data.rowCount() == 0 || data.colCount() == 0) {
@@ -159,6 +172,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         runCfg.storeOutlierFlagsInReport = true;
     }
 
+    throwIfCanceled();
     PreprocessReport prep = Preprocessor::run(data, runCfg);
     advanceTimed("Preprocessed dataset", "preprocess");
     exportPreprocessedDatasetIfRequested(data, runCfg);

@@ -153,7 +153,7 @@ export function renderWorkspaceOptions(workspaces, currentWorkspaceId) {
   }
 }
 
-export function renderAnalyses(analyses, { onOpen, onDelete, onDownload }) {
+export function renderAnalyses(analyses, { onOpen, onDelete, onDownload, onCancel }) {
   const rows = el('analysisRows');
   rows.innerHTML = '';
 
@@ -172,6 +172,7 @@ export function renderAnalyses(analyses, { onOpen, onDelete, onDownload }) {
     const statusLower = String(analysis.status || '').toLowerCase();
     const statusColor = statusLower === 'completed' ? '#1a9e5a'
       : statusLower === 'running' ? '#e8940a'
+      : statusLower === 'canceled' ? '#cc5555'
       : statusLower === 'failed' ? '#cc3333'
       : 'var(--c-dim)';
     statusTd.innerHTML = `<span style="color:${statusColor};font-weight:500;">${analysis.status}</span>`;
@@ -208,6 +209,12 @@ export function renderAnalyses(analyses, { onOpen, onDelete, onDownload }) {
 
     actionsTd.appendChild(inspectButton);
     actionsTd.appendChild(downloadButton);
+    if (statusLower === 'running' && typeof onCancel === 'function') {
+      const cancelButton = mkBtn('Cancel', 'background:rgba(204,51,51,0.10); border-color:rgba(204,51,51,0.35); color:#cc4444;');
+      cancelButton.setAttribute('aria-label', `Cancel analysis ${analysis.id}`);
+      cancelButton.onclick = () => onCancel(analysis.id);
+      actionsTd.appendChild(cancelButton);
+    }
     actionsTd.appendChild(deleteButton);
 
     tr.appendChild(idTd);

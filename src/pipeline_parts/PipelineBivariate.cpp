@@ -1469,40 +1469,6 @@ void addOverallSections(ReportEngine& report,
             if (!weightDyn.empty()) report.addImage("Overall NN Weight Dynamics", weightDyn);
         }
 
-        auto numericIdxForParallel = data.numericColumnIndices();
-        if (numericIdxForParallel.size() >= config.tuning.parallelCoordinatesMinDims &&
-            numericIdxForParallel.size() <= config.tuning.parallelCoordinatesMaxDims &&
-            data.rowCount() >= config.tuning.parallelCoordinatesMinRows) {
-            std::vector<std::string> axisLabels;
-            axisLabels.reserve(numericIdxForParallel.size());
-            for (size_t idx : numericIdxForParallel) {
-                axisLabels.push_back(data.columns()[idx].name);
-            }
-
-            std::vector<std::vector<double>> matrix;
-            matrix.reserve(data.rowCount());
-            for (size_t r = 0; r < data.rowCount(); ++r) {
-                std::vector<double> row;
-                row.reserve(numericIdxForParallel.size());
-                bool ok = true;
-                for (size_t idx : numericIdxForParallel) {
-                    const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
-                    if (r >= vals.size() || data.columns()[idx].missing[r] || !std::isfinite(vals[r])) {
-                        ok = false;
-                        break;
-                    }
-                    row.push_back(vals[r]);
-                }
-                if (ok) matrix.push_back(std::move(row));
-            }
-
-            std::string parallel = overallPlotter->parallelCoordinates("overall_parallel_coords",
-                                                                        matrix,
-                                                                        axisLabels,
-                                                                        "Parallel Coordinates (Numeric Features)");
-            if (!parallel.empty()) report.addImage("Parallel Coordinates", parallel);
-        }
-
         if (auto ts = detectTimeSeriesSignal(data, config.tuning); ts.has_value()) {
             const RegularizedSeriesView regularized = regularizeTimeSeries(ts->timeX, ts->values);
             const auto& tsX = regularized.x.empty() ? ts->timeX : regularized.x;
@@ -1615,81 +1581,14 @@ void addOverallSections(ReportEngine& report,
                                                                    "3D Scatter: " + data.columns()[numeric[0]].name + " vs " + data.columns()[numeric[1]].name + " vs " + data.columns()[numeric[2]].name);
                 if (!scatter3d.empty()) report.addImage("3D Scatter", scatter3d);
 
-                if (x3.size() >= 40) {
-                    const size_t gx = 16;
-                    const size_t gy = 16;
-                    auto [xMinIt, xMaxIt] = std::minmax_element(x3.begin(), x3.end());
-                    auto [yMinIt, yMaxIt] = std::minmax_element(y3.begin(), y3.end());
-                    const double xMin = *xMinIt;
-                    const double xMax = *xMaxIt;
-                    const double yMin = *yMinIt;
-                    const double yMax = *yMaxIt;
-                    const double xSpan = std::max(1e-9, xMax - xMin);
-                    const double ySpan = std::max(1e-9, yMax - yMin);
-
-                    std::vector<std::vector<double>> sum(gy, std::vector<double>(gx, 0.0));
-                    std::vector<std::vector<size_t>> cnt(gy, std::vector<size_t>(gx, 0));
-                    for (size_t i = 0; i < x3.size(); ++i) {
-                        const size_t ix = std::min(gx - 1, static_cast<size_t>(((x3[i] - xMin) / xSpan) * static_cast<double>(gx - 1)));
-                        const size_t iy = std::min(gy - 1, static_cast<size_t>(((y3[i] - yMin) / ySpan) * static_cast<double>(gy - 1)));
-                        sum[iy][ix] += z3[i];
-                        cnt[iy][ix] += 1;
-                    }
-
-                    std::vector<double> xs(gx, 0.0);
-                    std::vector<double> ys(gy, 0.0);
-                    std::vector<std::vector<double>> zz(gy, std::vector<double>(gx, 0.0));
-                    for (size_t ix = 0; ix < gx; ++ix) xs[ix] = xMin + (xSpan * static_cast<double>(ix) / static_cast<double>(gx - 1));
-                    for (size_t iy = 0; iy < gy; ++iy) ys[iy] = yMin + (ySpan * static_cast<double>(iy) / static_cast<double>(gy - 1));
-                    for (size_t iy = 0; iy < gy; ++iy) {
-                        for (size_t ix = 0; ix < gx; ++ix) {
-                            zz[iy][ix] = (cnt[iy][ix] > 0) ? (sum[iy][ix] / static_cast<double>(cnt[iy][ix])) : 0.0;
-                        }
-                    }
-                    std::string surf = overallPlotter->surface("overall_surface",
-                                                                xs,
-                                                                ys,
-                                                                zz,
-                                                                "Surface (Binned Mean): " + data.columns()[numeric[2]].name);
-                    if (!surf.empty()) report.addImage("3D Surface", surf);
-                }
-            }
-        }
-
-        {
-            const auto cats = data.categoricalColumnIndices();
-            const auto nums = data.numericColumnIndices();
-            if (!cats.empty() && !nums.empty()) {
-                const auto& ccol = data.columns()[cats.front()];
-                const auto& ncol = data.columns()[nums.front()];
-                const auto& catVals = std::get<std::vector<std::string>>(ccol.values);
-                const auto& numVals = std::get<std::vector<double>>(ncol.values);
-                std::vector<std::string> catsAligned;
-                std::vector<double> numsAligned;
-                const size_t n = std::min(catVals.size(), numVals.size());
-                catsAligned.reserve(n);
-                numsAligned.reserve(n);
-                for (size_t i = 0; i < n; ++i) {
-                    if (i < ccol.missing.size() && ccol.missing[i]) continue;
-                    if (i < ncol.missing.size() && ncol.missing[i]) continue;
-                    if (!std::isfinite(numVals[i])) continue;
-                    const std::string cat = CommonUtils::trim(catVals[i]);
-                    if (cat.empty()) continue;
-                    catsAligned.push_back(cat);
-                    numsAligned.push_back(numVals[i]);
-                }
-                std::string violin = overallPlotter->violin("overall_violin",
-                                                            catsAligned,
-                                                            numsAligned,
-                                                            "Violin Plot: " + ncol.name + " by " + ccol.name);
-                if (!violin.empty()) report.addImage("Violin Plot", violin);
             }
         }
 
         {
             auto numIdx = data.numericColumnIndices();
             if (numIdx.size() >= 3) {
-                const size_t cap = std::min<size_t>(numIdx.size(), config.tuning.parallelCoordinatesMaxDims);
+                constexpr size_t kPcaMaxDimensions = 10;
+                const size_t cap = std::min<size_t>(numIdx.size(), kPcaMaxDimensions);
                 numIdx.resize(cap);
                 const PCAInsight pca = runPCA2(data, numIdx, 300);
                 if (!pca.pc1.empty() && pca.pc1.size() == pca.pc2.size()) {

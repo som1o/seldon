@@ -14,5 +14,11 @@ public:
      * Set before calling run().
      * Called on the pipeline thread with (label, step, totalSteps).
      */
-    static std::function<void(const std::string&, int, int)> onProgress;
+    static thread_local std::function<void(const std::string&, int, int)> onProgress;
+
+    /**
+     * Optional cancellation hook for external consumers (e.g., web UI cancel).
+     * Should return true when the current run should stop as soon as possible.
+     */
+    static thread_local std::function<bool()> shouldCancel;
 };

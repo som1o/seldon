@@ -98,6 +98,10 @@ export function getAnalysis(id) {
   return apiRequest(`/api/analyses/${encodeURIComponent(id)}`);
 }
 
+export function cancelAnalysis(id) {
+  return apiRequest(`/api/analyses/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+}
+
 export function deleteAnalysis(id) {
   return apiRequest(`/api/analyses/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }

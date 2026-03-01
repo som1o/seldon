@@ -1,6 +1,7 @@
 #include "CSVUtils.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <unordered_set>
 
@@ -52,135 +53,235 @@ std::vector<std::string> parseCSVLine(std::istream& is,
     if (limitExceeded) *limitExceeded = false;
     if (is.peek() == EOF) return {};
 
+    enum class FieldState {
+        LEADING,
+        UNQUOTED,
+        QUOTED,
+        AFTER_QUOTE
+    };
+
     std::vector<std::string> row;
-    std::string val;
-    bool inQuotes = false;
+    std::string value;
+    FieldState state = FieldState::LEADING;
     bool currentFieldQuoted = false;
-    bool lastPushedFieldQuoted = false;
-    bool hasRecordData = false;
     bool hadDelimiter = false;
-    bool recordHadAnyNewline = false;
+    bool hasAnyData = false;
+    bool endedByNewline = false;
+    bool atRecordStart = true;
     size_t recordBytes = 0;
-    size_t physicalLineCount = 1;
-    char c;
+    size_t physicalLines = 1;
 
     auto markLimitExceeded = [&]() {
         if (limitExceeded) *limitExceeded = true;
     };
 
-    auto exceedsRecordBytes = [&](size_t delta) {
-        if (limits.maxRecordBytes == 0) return false;
-        if (recordBytes > limits.maxRecordBytes - delta) {
+    auto addRecordBytes = [&](size_t delta) {
+        if (limits.maxRecordBytes > 0 && recordBytes > limits.maxRecordBytes - delta) {
             markLimitExceeded();
-            return true;
+            return false;
         }
         recordBytes += delta;
-        return false;
+        return true;
     };
 
-    auto exceedsFieldBytes = [&](size_t fieldSize) {
-        if (limits.maxFieldBytes == 0) return false;
-        if (fieldSize > limits.maxFieldBytes) {
+    auto appendValueChar = [&](char ch) {
+        value.push_back(ch);
+        if (limits.maxFieldBytes > 0 && value.size() > limits.maxFieldBytes) {
             markLimitExceeded();
-            return true;
+            return false;
         }
-        return false;
+        return true;
     };
 
     auto pushField = [&]() {
-        row.push_back(currentFieldQuoted ? val : trimUnquotedField(val));
-        lastPushedFieldQuoted = currentFieldQuoted;
+        row.push_back(currentFieldQuoted ? value : trimUnquotedField(value));
         if (limits.maxColumns > 0 && row.size() > limits.maxColumns) {
             markLimitExceeded();
+            return false;
         }
+        value.clear();
+        state = FieldState::LEADING;
+        currentFieldQuoted = false;
+        return true;
     };
 
-    while (is.get(c)) {
-        if (exceedsRecordBytes(1)) break;
+    while (true) {
+        int peeked = is.peek();
+        if (peeked == EOF) break;
 
-        if (c == '"') {
-            if (!inQuotes && val.empty()) {
-                inQuotes = true;
-                currentFieldQuoted = true;
-                hasRecordData = true;
-            } else if (inQuotes) {
+        char c = static_cast<char>(peeked);
+        if (state == FieldState::QUOTED) {
+            is.get();
+            if (!addRecordBytes(1)) break;
+            atRecordStart = false;
+
+            if (c == '"') {
                 if (is.peek() == '"') {
                     is.get();
-                    if (exceedsRecordBytes(1)) break;
-                    val += '"';
-                    if (exceedsFieldBytes(val.size())) break;
-                } else {
-                    int next = is.peek();
-                    if (next == EOF || next == delimiter || next == '\n' || next == '\r') {
-                        inQuotes = false;
-                    } else {
-                        val += c;
-                        if (exceedsFieldBytes(val.size())) break;
-                    }
+                    if (!addRecordBytes(1)) break;
+                    if (!appendValueChar('"')) break;
+                    hasAnyData = true;
+                    continue;
                 }
-            } else {
-                val += c;
-                if (exceedsFieldBytes(val.size())) break;
-                hasRecordData = true;
+                state = FieldState::AFTER_QUOTE;
+                continue;
             }
-        } else if (c == delimiter && !inQuotes) {
-            pushField();
-            if (limitExceeded && *limitExceeded) break;
-            val.clear();
-            currentFieldQuoted = false;
-            hadDelimiter = true;
-            hasRecordData = true;
-        } else if (c == '\r') {
-            if (is.peek() == '\n') is.get();
-            if (consumedLines) ++(*consumedLines);
-            recordHadAnyNewline = true;
-            if (inQuotes) {
-                ++physicalLineCount;
-                if (limits.maxPhysicalLinesPerRecord > 0 && physicalLineCount > limits.maxPhysicalLinesPerRecord) {
+
+            if (c == '\r') {
+                if (is.peek() == '\n') {
+                    is.get();
+                    if (!addRecordBytes(1)) break;
+                }
+                if (consumedLines) ++(*consumedLines);
+                ++physicalLines;
+                if (limits.maxPhysicalLinesPerRecord > 0 && physicalLines > limits.maxPhysicalLinesPerRecord) {
                     markLimitExceeded();
                     break;
                 }
+                if (!appendValueChar('\n')) break;
+                hasAnyData = true;
+                continue;
             }
-            if (inQuotes) {
-                val += '\n';
-                if (exceedsFieldBytes(val.size())) break;
-            } else {
-                break;
-            }
-        } else if (c == '\n') {
-            if (consumedLines) ++(*consumedLines);
-            recordHadAnyNewline = true;
-            if (inQuotes) {
-                ++physicalLineCount;
-                if (limits.maxPhysicalLinesPerRecord > 0 && physicalLineCount > limits.maxPhysicalLinesPerRecord) {
+
+            if (c == '\n') {
+                if (consumedLines) ++(*consumedLines);
+                ++physicalLines;
+                if (limits.maxPhysicalLinesPerRecord > 0 && physicalLines > limits.maxPhysicalLinesPerRecord) {
                     markLimitExceeded();
                     break;
                 }
+                if (!appendValueChar('\n')) break;
+                hasAnyData = true;
+                continue;
             }
-            if (inQuotes) {
-                val += '\n';
-                if (exceedsFieldBytes(val.size())) break;
-            } else {
-                break;
-            }
-        } else {
-            val += c;
-            if (exceedsFieldBytes(val.size())) break;
-            hasRecordData = true;
+
+            if (!appendValueChar(c)) break;
+            hasAnyData = true;
+            continue;
         }
 
-        if (limitExceeded && *limitExceeded) break;
+        if (state == FieldState::AFTER_QUOTE) {
+            if (c == delimiter) {
+                is.get();
+                if (!addRecordBytes(1)) break;
+                atRecordStart = false;
+                hadDelimiter = true;
+                hasAnyData = true;
+                if (!pushField()) break;
+                continue;
+            }
+
+            if (c == '\r') {
+                is.get();
+                if (!addRecordBytes(1)) break;
+                if (is.peek() == '\n') {
+                    is.get();
+                    if (!addRecordBytes(1)) break;
+                }
+                if (consumedLines) ++(*consumedLines);
+                endedByNewline = true;
+                if (!pushField()) break;
+                break;
+            }
+
+            if (c == '\n') {
+                is.get();
+                if (!addRecordBytes(1)) break;
+                if (consumedLines) ++(*consumedLines);
+                endedByNewline = true;
+                if (!pushField()) break;
+                break;
+            }
+
+            if (std::isspace(static_cast<unsigned char>(c))) {
+                is.get();
+                if (!addRecordBytes(1)) break;
+                atRecordStart = false;
+                continue;
+            }
+
+            if (malformed) *malformed = true;
+            is.get();
+            if (!addRecordBytes(1)) break;
+            atRecordStart = false;
+            if (!appendValueChar(c)) break;
+            state = FieldState::UNQUOTED;
+            hasAnyData = true;
+            continue;
+        }
+
+        if (c == delimiter) {
+            is.get();
+            if (!addRecordBytes(1)) break;
+            atRecordStart = false;
+            hadDelimiter = true;
+            hasAnyData = true;
+            if (!pushField()) break;
+            continue;
+        }
+
+        if (c == '\r') {
+            is.get();
+            if (!addRecordBytes(1)) break;
+            if (is.peek() == '\n') {
+                is.get();
+                if (!addRecordBytes(1)) break;
+            }
+            if (consumedLines) ++(*consumedLines);
+            endedByNewline = true;
+            if (!atRecordStart || hadDelimiter || !value.empty()) {
+                if (!pushField()) break;
+            }
+            break;
+        }
+
+        if (c == '\n') {
+            is.get();
+            if (!addRecordBytes(1)) break;
+            if (consumedLines) ++(*consumedLines);
+            endedByNewline = true;
+            if (!atRecordStart || hadDelimiter || !value.empty()) {
+                if (!pushField()) break;
+            }
+            break;
+        }
+
+        if (state == FieldState::LEADING && std::isspace(static_cast<unsigned char>(c))) {
+            is.get();
+            if (!addRecordBytes(1)) break;
+            atRecordStart = false;
+            if (!appendValueChar(c)) break;
+            continue;
+        }
+
+        if (state == FieldState::LEADING && c == '"' && trimUnquotedField(value).empty()) {
+            is.get();
+            if (!addRecordBytes(1)) break;
+            atRecordStart = false;
+            value.clear();
+            state = FieldState::QUOTED;
+            currentFieldQuoted = true;
+            hasAnyData = true;
+            continue;
+        }
+
+        is.get();
+        if (!addRecordBytes(1)) break;
+        atRecordStart = false;
+        if (!appendValueChar(c)) break;
+        state = FieldState::UNQUOTED;
+        hasAnyData = true;
     }
 
-    if (inQuotes && malformed) {
-        *malformed = true;
+    if (state == FieldState::QUOTED) {
+        if (malformed) *malformed = true;
     }
 
-    if (hasRecordData || hadDelimiter || !val.empty()) {
+    if (!row.empty() || hadDelimiter || !value.empty() || state != FieldState::LEADING || hasAnyData) {
         pushField();
     }
 
-    if (row.size() == 1 && row[0].empty() && !lastPushedFieldQuoted && !hadDelimiter && recordHadAnyNewline) {
+    if (row.size() == 1 && row[0].empty() && !hadDelimiter && endedByNewline) {
         return {};
     }
 

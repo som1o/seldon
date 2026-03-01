@@ -1213,39 +1213,6 @@ std::string GnuplotEngine::scatter3D(const std::string& id,
     return runScript(id, data.str(), script.str());
 }
 
-std::string GnuplotEngine::surface(const std::string& id,
-                                   const std::vector<double>& x,
-                                   const std::vector<double>& y,
-                                   const std::vector<std::vector<double>>& z,
-                                   const std::string& title) {
-    if (x.empty() || y.empty() || z.empty()) return "";
-    if (z.size() != y.size()) return "";
-
-    std::ostringstream data;
-    for (size_t r = 0; r < y.size(); ++r) {
-        if (r >= z.size()) break;
-        const auto& row = z[r];
-        for (size_t c = 0; c < x.size() && c < row.size(); ++c) {
-            if (!std::isfinite(row[c])) continue;
-            data << x[c] << " " << y[r] << " " << row[c] << "\n";
-        }
-        data << "\n";
-    }
-
-    const std::string safeId = sanitizeId(id);
-    std::ostringstream script;
-    script << styledHeader(id, title);
-    script << "set hidden3d\n";
-    script << "set pm3d depthorder\n";
-    script << "set xlabel 'X'\n";
-    script << "set ylabel 'Y'\n";
-    script << "set zlabel 'Value'\n";
-    script << "set palette defined (0 '#1d4ed8', 1 '#60a5fa', 2 '#f59e0b', 3 '#dc2626')\n";
-    script << "splot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
-           << " using 1:2:3 with pm3d title 'Surface'\n";
-    return runScript(id, data.str(), script.str());
-}
-
 std::string GnuplotEngine::residual(const std::string& id,
                                     const std::vector<double>& fitted,
                                     const std::vector<double>& residuals,
@@ -1450,18 +1417,11 @@ std::string GnuplotEngine::categoricalDistribution(const std::string& id,
     });
     if (ordered.size() > 10) ordered.resize(10);
 
-    std::vector<size_t> sizes;
-    sizes.reserve(ordered.size());
-    for (const auto& kv : ordered) sizes.push_back(kv.second.size());
-    std::sort(sizes.begin(), sizes.end());
-    const size_t medianPerCat = sizes[sizes.size() / 2];
-    const bool useViolin = ordered.size() <= 6 && medianPerCat >= 35;
-
     std::ostringstream data;
     std::ostringstream script;
     const std::string safeId = sanitizeId(id);
     const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
-    script << styledHeader(id, title + (useViolin ? " (violin mode)" : " (boxen mode)"));
+    script << styledHeader(id, title + " (boxen mode)");
     script << "set ylabel 'Value' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
     script << "set xrange [0.5:" << (ordered.size() + 0.5) << "]\n";
     script << "set xtics (";
@@ -1470,123 +1430,18 @@ std::string GnuplotEngine::categoricalDistribution(const std::string& id,
         script << quoteForGnuplot(normalizePlotLabel(ordered[i].first, 16)) << " " << (i + 1);
     }
     script << ") rotate by -25 font ',10'\n";
-
-    if (useViolin) {
-        for (size_t i = 0; i < ordered.size(); ++i) {
-            auto vals = ordered[i].second;
-            std::sort(vals.begin(), vals.end());
-            const double minV = vals.front();
-            const double maxV = vals.back();
-            const double span = std::max(1e-9, maxV - minV);
-
-            std::vector<double> grid;
-            grid.reserve(90);
-            for (size_t g = 0; g < 90; ++g) {
-                const double t = static_cast<double>(g) / 89.0;
-                grid.push_back(minV + span * t);
-            }
-            std::vector<double> dens = kdeEvaluate(vals, grid, silvermanBandwidth(vals));
-            const double maxD = *std::max_element(dens.begin(), dens.end());
-            const double scale = (maxD <= 1e-12) ? 0.0 : (0.40 / maxD);
-
-            for (size_t g = 0; g < grid.size(); ++g) {
-                const double half = dens[g] * scale;
-                data << grid[g] << " " << ((i + 1) - half) << " " << ((i + 1) + half) << "\n";
-            }
-            data << "\n\n";
-        }
-
-        script << "plot ";
-        for (size_t i = 0; i < ordered.size(); ++i) {
-            if (i > 0) script << ", ";
-            script << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
-                   << " index " << i
-                   << " using 2:1:3 with filledcurves lc rgb '#93c5fd' fs solid 0.45 notitle";
-        }
-        script << "\n";
-    } else {
-        for (size_t i = 0; i < ordered.size(); ++i) {
-            for (double v : ordered[i].second) {
-                data << (i + 1) << " " << v << "\n";
-            }
-        }
-
-        script << "set style data boxplot\n";
-        script << "set style boxplot outliers pointtype 7\n";
-        script << "set style fill solid 0.35 border lc rgb '#1d4ed8'\n";
-        script << "set boxwidth 0.45\n";
-        script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
-               << " using 1:2 title 'Distribution' lc rgb '#2563eb'\n";
-    }
-
-    return runScript(id, data.str(), script.str());
-}
-
-std::string GnuplotEngine::violin(const std::string& id,
-                                  const std::vector<std::string>& categories,
-                                  const std::vector<double>& values,
-                                  const std::string& title) {
-    const size_t n = std::min(categories.size(), values.size());
-    if (n < 20) return "";
-
-    std::map<std::string, std::vector<double>> byCat;
-    for (size_t i = 0; i < n; ++i) {
-        if (!std::isfinite(values[i]) || categories[i].empty()) continue;
-        byCat[categories[i]].push_back(values[i]);
-    }
-    if (byCat.size() < 2) return "";
-
-    std::vector<std::pair<std::string, std::vector<double>>> ordered;
-    for (auto& kv : byCat) ordered.push_back(kv);
-    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
-        return a.second.size() > b.second.size();
-    });
-    if (ordered.size() > 10) ordered.resize(10);
-
-    std::ostringstream data;
     for (size_t i = 0; i < ordered.size(); ++i) {
-        auto vals = ordered[i].second;
-        std::sort(vals.begin(), vals.end());
-        if (vals.size() < 6) continue;
-        const double minV = vals.front();
-        const double maxV = vals.back();
-        const double span = std::max(1e-9, maxV - minV);
-
-        std::vector<double> grid;
-        grid.reserve(100);
-        for (size_t g = 0; g < 100; ++g) {
-            const double t = static_cast<double>(g) / 99.0;
-            grid.push_back(minV + span * t);
+        for (double v : ordered[i].second) {
+            data << (i + 1) << " " << v << "\n";
         }
-        const std::vector<double> dens = kdeEvaluate(vals, grid, silvermanBandwidth(vals));
-        const double maxD = dens.empty() ? 0.0 : *std::max_element(dens.begin(), dens.end());
-        const double scale = (maxD <= 1e-12) ? 0.0 : (0.42 / maxD);
-
-        for (size_t g = 0; g < grid.size(); ++g) {
-            const double half = dens[g] * scale;
-            data << grid[g] << " " << ((i + 1) - half) << " " << ((i + 1) + half) << "\n";
-        }
-        data << "\n\n";
     }
 
-    std::ostringstream script;
-    script << styledHeader(id, title);
-    script << "set ylabel 'Value'\n";
-    script << "set xrange [0.5:" << (ordered.size() + 0.5) << "]\n";
-    script << "set xtics (";
-    for (size_t i = 0; i < ordered.size(); ++i) {
-        if (i > 0) script << ", ";
-        script << quoteForGnuplot(normalizePlotLabel(ordered[i].first, 16)) << " " << (i + 1);
-    }
-    script << ") rotate by -25 font ',10'\n";
-    script << "plot ";
-    for (size_t i = 0; i < ordered.size(); ++i) {
-        if (i > 0) script << ", ";
-        script << quoteForGnuplot(assetsDir_ + "/" + sanitizeId(id) + ".dat")
-               << " index " << i
-               << " using 2:1:3 with filledcurves lc rgb '#93c5fd' fs solid 0.45 notitle";
-    }
-    script << "\n";
+    script << "set style data boxplot\n";
+    script << "set style boxplot outliers pointtype 7\n";
+    script << "set style fill solid 0.35 border lc rgb '#1d4ed8'\n";
+    script << "set boxwidth 0.45\n";
+    script << "plot " << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
+           << " using 1:2 title 'Distribution' lc rgb '#2563eb'\n";
 
     return runScript(id, data.str(), script.str());
 }
@@ -1643,80 +1498,6 @@ std::string GnuplotEngine::facetedScatter(const std::string& id,
                << " index " << i << " using 1:2 with points ls 1 notitle\n";
     }
     script << "unset multiplot\n";
-
-    return runScript(id, data.str(), script.str());
-}
-
-std::string GnuplotEngine::parallelCoordinates(const std::string& id,
-                                               const std::vector<std::vector<double>>& matrix,
-                                               const std::vector<std::string>& axisLabels,
-                                               const std::string& title) {
-    if (matrix.empty() || axisLabels.size() < 3) return "";
-    const size_t cols = axisLabels.size();
-
-    std::vector<std::vector<double>> rows;
-    rows.reserve(matrix.size());
-    for (const auto& row : matrix) {
-        if (row.size() != cols) continue;
-        bool ok = true;
-        for (double v : row) {
-            if (!std::isfinite(v)) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) rows.push_back(row);
-    }
-    if (rows.size() < 8) return "";
-
-    const size_t maxRows = 220;
-    if (rows.size() > maxRows) {
-        const double step = static_cast<double>(rows.size() - 1) / static_cast<double>(maxRows - 1);
-        std::vector<std::vector<double>> sampled;
-        sampled.reserve(maxRows);
-        for (size_t i = 0; i < maxRows; ++i) {
-            const size_t idx = static_cast<size_t>(std::llround(i * step));
-            sampled.push_back(rows[std::min(idx, rows.size() - 1)]);
-        }
-        rows = std::move(sampled);
-    }
-
-    std::vector<double> mins(cols, std::numeric_limits<double>::infinity());
-    std::vector<double> maxs(cols, -std::numeric_limits<double>::infinity());
-    for (const auto& row : rows) {
-        for (size_t c = 0; c < cols; ++c) {
-            mins[c] = std::min(mins[c], row[c]);
-            maxs[c] = std::max(maxs[c], row[c]);
-        }
-    }
-
-    std::ostringstream data;
-    for (const auto& row : rows) {
-        for (size_t c = 0; c < cols; ++c) {
-            const double span = maxs[c] - mins[c];
-            const double norm = (span <= 1e-12) ? 0.5 : ((row[c] - mins[c]) / span);
-            data << (c + 1) << " " << std::clamp(norm, 0.0, 1.0) << "\n";
-        }
-        data << "\n\n";
-    }
-
-    const std::string safeId = sanitizeId(id);
-    const std::string axisColor = (cfg_.theme == "dark") ? "#e5e7eb" : "#374151";
-    std::ostringstream script;
-    script << styledHeader(id, title);
-    script << "set ylabel 'Normalized value' tc rgb " << quoteForGnuplot(axisColor) << " font ',11'\n";
-    script << "set yrange [0:1]\n";
-    script << "set xrange [1:" << cols << "]\n";
-    script << "set xtics (";
-    for (size_t c = 0; c < cols; ++c) {
-        if (c > 0) script << ", ";
-        script << quoteForGnuplot(normalizePlotLabel(axisLabels[c], 16)) << " " << (c + 1);
-    }
-    script << ") rotate by -25 font ',10'\n";
-    script << "unset key\n";
-    script << "plot for [i=0:" << (rows.size() - 1) << "] "
-           << quoteForGnuplot(assetsDir_ + "/" + safeId + ".dat")
-           << " index i using 1:2 with lines lc rgb '#2563eb' lw 1 notitle\n";
 
     return runScript(id, data.str(), script.str());
 }

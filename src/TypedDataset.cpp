@@ -798,13 +798,33 @@ void TypedDataset::load() {
     auto in = makeInputStream();
     CSVUtils::skipBOM(*in);
 
+    auto readHeaderRow = [&](std::istream& stream) {
+        bool malformedHeader = false;
+        bool parseLimitExceededHeader = false;
+        std::vector<std::string> headerRow;
+        while (stream.peek() != EOF) {
+            malformedHeader = false;
+            parseLimitExceededHeader = false;
+            headerRow = CSVUtils::parseCSVLine(stream, delimiter_, &malformedHeader, nullptr, &parseLimitExceededHeader, parseLimits);
+            if (parseLimitExceededHeader) {
+                throw Seldon::DatasetException("CSV header exceeds parser safety limits");
+            }
+            if (malformedHeader) {
+                throw Seldon::DatasetException("Malformed CSV header");
+            }
+            if (!headerRow.empty()) {
+                break;
+            }
+        }
+        if (headerRow.empty()) {
+            throw Seldon::DatasetException("Malformed or empty CSV header");
+        }
+        return headerRow;
+    };
+
     bool malformed = false;
     bool parseLimitExceeded = false;
-    auto header = CSVUtils::parseCSVLine(*in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
-    if (parseLimitExceeded) {
-        throw Seldon::DatasetException("CSV header exceeds parser safety limits");
-    }
-    if (malformed || header.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
+    auto header = readHeaderRow(*in);
     header = CSVUtils::normalizeHeader(header);
 
     std::vector<uint8_t> forcedTypeMask(header.size(), static_cast<uint8_t>(0));
@@ -1115,11 +1135,7 @@ void TypedDataset::load() {
     CSVUtils::skipBOM(*in);
     malformed = false;
     parseLimitExceeded = false;
-    auto headerSecondPass = CSVUtils::parseCSVLine(*in, delimiter_, &malformed, nullptr, &parseLimitExceeded, parseLimits);
-    if (parseLimitExceeded) {
-        throw Seldon::DatasetException("CSV header exceeds parser safety limits");
-    }
-    if (malformed || headerSecondPass.empty()) throw Seldon::DatasetException("Malformed or empty CSV header");
+    auto headerSecondPass = readHeaderRow(*in);
 
     size_t r = 0;
     size_t decisionIdx = 0;

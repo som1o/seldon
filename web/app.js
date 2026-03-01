@@ -32,6 +32,35 @@ let progressSocket;
 let analysesRefreshTimer = null;
 const TABLE_CHUNK_SIZE = 500;
 
+function getRunningAnalysisId() {
+  const state = getState();
+  const analyses = Array.isArray(state.analyses) ? state.analyses : [];
+  const selected = analyses.find((analysis) => analysis.id === state.currentAnalysisId && analysis.status === 'running');
+  if (selected) {
+    return selected.id;
+  }
+  const firstRunning = analyses.find((analysis) => analysis.status === 'running');
+  return firstRunning ? firstRunning.id : null;
+}
+
+function shouldRenderProgressForMessage(message) {
+  const currentAnalysisId = getState().currentAnalysisId;
+  if (!currentAnalysisId) {
+    return true;
+  }
+  return message.analysis_id === currentAnalysisId;
+}
+
+function syncCancelButton() {
+  const button = el('cancelAnalysisBtn');
+  if (!button) {
+    return;
+  }
+  const runningAnalysisId = getRunningAnalysisId();
+  button.disabled = !runningAnalysisId;
+  button.dataset.analysisId = runningAnalysisId || '';
+}
+
 function scheduleRefreshAnalyses() {
   if (analysesRefreshTimer) {
     return;
@@ -62,8 +91,9 @@ async function refreshWorkspaces() {
     await loadWorkspaceNotes();
     await refreshAnalyses();
   } else {
-    renderAnalyses([], { onOpen: () => {}, onDelete: () => {} });
+    renderAnalyses([], { onOpen: () => {}, onDelete: () => {}, onDownload: () => {}, onCancel: () => {} });
     setWorkspaceNotes('');
+    syncCancelButton();
   }
 }
 
@@ -117,7 +147,9 @@ async function refreshAnalyses() {
     },
     onDelete: (analysisId) => deleteAnalysis(analysisId).catch((error) => showToast(error.message, 'error')),
     onDownload: (analysisId) => downloadAnalysisBundle(analysisId),
+    onCancel: (analysisId) => cancelAnalysis(analysisId).catch((error) => showToast(error.message, 'error')),
   });
+  syncCancelButton();
 }
 
 function downloadAnalysisBundle(analysisId) {
@@ -141,6 +173,10 @@ async function refreshAnalysis(analysisId) {
   renderProgress(analysis);
   if (analysis.status === 'completed') {
     await loadAnalysisResults(analysisId);
+    scheduleRefreshAnalyses();
+    return;
+  }
+  if (analysis.status === 'failed' || analysis.status === 'canceled') {
     scheduleRefreshAnalyses();
   }
 }
@@ -294,6 +330,37 @@ async function deleteAnalysis(analysisId) {
   showToast('Analysis deleted.', 'success');
 }
 
+async function cancelAnalysis(analysisId) {
+  const resolvedAnalysisId = analysisId || el('cancelAnalysisBtn')?.dataset.analysisId || getRunningAnalysisId();
+  if (!resolvedAnalysisId) {
+    showToast('No running analysis to cancel.', 'error');
+    syncCancelButton();
+    return;
+  }
+  if (!window.confirm('Cancel this running analysis?')) {
+    return;
+  }
+
+  const cancelButton = el('cancelAnalysisBtn');
+  const shouldShowLoading = cancelButton && cancelButton.dataset.analysisId === resolvedAnalysisId;
+  if (shouldShowLoading) {
+    setButtonLoading(cancelButton, true, 'Canceling…');
+  }
+  try {
+    await api.cancelAnalysis(resolvedAnalysisId);
+    showToast('Cancel request sent.', 'success');
+    await refreshAnalyses();
+    if (getState().currentAnalysisId === resolvedAnalysisId) {
+      await refreshAnalysis(resolvedAnalysisId);
+    }
+  } finally {
+    if (shouldShowLoading) {
+      setButtonLoading(cancelButton, false);
+    }
+    syncCancelButton();
+  }
+}
+
 async function deleteWorkspace() {
   const button = el('deleteWorkspaceBtn');
   const { currentWorkspaceId } = getState();
@@ -398,6 +465,7 @@ function bindUiEvents() {
   };
   el('saveWorkspaceNotesBtn').onclick = () => saveWorkspaceNotes().catch((error) => showToast(error.message, 'error'));
   el('uploadForm').onsubmit = (event) => uploadAndRun(event).catch((error) => showToast(error.message, 'error'));
+  el('cancelAnalysisBtn').onclick = () => cancelAnalysis().catch((error) => showToast(error.message, 'error'));
   el('saveAnalysisNotesBtn').onclick = () => saveAnalysisNotes().catch((error) => showToast(error.message, 'error'));
   el('shareAnalysisBtn').onclick = () => shareAnalysis().catch((error) => showToast(error.message, 'error'));
   el('copyShareLinkBtn').onclick = () => copyShareLink().catch((error) => showToast(error.message, 'error'));
@@ -410,6 +478,8 @@ function bindUiEvents() {
     onLoadMore: () => fetchNextTableChunk().catch((error) => showToast(error.message, 'error')),
     onLoadAll: () => loadAllTableRows().catch((error) => showToast(error.message, 'error')),
   });
+
+  syncCancelButton();
 }
 
 function initWebSocket() {
@@ -418,11 +488,18 @@ function initWebSocket() {
     getCurrentAnalysisId: () => getState().currentAnalysisId,
     onStatus: (text, mode) => setWsStatus(text, mode),
     onProgress: (message) => {
-      renderProgress(message);
+      if (shouldRenderProgressForMessage(message)) {
+        renderProgress(message);
+      }
+
       if (message.analysis_id === getState().currentAnalysisId) {
         refreshAnalysis(message.analysis_id).catch((error) => showToast(error.message, 'error'));
       }
-      if (message.step >= message.total_steps) {
+
+      if (message.analysis_id === getState().currentAnalysisId &&
+          message.status === 'completed' &&
+          message.total_steps > 0 &&
+          message.step >= message.total_steps) {
         loadAnalysisResults(message.analysis_id).catch((error) => showToast(error.message, 'error'));
       }
       scheduleRefreshAnalyses();

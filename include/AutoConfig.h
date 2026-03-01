@@ -134,12 +134,6 @@ struct HeuristicTuningConfig {
     // Density-overlay minimum sample size
     size_t histogramDensityMinSample = 80;
 
-    // Parallel coordinates tuning
-    size_t parallelCoordinatesMinRows = 40;
-    size_t parallelCoordinatesMaxRows = 220;
-    size_t parallelCoordinatesMinDims = 4;
-    size_t parallelCoordinatesMaxDims = 10;
-
     // Automatic time-series trend overlay tuning
     size_t timeSeriesTrendMinRows = 18;
     size_t timeSeriesSeasonPeriod = 12;
