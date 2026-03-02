@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -48,6 +49,29 @@ std::string nowIsoLike() {
     std::ostringstream out;
     out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S");
     return out.str();
+}
+
+std::optional<std::time_t> parseIsoLike(const std::string& value) {
+    if (value.empty()) return std::nullopt;
+    std::tm tm{};
+    std::istringstream in(value);
+    in >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+    if (in.fail()) return std::nullopt;
+    return std::mktime(&tm);
+}
+
+int analysisDurationSeconds(const std::string& startedAt,
+                            const std::string& finishedAt,
+                            const std::string& status) {
+    const auto start = parseIsoLike(startedAt);
+    if (!start.has_value()) return 0;
+    auto end = parseIsoLike(finishedAt);
+    if (!end.has_value() && status == "running") {
+        end = std::time(nullptr);
+    }
+    if (!end.has_value()) return 0;
+    const int sec = static_cast<int>(std::difftime(*end, *start));
+    return std::max(0, sec);
 }
 
 std::string sanitizeId(std::string value) {
@@ -921,9 +945,9 @@ private:
             const std::string featureStrategy = req.has_param("feature_strategy") ? req.get_param_value("feature_strategy") : "auto";
             const std::string neuralStrategy = req.has_param("neural_strategy") ? req.get_param_value("neural_strategy") : "auto";
             const std::string bivariateStrategy = req.has_param("bivariate_strategy") ? req.get_param_value("bivariate_strategy") : "auto";
-            const std::string plots = req.has_param("plots") ? req.get_param_value("plots") : "bivariate,univariate,overall";
+            const std::string plots = req.has_param("plots") ? req.get_param_value("plots") : "bivariate,univariate";
             const std::string plotUnivariate = req.has_param("plot_univariate") ? req.get_param_value("plot_univariate") : "true";
-            const std::string plotOverall = req.has_param("plot_overall") ? req.get_param_value("plot_overall") : "true";
+            const std::string plotOverall = req.has_param("plot_overall") ? req.get_param_value("plot_overall") : "false";
             const std::string plotBivariate = req.has_param("plot_bivariate") ? req.get_param_value("plot_bivariate") : "true";
             const std::string benchmarkMode = req.has_param("benchmark_mode") ? req.get_param_value("benchmark_mode") : "true";
             const std::string generateHtml = req.has_param("generate_html") ? req.get_param_value("generate_html") : "false";
@@ -1115,7 +1139,6 @@ private:
 
             std::vector<std::string> univariateCharts;
             std::vector<std::string> bivariateCharts;
-            std::vector<std::string> overallCharts;
 
             std::ostringstream out;
             out << "{\"report_markdown\":\"" << jsonEscape(report)
@@ -1145,10 +1168,17 @@ private:
                     univariateCharts.push_back(chartUrl);
                 } else if (relative.find("bivariate/") != std::string::npos) {
                     bivariateCharts.push_back(chartUrl);
-                } else {
-                    overallCharts.push_back(chartUrl);
                 }
             }
+
+            size_t reportCount = 0;
+            if (!univariate.empty()) ++reportCount;
+            if (!bivariate.empty()) ++reportCount;
+            if (!neuralSynthesis.empty()) ++reportCount;
+            if (!finalAnalysis.empty()) ++reportCount;
+            if (!report.empty()) ++reportCount;
+            const int analysisSeconds = analysisDurationSeconds(info.startedAt, info.finishedAt, info.status);
+
             out << "],\"chart_groups\":{"
                 << "\"univariate\":[";
             for (size_t i = 0; i < univariateCharts.size(); ++i) {
@@ -1160,12 +1190,12 @@ private:
                 if (i > 0) out << ',';
                 out << "\"" << jsonEscape(bivariateCharts[i]) << "\"";
             }
-            out << "],\"overall\":[";
-            for (size_t i = 0; i < overallCharts.size(); ++i) {
-                if (i > 0) out << ',';
-                out << "\"" << jsonEscape(overallCharts[i]) << "\"";
-            }
-            out << "]},\"reports\":{"
+            out << "]},\"summary\":{"
+                << "\"univariate_charts\":" << univariateCharts.size() << ','
+                << "\"bivariate_charts\":" << bivariateCharts.size() << ','
+                << "\"reports\":" << reportCount << ','
+                << "\"analysis_seconds\":" << analysisSeconds
+                << "},\"reports\":{"
                 << "\"univariate\":\"" << jsonEscape(univariate) << "\"," 
                 << "\"bivariate\":\"" << jsonEscape(bivariate) << "\"," 
                 << "\"neural_synthesis\":\"" << jsonEscape(neuralSynthesis) << "\"," 
@@ -1412,11 +1442,10 @@ private:
 
         const auto requestedPlotModes = splitCsv(plots);
         const bool plotListHasUnivariate = std::find(requestedPlotModes.begin(), requestedPlotModes.end(), "univariate") != requestedPlotModes.end();
-        const bool plotListHasOverall = std::find(requestedPlotModes.begin(), requestedPlotModes.end(), "overall") != requestedPlotModes.end();
         const bool plotListHasBivariate = std::find(requestedPlotModes.begin(), requestedPlotModes.end(), "bivariate") != requestedPlotModes.end();
         pipelineCfg.plotModesExplicit = true;
         pipelineCfg.plotUnivariate = parseBool(plotUnivariate, plotListHasUnivariate);
-        pipelineCfg.plotOverall = parseBool(plotOverall, plotListHasOverall);
+        pipelineCfg.plotOverall = parseBool(plotOverall, false);
         pipelineCfg.plotBivariateSignificant = parseBool(plotBivariate, plotListHasBivariate);
 
         if (pipelineCfg.plotUnivariate || pipelineCfg.plotOverall || pipelineCfg.plotBivariateSignificant) {

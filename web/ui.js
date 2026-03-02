@@ -231,6 +231,119 @@ export function renderProgress(progress) {
   el('progressText').textContent = `${progress.id || progress.analysis_id}: ${progress.message || 'Running'} (${progress.step}/${progress.total_steps})`;
 }
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderInline(markdown) {
+  let html = escapeHtml(markdown);
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return html;
+}
+
+function splitMarkdownTableRow(line) {
+  const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  return trimmed.split('|').map((cell) => cell.trim().replace(/\\\|/g, '|'));
+}
+
+function isMarkdownTableSeparator(line) {
+  const cells = splitMarkdownTableRow(line);
+  if (!cells.length) return false;
+  return cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function renderMarkdown(markdownText) {
+  const source = String(markdownText || '').replace(/\r/g, '');
+  if (!source.trim()) {
+    return '<div class="mono" style="color:var(--c-muted);">No report content available yet.</div>';
+  }
+
+  const lines = source.split('\n');
+  const out = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      continue;
+    }
+
+    if (trimmed.startsWith('```')) {
+      const codeLines = [];
+      i += 1;
+      while (i < lines.length && !lines[i].trim().startsWith('```')) {
+        codeLines.push(lines[i]);
+        i += 1;
+      }
+      out.push(`<pre style="overflow:auto; border:1px solid var(--c-border); padding:6px; background:rgba(255,255,255,0.02);"><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+      continue;
+    }
+
+    if (trimmed.startsWith('|') && i + 1 < lines.length && isMarkdownTableSeparator(lines[i + 1])) {
+      const headers = splitMarkdownTableRow(line);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim().startsWith('|')) {
+        rows.push(splitMarkdownTableRow(lines[i]));
+        i += 1;
+      }
+      i -= 1;
+
+      const thead = `<thead><tr>${headers.map((cell) => `<th>${renderInline(cell)}</th>`).join('')}</tr></thead>`;
+      const tbody = `<tbody>${rows.map((row) => `<tr>${headers.map((_, idx) => `<td>${renderInline(row[idx] || '')}</td>`).join('')}</tr>`).join('')}</tbody>`;
+      out.push(`<div style="overflow:auto; max-width:100%; max-height:320px; border:1px solid var(--c-border); margin:4px 0;"><table class="data-table" style="min-width:max-content; margin:0;">${thead}${tbody}</table></div>`);
+      continue;
+    }
+
+    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      const level = Math.min(6, heading[1].length + 1);
+      out.push(`<h${level} style="margin:6px 0 4px 0; color:var(--c-text);">${renderInline(heading[2])}</h${level}>`);
+      continue;
+    }
+
+    if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+      const items = [trimmed.slice(2)];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1].trim();
+        if (!(next.startsWith('- ') || next.startsWith('* '))) break;
+        items.push(next.slice(2));
+        i += 1;
+      }
+      out.push(`<ul style="margin:4px 0 4px 16px; list-style:disc;">${items.map((item) => `<li>${renderInline(item)}</li>`).join('')}</ul>`);
+      continue;
+    }
+
+    if (/^<[^>]+>/.test(trimmed)) {
+      out.push(line);
+      continue;
+    }
+
+    const paragraph = [trimmed];
+    while (i + 1 < lines.length) {
+      const next = lines[i + 1].trim();
+      if (!next || next.startsWith('#') || next.startsWith('|') || next.startsWith('- ') || next.startsWith('* ') || next.startsWith('```')) break;
+      paragraph.push(next);
+      i += 1;
+    }
+    out.push(`<p style="margin:4px 0;">${renderInline(paragraph.join(' '))}</p>`);
+  }
+
+  const html = out.join('');
+  if (window.DOMPurify?.sanitize) {
+    return window.DOMPurify.sanitize(html);
+  }
+  return html;
+}
+
 export function renderResults(results) {
   const reports = {
     univariate: results?.reports?.univariate || '',
@@ -243,7 +356,6 @@ export function renderResults(results) {
   const grouped = {
     univariate: [],
     bivariate: [],
-    overall: [],
   };
   const charts = Array.isArray(results?.charts) ? results.charts : [];
   charts.forEach((chartUrl) => {
@@ -251,10 +363,20 @@ export function renderResults(results) {
       grouped.univariate.push(chartUrl);
     } else if (chartUrl.includes('/bivariate/')) {
       grouped.bivariate.push(chartUrl);
-    } else {
-      grouped.overall.push(chartUrl);
     }
   });
+
+  const summary = results?.summary || {};
+  const reportCount = Object.values(reports).filter((text) => text && text.trim()).length;
+  const univariateCount = Number.isFinite(Number(summary.univariate_charts))
+    ? Number(summary.univariate_charts)
+    : grouped.univariate.length;
+  const bivariateCount = Number.isFinite(Number(summary.bivariate_charts))
+    ? Number(summary.bivariate_charts)
+    : grouped.bivariate.length;
+  const analysisSeconds = Number.isFinite(Number(summary.analysis_seconds))
+    ? Math.max(0, Number(summary.analysis_seconds))
+    : 0;
 
   const prevKey = getState().selectedReportKey;
   const selectedReportKey = reports[prevKey] ? prevKey : 'report';
@@ -273,6 +395,12 @@ export function renderResults(results) {
     chartsVisibleCount: 12,
     reports,
     selectedReportKey,
+    summaryMetrics: {
+      univariateCount,
+      bivariateCount,
+      reportCount,
+      analysisSeconds,
+    },
   });
 
   renderResultStats();
@@ -290,19 +418,19 @@ function renderResultStats() {
     return;
   }
   const state = getState();
-  const reportCount = Object.values(state.reports).filter((text) => text && text.trim()).length;
+  const metrics = state.summaryMetrics || {};
   const data = [
-    { label: 'Univariate', value: state.chartGroups?.univariate?.length ?? 0, sub: 'charts' },
-    { label: 'Bivariate', value: state.chartGroups?.bivariate?.length ?? 0, sub: 'charts' },
-    { label: 'Overall', value: state.chartGroups?.overall?.length ?? 0, sub: 'charts' },
-    { label: 'Reports', value: reportCount, sub: 'generated' },
+    { label: 'Univariate', value: Number(metrics.univariateCount || 0), sub: 'charts' },
+    { label: 'Bivariate', value: Number(metrics.bivariateCount || 0), sub: 'charts' },
+    { label: 'Reports', value: Number(metrics.reportCount || 0), sub: 'generated' },
+    { label: 'Analysis Time', value: Number(metrics.analysisSeconds || 0), sub: 'seconds' },
   ];
 
   statsNode.innerHTML = '';
   data.forEach((item) => {
     const card = document.createElement('div');
     card.setAttribute('role', 'listitem');
-    card.style.cssText = 'border-right:1px solid var(--c-border); background:rgba(255,255,255,0.015); padding:7px 10px;';
+    card.style.cssText = 'border:1px solid var(--c-border); background:rgba(255,255,255,0.015); padding:7px 10px; min-height:62px;';
     card.innerHTML = `<div style="font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--c-muted);">${item.label}</div><div class="mono" style="font-size:22px;font-weight:500;color:var(--c-cyan);line-height:1.1;margin-top:2px;text-shadow:0 0 10px rgba(232,148,10,0.45);">${item.value}</div><div style="font-size:11px;color:var(--c-muted);margin-top:1px;">${item.sub}</div>`;
     statsNode.appendChild(card);
   });
@@ -313,6 +441,8 @@ export function renderAnalysisSummary() {
   const reportListNode = el('analysisReportList');
   const openBtn = el('openFullAnalysisBtn');
   const state = getState();
+
+  renderResultStats();
 
   const hasResults =
     (state.charts?.length ?? 0) > 0 ||
@@ -405,7 +535,7 @@ function renderSelectedReport() {
   if (titleNode) {
     titleNode.textContent = labels[selectedReportKey] || 'Report';
   }
-  bodyNode.textContent = reports[selectedReportKey] || 'No report content available yet.';
+  bodyNode.innerHTML = renderMarkdown(reports[selectedReportKey] || 'No report content available yet.');
 }
 
 export function renderTables() {
@@ -493,7 +623,6 @@ export function renderCharts() {
   const grouped = [
     { key: 'univariate', title: 'Univariate Charts', charts: chartGroups.univariate },
     { key: 'bivariate', title: 'Bivariate Charts', charts: chartGroups.bivariate },
-    { key: 'overall', title: 'Overall Charts', charts: chartGroups.overall },
   ];
 
   grouped.forEach((group) => {

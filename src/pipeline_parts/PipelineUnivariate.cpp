@@ -32,6 +32,7 @@
 #include <random>
 #include <regex>
 #include <sstream>
+#include <future>
 #include <spawn.h>
 #include <set>
 #include <string_view>
@@ -3206,11 +3207,22 @@ ReportSaveSummary saveGeneratedReports(const AutoConfig& runCfg,
     const std::string neuralHtml = (fs::path(runCfg.reportFile).parent_path() /
                                     (fs::path(runCfg.reportFile).stem().string() + ".html")).string();
 
-    univariate.save(uniMd);
-    bivariate.save(biMd);
-    neuralReport.save(runCfg.reportFile);
-    finalAnalysis.save(finalMd);
-    heuristicsReport.save(reportMd);
+    const std::array<std::pair<const ReportEngine*, std::string>, 5> markdownTargets = {{
+        {&univariate, uniMd},
+        {&bivariate, biMd},
+        {&neuralReport, runCfg.reportFile},
+        {&finalAnalysis, finalMd},
+        {&heuristicsReport, reportMd}
+    }};
+
+    std::vector<std::future<void>> markdownWrites;
+    markdownWrites.reserve(markdownTargets.size());
+    for (const auto& target : markdownTargets) {
+        markdownWrites.push_back(std::async(std::launch::async, [engine = target.first, path = target.second]() {
+            engine->save(path);
+        }));
+    }
+    for (auto& task : markdownWrites) task.get();
 
     if (runCfg.generateHtml) {
         summary.htmlRequested = true;
@@ -3228,9 +3240,15 @@ ReportSaveSummary saveGeneratedReports(const AutoConfig& runCfg,
             {reportMd, runCfg.outputDir + "/report.html"}
         };
         summary.htmlAttempted = conversions.size();
+        std::vector<std::future<int>> htmlConversions;
+        htmlConversions.reserve(conversions.size());
         for (const auto& [src, dst] : conversions) {
-            const int rc = spawnProcessSilenced(pandocExe, {src, "-o", dst, "--standalone", "--self-contained"});
-            if (rc == 0) ++summary.htmlSucceeded;
+            htmlConversions.push_back(std::async(std::launch::async, [pandocExe, src, dst]() {
+                return spawnProcessSilenced(pandocExe, {src, "-o", dst, "--standalone", "--self-contained"});
+            }));
+        }
+        for (auto& task : htmlConversions) {
+            if (task.get() == 0) ++summary.htmlSucceeded;
         }
         if (summary.htmlSucceeded < summary.htmlAttempted) {
             std::cout << "[Seldon][Warning] HTML conversion completed for " << summary.htmlSucceeded

@@ -30,6 +30,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
         runCfg.generateHtml = false;
     }
 
+    runCfg.plotOverall = false;
+
     runCfg.plot.format = "png";
     {
         namespace fs = std::filesystem;
@@ -303,7 +305,6 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     GnuplotEngine plotterBivariate(plotSubdir(runCfg, "bivariate"), runCfg.plot);
     GnuplotEngine plotterUnivariate(plotSubdir(runCfg, "univariate"), runCfg.plot);
-    GnuplotEngine plotterOverall(plotSubdir(runCfg, "overall"), runCfg.plot);
     const bool canPlot = configurePlotAvailability(runCfg, univariate, plotterBivariate);
 
     FeatureSelectionResult selectedFeatures = collectFeatureIndices(data, targetIdx, runCfg, prep);
@@ -1396,8 +1397,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
                        neural,
                        dataHealth,
                        runCfg,
-                       &plotterOverall,
-                       canPlot && runCfg.plotOverall,
+                       nullptr,
+                       false,
                        runCfg.verboseAnalysis,
                        statsCache);
     advanceTimed("Built overall sections", "overall_sections");

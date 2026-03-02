@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <iterator>
 
 namespace {
 std::string escapeMarkdownTableCell(const std::string& value) {
@@ -241,7 +242,22 @@ void ReportEngine::save(const std::string& filePath) const {
         ? std::filesystem::current_path(ec)
         : std::filesystem::path(filePath).parent_path();
 
-    const std::string normalized = normalizeMarkdownLinksForReport(body_, reportDir);
-    std::ofstream out(filePath);
-    out << normalized;
+    const std::string normalized = (body_.find("](") == std::string::npos)
+        ? body_
+        : normalizeMarkdownLinksForReport(body_, reportDir);
+
+    {
+        std::ifstream in(filePath, std::ios::binary);
+        if (in) {
+            const std::string existing((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            if (existing == normalized) {
+                return;
+            }
+        }
+    }
+
+    std::ofstream out(filePath, std::ios::binary | std::ios::trunc);
+    std::vector<char> ioBuffer(1 << 20, '\0');
+    out.rdbuf()->pubsetbuf(ioBuffer.data(), static_cast<std::streamsize>(ioBuffer.size()));
+    out.write(normalized.data(), static_cast<std::streamsize>(normalized.size()));
 }

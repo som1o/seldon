@@ -30,7 +30,85 @@ import {
 
 let progressSocket;
 let analysesRefreshTimer = null;
+let liveTimerHandle = null;
 const TABLE_CHUNK_SIZE = 500;
+
+function resetSummaryMetrics() {
+  updateState({
+    summaryMetrics: {
+      univariateCount: 0,
+      bivariateCount: 0,
+      reportCount: 0,
+      analysisSeconds: 0,
+    },
+  });
+  renderAnalysisSummary();
+}
+
+function normalizedPlotModes(raw) {
+  const allowed = new Set(['univariate', 'bivariate']);
+  const ordered = [];
+  String(raw || '')
+    .split(',')
+    .map((token) => token.trim().toLowerCase())
+    .forEach((token) => {
+      if (!allowed.has(token) || ordered.includes(token)) {
+        return;
+      }
+      ordered.push(token);
+    });
+  return ordered.length ? ordered.join(',') : 'bivariate,univariate';
+}
+
+function formatElapsed(totalSeconds) {
+  const value = Number.isFinite(totalSeconds) ? Math.max(0, Math.floor(totalSeconds)) : 0;
+  const minutes = Math.floor(value / 60);
+  const seconds = value % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function parseTimestamp(value) {
+  if (!value) return NaN;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function resolveTimerSource() {
+  const state = getState();
+  const analyses = Array.isArray(state.analyses) ? state.analyses : [];
+  if (!state.currentAnalysisId) {
+    return null;
+  }
+  return analyses.find((item) => item.id === state.currentAnalysisId) || null;
+}
+
+function updateLiveTimer() {
+  const node = document.getElementById('liveTimer');
+  if (!node) return;
+
+  const item = resolveTimerSource();
+  if (!item) {
+    node.textContent = 'Elapsed: 00:00';
+    return;
+  }
+
+  const startedAt = parseTimestamp(item.started_at);
+  const finishedAt = parseTimestamp(item.finished_at);
+  if (!Number.isFinite(startedAt)) {
+    node.textContent = 'Elapsed: 00:00';
+    return;
+  }
+
+  const end = Number.isFinite(finishedAt) ? finishedAt : Date.now();
+  const elapsedSeconds = Math.max(0, Math.floor((end - startedAt) / 1000));
+  node.textContent = `Elapsed: ${formatElapsed(elapsedSeconds)}`;
+}
+
+function ensureLiveTimer() {
+  if (liveTimerHandle) return;
+  updateLiveTimer();
+  liveTimerHandle = setInterval(updateLiveTimer, 1000);
+}
 
 function getRunningAnalysisId() {
   const state = getState();
@@ -93,6 +171,7 @@ async function refreshWorkspaces() {
   } else {
     renderAnalyses([], { onOpen: () => {}, onDelete: () => {}, onDownload: () => {}, onCancel: () => {} });
     setWorkspaceNotes('');
+    resetSummaryMetrics();
     syncCancelButton();
   }
 }
@@ -135,6 +214,7 @@ async function refreshAnalyses() {
 
   if (state.currentAnalysisId && !analyses.find((analysis) => analysis.id === state.currentAnalysisId)) {
     updateState({ currentAnalysisId: null });
+    resetSummaryMetrics();
   }
 
   renderAnalyses(analyses, {
@@ -150,6 +230,7 @@ async function refreshAnalyses() {
     onCancel: (analysisId) => cancelAnalysis(analysisId).catch((error) => showToast(error.message, 'error')),
   });
   syncCancelButton();
+  updateLiveTimer();
 }
 
 function downloadAnalysisBundle(analysisId) {
@@ -168,6 +249,7 @@ function downloadAnalysisBundle(analysisId) {
 async function refreshAnalysis(analysisId) {
   const analysis = await api.getAnalysis(analysisId);
   if (getState().currentAnalysisId !== analysisId) {
+    updateLiveTimer();
     return;
   }
   renderProgress(analysis);
@@ -179,6 +261,7 @@ async function refreshAnalysis(analysisId) {
   if (analysis.status === 'failed' || analysis.status === 'canceled') {
     scheduleRefreshAnalyses();
   }
+    updateLiveTimer();
 }
 
 async function loadAnalysisResults(analysisId, options = {}) {
@@ -266,6 +349,7 @@ async function selectAnalysis(analysisId) {
   const notes = await api.getAnalysisNotes(analysisId);
   setAnalysisNotes(notes.markdown || '');
   await loadAnalysisResults(analysisId);
+  updateLiveTimer();
 }
 
 async function saveAnalysisNotes() {
@@ -324,6 +408,11 @@ async function deleteAnalysis(analysisId) {
         final_analysis: '',
         report: '',
       },
+      summary: {
+        univariate_charts: 0,
+        bivariate_charts: 0,
+        analysis_seconds: 0,
+      },
     });
   }
   await refreshAnalyses();
@@ -376,6 +465,7 @@ async function deleteWorkspace() {
   try {
     await api.deleteWorkspace(currentWorkspaceId);
     updateState({ currentWorkspaceId: null, currentAnalysisId: null });
+    resetSummaryMetrics();
     await refreshWorkspaces();
     showToast('Workspace deleted.', 'success');
   } finally {
@@ -427,9 +517,9 @@ async function uploadAndRun(event) {
       feature_strategy: params.feature_strategy,
       neural_strategy: params.neural_strategy,
       bivariate_strategy: params.bivariate_strategy,
-      plots: params.plots,
+      plots: normalizedPlotModes(params.plots),
       plot_univariate: true,
-      plot_overall: true,
+      plot_overall: false,
       plot_bivariate: true,
       benchmark_mode: true,
       generate_html: false,
@@ -450,7 +540,6 @@ async function loadSharedView(token) {
   document.title = `Shared: ${out.name}`;
   setWorkspaceNotes(out.notes || '');
   setAnalysisNotes(out.notes || '');
-  el('reportMarkdown').textContent = out.summary || '';
   el('progressText').textContent = `${out.analysis_id}: ${out.status}`;
 }
 
@@ -459,6 +548,7 @@ function bindUiEvents() {
   el('deleteWorkspaceBtn').onclick = () => deleteWorkspace().catch((error) => showToast(error.message, 'error'));
   el('workspaceSelect').onchange = async (event) => {
     updateState({ currentWorkspaceId: event.target.value, currentAnalysisId: null });
+    resetSummaryMetrics();
     clearValidationErrors();
     await loadWorkspaceNotes();
     await refreshAnalyses();
@@ -510,6 +600,7 @@ function initWebSocket() {
 
 async function init() {
   bindUiEvents();
+  resetSummaryMetrics();
 
   const config = await api.getConfig();
   updateState({ wsPort: config.ws_port });
@@ -520,6 +611,7 @@ async function init() {
     return;
   }
 
+  ensureLiveTimer();
   await refreshWorkspaces();
 }
 

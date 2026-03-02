@@ -21,17 +21,123 @@ function parseAnalysisId() {
 }
 
 function groupedCharts(charts) {
-  const grouped = { univariate: [], bivariate: [], overall: [] };
+  const grouped = { univariate: [], bivariate: [] };
   (charts || []).forEach((chart) => {
     if (chart.includes('/univariate/')) {
       grouped.univariate.push(chart);
     } else if (chart.includes('/bivariate/')) {
       grouped.bivariate.push(chart);
-    } else {
-      grouped.overall.push(chart);
     }
   });
   return grouped;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderInline(markdown) {
+  let html = escapeHtml(markdown);
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return html;
+}
+
+function splitMarkdownTableRow(line) {
+  const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  return trimmed.split('|').map((cell) => cell.trim().replace(/\\\|/g, '|'));
+}
+
+function isMarkdownTableSeparator(line) {
+  const cells = splitMarkdownTableRow(line);
+  if (!cells.length) return false;
+  return cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function renderMarkdown(markdownText) {
+  const source = String(markdownText || '').replace(/\r/g, '');
+  if (!source.trim()) {
+    return '<div class="mono" style="color:var(--c-muted);">No content available.</div>';
+  }
+
+  const lines = source.split('\n');
+  const out = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith('```')) {
+      const codeLines = [];
+      i += 1;
+      while (i < lines.length && !lines[i].trim().startsWith('```')) {
+        codeLines.push(lines[i]);
+        i += 1;
+      }
+      out.push(`<pre style="overflow:auto; border:1px solid var(--c-border); padding:6px; background:rgba(255,255,255,0.02);"><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+      continue;
+    }
+
+    if (trimmed.startsWith('|') && i + 1 < lines.length && isMarkdownTableSeparator(lines[i + 1])) {
+      const headers = splitMarkdownTableRow(line);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim().startsWith('|')) {
+        rows.push(splitMarkdownTableRow(lines[i]));
+        i += 1;
+      }
+      i -= 1;
+
+      const thead = `<thead><tr>${headers.map((cell) => `<th>${renderInline(cell)}</th>`).join('')}</tr></thead>`;
+      const tbody = `<tbody>${rows.map((row) => `<tr>${headers.map((_, idx) => `<td>${renderInline(row[idx] || '')}</td>`).join('')}</tr>`).join('')}</tbody>`;
+      out.push(`<div style="overflow:auto; max-width:100%; max-height:420px; border:1px solid var(--c-border); margin:4px 0;"><table style="width:max-content; min-width:100%; border-collapse:collapse;">${thead}${tbody}</table></div>`);
+      continue;
+    }
+
+    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      const level = Math.min(6, heading[1].length + 1);
+      out.push(`<h${level} style="margin:6px 0 4px 0; color:var(--c-text);">${renderInline(heading[2])}</h${level}>`);
+      continue;
+    }
+
+    if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+      const items = [trimmed.slice(2)];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1].trim();
+        if (!(next.startsWith('- ') || next.startsWith('* '))) break;
+        items.push(next.slice(2));
+        i += 1;
+      }
+      out.push(`<ul style="margin:4px 0 4px 16px; list-style:disc;">${items.map((item) => `<li>${renderInline(item)}</li>`).join('')}</ul>`);
+      continue;
+    }
+
+    if (/^<[^>]+>/.test(trimmed)) {
+      out.push(line);
+      continue;
+    }
+
+    const paragraph = [trimmed];
+    while (i + 1 < lines.length) {
+      const next = lines[i + 1].trim();
+      if (!next || next.startsWith('#') || next.startsWith('|') || next.startsWith('- ') || next.startsWith('* ') || next.startsWith('```')) break;
+      paragraph.push(next);
+      i += 1;
+    }
+    out.push(`<p style="margin:4px 0;">${renderInline(paragraph.join(' '))}</p>`);
+  }
+
+  const html = out.join('');
+  if (window.DOMPurify?.sanitize) return window.DOMPurify.sanitize(html);
+  return html;
 }
 
 function renderChartGroup(containerId, charts, label) {
@@ -77,7 +183,7 @@ function renderReports(reports) {
   const setActive = (key) => {
     selectedKey = key;
     title.textContent = reportLabels[key] || 'Report';
-    body.textContent = reports[key] || 'No content available.';
+    body.innerHTML = renderMarkdown(reports[key] || 'No content available.');
     renderButtons();
   };
 
@@ -121,7 +227,6 @@ async function init() {
   const groups = groupedCharts(results.charts || []);
   renderChartGroup('univariateCharts', groups.univariate, 'Univariate');
   renderChartGroup('bivariateCharts', groups.bivariate, 'Bivariate');
-  renderChartGroup('overallCharts', groups.overall, 'Overall');
 
   const reports = {
     univariate: results?.reports?.univariate || '',

@@ -282,7 +282,7 @@
     </header>
 
     <!-- MAIN GRID -->
-    <main style="display:grid; grid-template-columns:380px 1fr; overflow:hidden;"
+    <main style="display:grid; grid-template-columns:440px 1fr; overflow:hidden;"
           aria-label="Workspace and analysis launch">
 
       <!-- LEFT COLUMN -->
@@ -307,7 +307,7 @@
           </div>
 
           <div class="sec-label" style="margin-bottom:2px;">Notes</div>
-          <textarea id="workspaceNotes" rows="2" class="field"
+          <textarea id="workspaceNotes" rows="6" class="field"
                     placeholder="Markdown notes" style="resize:vertical; font-size:12px; padding:5px 9px; font-family:'JetBrains Mono',monospace;"></textarea>
           <button id="saveWorkspaceNotesBtn" class="btn btn-secondary"
                   style="width:100%; margin-top:4px; padding:4px 10px;">Save Notes</button>
@@ -369,7 +369,7 @@
 
               <div>
                 <div class="sec-label" style="margin-bottom:2px;">Plots</div>
-                <input id="plots" class="field mono" value="bivariate,univariate,overall" style="padding:5px 9px; font-size:12px;" />
+                <input id="plots" class="field mono" value="bivariate,univariate" style="padding:5px 9px; font-size:12px;" />
               </div>
 
               <div>
@@ -389,13 +389,14 @@
             </div>
           </form>
 
+        </section>
+
           <div style="margin-top:8px;">
             <div class="sec-label" style="margin-bottom:2px;">Dataset Preview</div>
             <div id="datasetPreviewContainer"
                  style="overflow-x:auto; border:1px solid var(--c-border);
                         background:rgba(255,255,255,0.02); padding:3px; min-height:20px; font-size:11px;"></div>
           </div>
-        </section>
 
       </aside>
 
@@ -439,6 +440,10 @@
                    style="font-size:11px; color:var(--c-dim); margin-top:5px; line-height:1.55;" aria-live="polite">
                 No active analysis selected.
               </div>
+              <div id="liveTimer" class="mono"
+                   style="font-size:10px; color:var(--c-muted); margin-top:3px; letter-spacing:.06em;" aria-live="polite">
+                Timer: 00:00
+              </div>
             </div>
 
             <hr class="h-divider" style="margin-top:2px;" />
@@ -465,10 +470,10 @@
                 tabindex="-1">Analysis Summary</h2>
           </div>
 
-          <!-- Stat cards: univariate / bivariate / overall / reports -->
-          <div id="resultStats"
-               style="display:grid; grid-template-columns:repeat(4,1fr); gap:1px;
-                      border:1px solid var(--c-border); flex-shrink:0;"
+             <!-- Stat cards: row1 charts, row2 reports/time -->
+             <div id="resultStats"
+             style="display:grid; grid-template-columns:repeat(2,1fr); gap:5px;
+               flex-shrink:0;"
                role="list" aria-label="Analysis statistics"></div>
 
           <!-- Available report badges -->
@@ -486,11 +491,13 @@
           <hr class="h-divider" style="flex-shrink:0; margin-top:8px; margin-bottom:8px;" />
 
           <!-- Analysis Notes -->
-          <div class="sec-label" style="margin-bottom:3px; flex-shrink:0;">Analysis Notes</div>
-          <textarea id="analysisNotes" class="field"
-                    placeholder="Markdown notes for selected analysis"
-                    style="flex:1; resize:none; font-size:12px; padding:6px 9px;
-                           font-family:'JetBrains Mono',monospace; min-height:64px;"></textarea>
+          <div style="display:flex; flex-direction:column; flex:1; min-height:0;">
+            <div class="sec-label" style="margin-bottom:3px; flex-shrink:0;">Analysis Notes</div>
+            <textarea id="analysisNotes" class="field"
+                      placeholder="Markdown notes for selected analysis"
+                    style="resize:none; font-size:12px; padding:6px 9px;
+                      font-family:'JetBrains Mono',monospace; flex:1; min-height:120px;"></textarea>
+          </div>
 
           <!-- Share controls -->
           <div style="display:flex; gap:4px; margin-top:5px; flex-shrink:0;">
@@ -522,9 +529,6 @@
     <div aria-hidden="true" style="display:none;">
       <div id="tablesContainer"></div>
       <div id="chartsContainer"></div>
-      <h3 id="reportTitle"></h3>
-      <div id="reportSwitches"></div>
-      <pre id="reportMarkdown"></pre>
     </div>
   </div>
 
