@@ -155,29 +155,6 @@
       box-shadow: 0 0 5px 1px var(--g-amber);
     }
 
-    /* ── REPORT BADGES ──────────────────────────────────────────────────── */
-    .report-badge {
-      display: inline-flex; align-items: center; gap: 5px;
-      padding: 4px 10px; border: 1px solid var(--c-border);
-      background: transparent; font-size: 11px; font-weight: 700;
-      letter-spacing: .08em; text-transform: uppercase; color: var(--c-muted);
-      white-space: nowrap;
-    }
-    .report-badge.has-content {
-      border-color: rgba(232,148,10,0.35);
-      color: var(--c-cyan);
-      background: rgba(232,148,10,0.06);
-    }
-    .report-badge .dot {
-      width: 4px; height: 4px;
-      background: var(--c-muted); flex-shrink: 0;
-      /* square dot — tactical */
-    }
-    .report-badge.has-content .dot {
-      background: var(--c-cyan);
-      box-shadow: 0 0 4px var(--g-amber);
-    }
-
     /* ── STATUS DOT ─────────────────────────────────────────────────────── */
     .status-dot {
       display: inline-block; width: 5px; height: 5px;
@@ -297,6 +274,7 @@
           <div style="display:flex; gap:4px; margin-bottom:4px;">
             <input id="workspaceName" class="field" placeholder="Workspace name" style="flex:1; padding:5px 9px; font-size:12px;" />
             <button id="createWorkspaceBtn" class="btn btn-primary" style="padding:5px 10px;">Create</button>
+            <button id="renameWorkspaceBtn" class="btn btn-secondary" style="padding:5px 10px;">Rename</button>
           </div>
           <p id="workspaceError" class="hidden"
              style="font-size:13px; color:var(--c-red); margin-bottom:3px;" role="alert"></p>
@@ -308,7 +286,7 @@
 
           <div class="sec-label" style="margin-bottom:2px;">Notes</div>
           <textarea id="workspaceNotes" rows="6" class="field"
-                    placeholder="Markdown notes" style="resize:vertical; font-size:12px; padding:5px 9px; font-family:'JetBrains Mono',monospace;"></textarea>
+                    placeholder="Workspace notes" style="resize:vertical; font-size:12px; padding:5px 9px; font-family:'JetBrains Mono',monospace;"></textarea>
           <button id="saveWorkspaceNotesBtn" class="btn btn-secondary"
                   style="width:100%; margin-top:4px; padding:4px 10px;">Save Notes</button>
         </section>
@@ -476,12 +454,6 @@
                flex-shrink:0;"
                role="list" aria-label="Analysis statistics"></div>
 
-          <!-- Available report badges -->
-          <div style="flex-shrink:0; margin-top:8px;">
-            <div class="sec-label" style="margin-bottom:4px;">Available Reports</div>
-            <div id="analysisReportList" style="display:flex; flex-wrap:wrap; gap:3px;"></div>
-          </div>
-
           <!-- Empty / hint state -->
           <div id="analysisSummaryEmpty" class="mono"
                style="font-size:11px; color:var(--c-muted); padding:5px 0; flex-shrink:0;">
@@ -494,7 +466,7 @@
           <div style="display:flex; flex-direction:column; flex:1; min-height:0;">
             <div class="sec-label" style="margin-bottom:3px; flex-shrink:0;">Analysis Notes</div>
             <textarea id="analysisNotes" class="field"
-                      placeholder="Markdown notes for selected analysis"
+                      placeholder="Notes for selected analysis"
                     style="resize:none; font-size:12px; padding:6px 9px;
                       font-family:'JetBrains Mono',monospace; flex:1; min-height:120px;"></textarea>
           </div>

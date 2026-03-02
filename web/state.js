@@ -51,18 +51,11 @@ const state = {
   summaryMetrics: {
     univariateCount: 0,
     bivariateCount: 0,
-    reportCount: 0,
+    totalGraphs: 0,
     analysisSeconds: 0,
   },
   chartsVisibleCount: 12,
-  reports: {
-    univariate: '',
-    bivariate: '',
-    neural_synthesis: '',
-    final_analysis: '',
-    report: '',
-  },
-  selectedReportKey: 'report',
+  reportHtml: '',
   inFlight: new Set(),
 };
 

@@ -420,14 +420,14 @@ std::pair<std::string, bool> resolveDatasetInputPath(const std::string& sourcePa
         if (!exe.empty()) {
             return runToTmp(exe, {sourcePath});
         }
-        throw Seldon::DatasetException("XLSX import requires xlsx2csv. See docs/ENABLE_EXCEL_IMPORT.md");
+        throw Seldon::DatasetException("XLSX import requires xlsx2csv. See docs/ENABLE_EXCEL_IMPORT");
     }
     if (lowerExt == ".xls") {
         const std::string exe = findExecutableInPath("xls2csv");
         if (!exe.empty()) {
             return runToTmp(exe, {sourcePath});
         }
-        throw Seldon::DatasetException("XLS import requires xls2csv (libxls tools). See docs/ENABLE_EXCEL_IMPORT.md");
+        throw Seldon::DatasetException("XLS import requires xls2csv (libxls tools). See docs/ENABLE_EXCEL_IMPORT");
     }
 
     return {sourcePath, false};

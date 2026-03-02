@@ -589,7 +589,6 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
             };
 
             std::ostringstream mermaid;
-            mermaid << "```mermaid\n";
             mermaid << "flowchart LR\n";
             for (const auto* edge : keptEdges) {
                 if (edge == nullptr) continue;
@@ -603,7 +602,6 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
                         << "| "
                         << toId << "[\"" << quoteSafe(to) << "\"]\n";
             }
-            mermaid << "```";
             out.causalDagMermaid = mermaid.str();
 
             size_t targetInbound = 0;

@@ -172,6 +172,7 @@ export function renderAnalyses(analyses, { onOpen, onDelete, onDownload, onCance
     const statusLower = String(analysis.status || '').toLowerCase();
     const statusColor = statusLower === 'completed' ? '#1a9e5a'
       : statusLower === 'running' ? '#e8940a'
+      : statusLower === 'canceling' ? '#d4820a'
       : statusLower === 'canceled' ? '#cc5555'
       : statusLower === 'failed' ? '#cc3333'
       : 'var(--c-dim)';
@@ -209,9 +210,13 @@ export function renderAnalyses(analyses, { onOpen, onDelete, onDownload, onCance
 
     actionsTd.appendChild(inspectButton);
     actionsTd.appendChild(downloadButton);
-    if (statusLower === 'running' && typeof onCancel === 'function') {
+    if ((statusLower === 'running' || statusLower === 'canceling') && typeof onCancel === 'function') {
       const cancelButton = mkBtn('Cancel', 'background:rgba(204,51,51,0.10); border-color:rgba(204,51,51,0.35); color:#cc4444;');
       cancelButton.setAttribute('aria-label', `Cancel analysis ${analysis.id}`);
+      cancelButton.disabled = statusLower === 'canceling';
+      if (statusLower === 'canceling') {
+        cancelButton.textContent = 'Canceling…';
+      }
       cancelButton.onclick = () => onCancel(analysis.id);
       actionsTd.appendChild(cancelButton);
     }
@@ -239,119 +244,16 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
-function renderInline(markdown) {
-  let html = escapeHtml(markdown);
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-  return html;
-}
-
-function splitMarkdownTableRow(line) {
-  const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
-  return trimmed.split('|').map((cell) => cell.trim().replace(/\\\|/g, '|'));
-}
-
-function isMarkdownTableSeparator(line) {
-  const cells = splitMarkdownTableRow(line);
-  if (!cells.length) return false;
-  return cells.every((cell) => /^:?-{3,}:?$/.test(cell));
-}
-
-function renderMarkdown(markdownText) {
-  const source = String(markdownText || '').replace(/\r/g, '');
-  if (!source.trim()) {
+function renderPlainText(text) {
+  const value = String(text || '').trim();
+  if (!value) {
     return '<div class="mono" style="color:var(--c-muted);">No report content available yet.</div>';
   }
-
-  const lines = source.split('\n');
-  const out = [];
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    if (!trimmed) {
-      continue;
-    }
-
-    if (trimmed.startsWith('```')) {
-      const codeLines = [];
-      i += 1;
-      while (i < lines.length && !lines[i].trim().startsWith('```')) {
-        codeLines.push(lines[i]);
-        i += 1;
-      }
-      out.push(`<pre style="overflow:auto; border:1px solid var(--c-border); padding:6px; background:rgba(255,255,255,0.02);"><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
-      continue;
-    }
-
-    if (trimmed.startsWith('|') && i + 1 < lines.length && isMarkdownTableSeparator(lines[i + 1])) {
-      const headers = splitMarkdownTableRow(line);
-      const rows = [];
-      i += 2;
-      while (i < lines.length && lines[i].trim().startsWith('|')) {
-        rows.push(splitMarkdownTableRow(lines[i]));
-        i += 1;
-      }
-      i -= 1;
-
-      const thead = `<thead><tr>${headers.map((cell) => `<th>${renderInline(cell)}</th>`).join('')}</tr></thead>`;
-      const tbody = `<tbody>${rows.map((row) => `<tr>${headers.map((_, idx) => `<td>${renderInline(row[idx] || '')}</td>`).join('')}</tr>`).join('')}</tbody>`;
-      out.push(`<div style="overflow:auto; max-width:100%; max-height:320px; border:1px solid var(--c-border); margin:4px 0;"><table class="data-table" style="min-width:max-content; margin:0;">${thead}${tbody}</table></div>`);
-      continue;
-    }
-
-    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
-    if (heading) {
-      const level = Math.min(6, heading[1].length + 1);
-      out.push(`<h${level} style="margin:6px 0 4px 0; color:var(--c-text);">${renderInline(heading[2])}</h${level}>`);
-      continue;
-    }
-
-    if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
-      const items = [trimmed.slice(2)];
-      while (i + 1 < lines.length) {
-        const next = lines[i + 1].trim();
-        if (!(next.startsWith('- ') || next.startsWith('* '))) break;
-        items.push(next.slice(2));
-        i += 1;
-      }
-      out.push(`<ul style="margin:4px 0 4px 16px; list-style:disc;">${items.map((item) => `<li>${renderInline(item)}</li>`).join('')}</ul>`);
-      continue;
-    }
-
-    if (/^<[^>]+>/.test(trimmed)) {
-      out.push(line);
-      continue;
-    }
-
-    const paragraph = [trimmed];
-    while (i + 1 < lines.length) {
-      const next = lines[i + 1].trim();
-      if (!next || next.startsWith('#') || next.startsWith('|') || next.startsWith('- ') || next.startsWith('* ') || next.startsWith('```')) break;
-      paragraph.push(next);
-      i += 1;
-    }
-    out.push(`<p style="margin:4px 0;">${renderInline(paragraph.join(' '))}</p>`);
-  }
-
-  const html = out.join('');
-  if (window.DOMPurify?.sanitize) {
-    return window.DOMPurify.sanitize(html);
-  }
-  return html;
+  return `<pre class="mono" style="white-space:pre-wrap; margin:0;">${escapeHtml(value)}</pre>`;
 }
 
 export function renderResults(results) {
-  const reports = {
-    univariate: results?.reports?.univariate || '',
-    bivariate: results?.reports?.bivariate || '',
-    neural_synthesis: results?.reports?.neural_synthesis || '',
-    final_analysis: results?.reports?.final_analysis || results?.final_markdown || '',
-    report: results?.reports?.report || results?.report_markdown || '',
-  };
+  const reportHtml = results?.report_html || results?.reports?.analysis || '';
 
   const grouped = {
     univariate: [],
@@ -367,7 +269,9 @@ export function renderResults(results) {
   });
 
   const summary = results?.summary || {};
-  const reportCount = Object.values(reports).filter((text) => text && text.trim()).length;
+  const totalGraphs = Number.isFinite(Number(summary.total_graphs))
+    ? Number(summary.total_graphs)
+    : charts.length;
   const univariateCount = Number.isFinite(Number(summary.univariate_charts))
     ? Number(summary.univariate_charts)
     : grouped.univariate.length;
@@ -377,9 +281,6 @@ export function renderResults(results) {
   const analysisSeconds = Number.isFinite(Number(summary.analysis_seconds))
     ? Math.max(0, Number(summary.analysis_seconds))
     : 0;
-
-  const prevKey = getState().selectedReportKey;
-  const selectedReportKey = reports[prevKey] ? prevKey : 'report';
 
   updateState({
     tableRows: Array.isArray(results.tables) ? results.tables : [],
@@ -393,18 +294,16 @@ export function renderResults(results) {
     charts,
     chartGroups: grouped,
     chartsVisibleCount: 12,
-    reports,
-    selectedReportKey,
+    reportHtml,
     summaryMetrics: {
       univariateCount,
       bivariateCount,
-      reportCount,
+      totalGraphs,
       analysisSeconds,
     },
   });
 
   renderResultStats();
-  renderReportSwitches();
   renderTables();
   renderCharts();
   renderSelectedReport();
@@ -422,7 +321,7 @@ function renderResultStats() {
   const data = [
     { label: 'Univariate', value: Number(metrics.univariateCount || 0), sub: 'charts' },
     { label: 'Bivariate', value: Number(metrics.bivariateCount || 0), sub: 'charts' },
-    { label: 'Reports', value: Number(metrics.reportCount || 0), sub: 'generated' },
+    { label: 'Total Graphs', value: Number(metrics.totalGraphs || 0), sub: 'available' },
     { label: 'Analysis Time', value: Number(metrics.analysisSeconds || 0), sub: 'seconds' },
   ];
 
@@ -438,7 +337,6 @@ function renderResultStats() {
 
 export function renderAnalysisSummary() {
   const emptyNode = el('analysisSummaryEmpty');
-  const reportListNode = el('analysisReportList');
   const openBtn = el('openFullAnalysisBtn');
   const state = getState();
 
@@ -446,7 +344,7 @@ export function renderAnalysisSummary() {
 
   const hasResults =
     (state.charts?.length ?? 0) > 0 ||
-    Object.values(state.reports ?? {}).some((t) => t && t.trim());
+    Boolean(state.reportHtml && state.reportHtml.trim());
 
   if (emptyNode) {
     emptyNode.style.display = hasResults ? 'none' : '';
@@ -456,86 +354,33 @@ export function renderAnalysisSummary() {
     openBtn.onclick = () => openFullAnalysisPage(getState().currentAnalysisId);
   }
 
-  if (!reportListNode) {
-    return;
-  }
-  reportListNode.innerHTML = '';
-
-  const reportLabels = {
-    report: 'Deterministic',
-    univariate: 'Univariate',
-    bivariate: 'Bivariate',
-    neural_synthesis: 'Neural',
-    final_analysis: 'Final',
-  };
-
-  Object.entries(reportLabels).forEach(([key, label]) => {
-    const hasContent = Boolean(state.reports?.[key]?.trim());
-    const badge = document.createElement('span');
-    badge.className = `report-badge${hasContent ? ' has-content' : ''}`;
-    badge.innerHTML = `<span class="dot"></span>${label}`;
-    reportListNode.appendChild(badge);
-  });
-}
-
-function renderReportSwitches() {
-  const switcher = el('reportSwitches');
-  if (!switcher || switcher.closest('[aria-hidden]')) {
-    return;
-  }
-  const state = getState();
-  const reportLabels = {
-    univariate: 'Univariate',
-    bivariate: 'Bivariate',
-    neural_synthesis: 'Neural',
-    final_analysis: 'Final',
-    report: 'Deterministic',
-  };
-
-  switcher.innerHTML = '';
-  Object.entries(reportLabels).forEach(([key, label]) => {
-    const btn = document.createElement('button');
-    const hasContent = Boolean(state.reports[key] && state.reports[key].trim());
-    const active = state.selectedReportKey === key;
-    btn.className = 'btn';
-    btn.style.cssText = active
-      ? 'padding:4px 10px; font-size:12px; background:rgba(185,114,8,0.20); border-color:rgba(232,148,10,0.50); color:#e8940a;'
-      : 'padding:4px 10px; font-size:12px; background:rgba(255,255,255,0.03); border-color:rgba(255,255,255,0.07); color:var(--c-dim);';
-    btn.disabled = !hasContent;
-    if (!hasContent) {
-      btn.style.opacity = '0.35';
-      btn.style.cursor = 'not-allowed';
-    }
-    btn.textContent = label;
-    btn.onclick = () => {
-      updateState({ selectedReportKey: key });
-      renderReportSwitches();
-      renderSelectedReport();
-    };
-    switcher.appendChild(btn);
-  });
 }
 
 function renderSelectedReport() {
-  const { reports, selectedReportKey } = getState();
+  const { reportHtml } = getState();
   const titleNode = el('reportTitle');
-  const bodyNode = el('reportMarkdown');
+  const bodyNode = el('reportBody');
   if (!bodyNode || bodyNode.closest('[aria-hidden]')) {
     return;
   }
 
-  const labels = {
-    univariate: 'Univariate Report',
-    bivariate: 'Bivariate Report',
-    neural_synthesis: 'Neural Synthesis',
-    final_analysis: 'Final Analysis',
-    report: 'Deterministic Report',
-  };
-
   if (titleNode) {
-    titleNode.textContent = labels[selectedReportKey] || 'Report';
+    titleNode.textContent = 'Analysis Report';
   }
-  bodyNode.innerHTML = renderMarkdown(reports[selectedReportKey] || 'No report content available yet.');
+  const trimmed = String(reportHtml || '').trim();
+  if (!trimmed) {
+    bodyNode.innerHTML = '<div class="mono" style="color:var(--c-muted);">No report content available yet.</div>';
+    return;
+  }
+  if (trimmed.startsWith('<')) {
+    if (window.DOMPurify?.sanitize) {
+      bodyNode.innerHTML = window.DOMPurify.sanitize(trimmed);
+    } else {
+      bodyNode.innerHTML = trimmed;
+    }
+    return;
+  }
+  bodyNode.innerHTML = renderPlainText(trimmed);
 }
 
 export function renderTables() {
@@ -746,12 +591,12 @@ export function setShareLink(link) {
   el('shareLink').value = link;
 }
 
-export function setWorkspaceNotes(markdown) {
-  el('workspaceNotes').value = markdown || '';
+export function setWorkspaceNotes(text) {
+  el('workspaceNotes').value = text || '';
 }
 
-export function setAnalysisNotes(markdown) {
-  el('analysisNotes').value = markdown || '';
+export function setAnalysisNotes(text) {
+  el('analysisNotes').value = text || '';
 }
 
 export function getWorkspaceNotes() {

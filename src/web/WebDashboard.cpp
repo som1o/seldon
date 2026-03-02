@@ -173,7 +173,6 @@ std::string mimeFromPath(const fs::path& p) {
     if (ext == ".png") return "image/png";
     if (ext == ".svg") return "image/svg+xml";
     if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
-    if (ext == ".md") return "text/markdown";
     return "application/octet-stream";
 }
 
@@ -202,12 +201,9 @@ bool buildAnalysisBundleZip(const fs::path& outputDir,
     }
 
     std::vector<std::string> relativeFiles;
-    const std::array<std::string, 5> reportFiles = {
-        "univariate.md",
-        "bivariate.md",
-        "neural_synthesis.md",
-        "final_analysis.md",
-        "report.md"
+    const std::array<std::string, 2> reportFiles = {
+        "analysis_report.html",
+        "report.html"
     };
     for (const auto& report : reportFiles) {
         if (fs::exists(outputDir / report) && fs::is_regular_file(outputDir / report)) {
@@ -230,7 +226,7 @@ bool buildAnalysisBundleZip(const fs::path& outputDir,
     }
 
     if (relativeFiles.empty()) {
-        errorOut = "no report/chart artifacts available for download";
+        errorOut = "no report/graph artifacts available for download";
         return false;
     }
 
@@ -259,40 +255,6 @@ bool buildAnalysisBundleZip(const fs::path& outputDir,
     }
 
     return true;
-}
-
-std::vector<std::vector<std::string>> parseMarkdownTables(const std::string& markdown) {
-    std::vector<std::vector<std::string>> rows;
-    std::istringstream in(markdown);
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.find('|') == std::string::npos) continue;
-        const std::string trimmed = std::regex_replace(line, std::regex("^\\s+|\\s+$"), "");
-        if (trimmed.size() < 3) continue;
-        std::vector<std::string> cells;
-        std::string cur;
-        for (char c : trimmed) {
-            if (c == '|') {
-                const std::string cell = std::regex_replace(cur, std::regex("^\\s+|\\s+$"), "");
-                if (!cell.empty()) cells.push_back(cell);
-                cur.clear();
-            } else {
-                cur.push_back(c);
-            }
-        }
-        const std::string tail = std::regex_replace(cur, std::regex("^\\s+|\\s+$"), "");
-        if (!tail.empty()) cells.push_back(tail);
-        if (cells.empty()) continue;
-        bool separator = true;
-        for (const auto& c : cells) {
-            if (c.find_first_not_of("-:") != std::string::npos) {
-                separator = false;
-                break;
-            }
-        }
-        if (!separator) rows.push_back(std::move(cells));
-    }
-    return rows;
 }
 
 std::array<uint32_t, 5> sha1(const std::string& input) {
@@ -662,7 +624,7 @@ private:
                 info.startedAt = readKv(ameta, "started_at", "");
                 info.finishedAt = readKv(ameta, "finished_at", "");
                 info.outputDir = readKv(ameta, "output_dir", (anDir.path() / "output").string());
-                info.notesPath = (anDir.path() / "notes.md").string();
+                info.notesPath = (anDir.path() / "notes.txt").string();
                 info.shareToken = readKv(ameta, "share_token", "");
 
                 const bool interruptedRun = (info.status == "running" || info.status == "queued");
@@ -801,6 +763,26 @@ private:
             json(res, 200, "{\"id\":\"" + jsonEscape(ws.id) + "\"}");
         });
 
+        server.Post(R"(/api/workspaces/([A-Za-z0-9_\-]+)/rename)", [&](const httplib::Request& req, httplib::Response& res) {
+            const std::string wsId = req.matches[1];
+            const std::string newName = req.has_param("name") ? CommonUtils::trim(req.get_param_value("name")) : "";
+            if (newName.empty()) {
+                json(res, 400, "{\"error\":\"name is required\"}");
+                return;
+            }
+
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = workspaces.find(wsId);
+            if (it == workspaces.end()) {
+                json(res, 404, "{\"error\":\"workspace not found\"}");
+                return;
+            }
+
+            it->second.name = newName;
+            persistWorkspace(it->second);
+            json(res, 200, "{\"ok\":true,\"id\":\"" + jsonEscape(it->second.id) + "\",\"name\":\"" + jsonEscape(it->second.name) + "\"}");
+        });
+
         server.Delete(R"(/api/workspaces/([A-Za-z0-9_\-]+))", [&](const httplib::Request& req, httplib::Response& res) {
             const std::string wsId = req.matches[1];
             std::lock_guard<std::mutex> lock(mutex);
@@ -812,7 +794,7 @@ private:
             }
 
             for (const auto& kv : analyses) {
-                if (kv.second.workspaceId == wsId && kv.second.status == "running") {
+                if (kv.second.workspaceId == wsId && (kv.second.status == "running" || kv.second.status == "canceling")) {
                     json(res, 409, "{\"error\":\"cannot delete workspace while analysis is running\"}");
                     return;
                 }
@@ -877,7 +859,7 @@ private:
 
         server.Post(R"(/api/workspaces/([A-Za-z0-9_\-]+)/notes)", [&](const httplib::Request& req, httplib::Response& res) {
             const std::string wsId = req.matches[1];
-            const fs::path notesPath = wsRoot / wsId / "workspace_notes.md";
+            const fs::path notesPath = wsRoot / wsId / "workspace_notes.txt";
             fs::create_directories(notesPath.parent_path());
             if (!writeText(notesPath, req.body)) {
                 json(res, 500, "{\"error\":\"failed to save notes\"}");
@@ -888,9 +870,9 @@ private:
 
         server.Get(R"(/api/workspaces/([A-Za-z0-9_\-]+)/notes)", [&](const httplib::Request& req, httplib::Response& res) {
             const std::string wsId = req.matches[1];
-            const fs::path notesPath = wsRoot / wsId / "workspace_notes.md";
+            const fs::path notesPath = wsRoot / wsId / "workspace_notes.txt";
             const std::string body = fileToString(notesPath);
-            json(res, 200, "{\"markdown\":\"" + jsonEscape(body) + "\"}");
+            json(res, 200, "{\"text\":\"" + jsonEscape(body) + "\"}");
         });
 
         server.Get(R"(/api/workspaces/([A-Za-z0-9_\-]+)/analyses)", [&](const httplib::Request& req, httplib::Response& res) {
@@ -933,7 +915,7 @@ private:
 
             const fs::path analysisDir = wsRoot / analysis.workspaceId / "analyses" / analysis.id;
             analysis.outputDir = (analysisDir / "output").string();
-            analysis.notesPath = (analysisDir / "notes.md").string();
+            analysis.notesPath = (analysisDir / "notes.txt").string();
 
             {
                 std::lock_guard<std::mutex> lock(mutex);
@@ -993,7 +975,7 @@ private:
                 json(res, 404, "{\"error\":\"analysis not found\"}");
                 return;
             }
-            if (it->second.status != "running") {
+            if (it->second.status != "running" && it->second.status != "canceling") {
                 json(res, 409, "{\"error\":\"analysis is not running\"}");
                 return;
             }
@@ -1004,6 +986,7 @@ private:
             }
 
             tokenIt->second->store(true, std::memory_order_release);
+            it->second.status = "canceling";
             it->second.message = "Cancel requested";
             persistAnalysis(it->second);
             publishProgress(it->second);
@@ -1078,23 +1061,19 @@ private:
             }
 
             const fs::path outDir = info.outputDir;
-            const std::string report = fileToString(outDir / "report.md");
-            const std::string finalAnalysis = fileToString(outDir / "final_analysis.md");
-            const std::string univariate = fileToString(outDir / "univariate.md");
-            const std::string bivariate = fileToString(outDir / "bivariate.md");
-            std::string neuralSynthesis = fileToString(outDir / "neural_synthesis.md");
-            if (neuralSynthesis.empty()) {
+            std::string reportHtml = fileToString(outDir / "analysis_report.html");
+            if (reportHtml.empty()) {
+                reportHtml = fileToString(outDir / "report.html");
+            }
+            if (reportHtml.empty()) {
                 for (const auto& entry : fs::directory_iterator(outDir)) {
-                    if (!entry.is_regular_file() || entry.path().extension() != ".md") {
+                    if (!entry.is_regular_file() || entry.path().extension() != ".html") {
                         continue;
                     }
-                    const std::string filename = entry.path().filename().string();
-                    if (filename == "report.md" || filename == "final_analysis.md" ||
-                        filename == "univariate.md" || filename == "bivariate.md") {
-                        continue;
+                    reportHtml = fileToString(entry.path());
+                    if (!reportHtml.empty()) {
+                        break;
                     }
-                    neuralSynthesis = fileToString(entry.path());
-                    break;
                 }
             }
 
@@ -1110,7 +1089,7 @@ private:
             }
             std::sort(images.begin(), images.end());
 
-            const auto tableRows = parseMarkdownTables(report + "\n" + bivariate + "\n" + univariate);
+            const std::vector<std::vector<std::string>> tableRows;
             const size_t totalRows = tableRows.size();
             size_t offset = 0;
             size_t limit = totalRows;
@@ -1141,8 +1120,7 @@ private:
             std::vector<std::string> bivariateCharts;
 
             std::ostringstream out;
-            out << "{\"report_markdown\":\"" << jsonEscape(report)
-                << "\",\"final_markdown\":\"" << jsonEscape(finalAnalysis)
+            out << "{\"report_html\":\"" << jsonEscape(reportHtml)
                 << "\",\"offset\":" << offset
                 << ",\"limit\":" << limit
                 << ",\"next_offset\":" << end
@@ -1171,12 +1149,7 @@ private:
                 }
             }
 
-            size_t reportCount = 0;
-            if (!univariate.empty()) ++reportCount;
-            if (!bivariate.empty()) ++reportCount;
-            if (!neuralSynthesis.empty()) ++reportCount;
-            if (!finalAnalysis.empty()) ++reportCount;
-            if (!report.empty()) ++reportCount;
+            const size_t totalGraphs = images.size();
             const int analysisSeconds = analysisDurationSeconds(info.startedAt, info.finishedAt, info.status);
 
             out << "],\"chart_groups\":{"
@@ -1193,14 +1166,10 @@ private:
             out << "]},\"summary\":{"
                 << "\"univariate_charts\":" << univariateCharts.size() << ','
                 << "\"bivariate_charts\":" << bivariateCharts.size() << ','
-                << "\"reports\":" << reportCount << ','
+                << "\"total_graphs\":" << totalGraphs << ','
                 << "\"analysis_seconds\":" << analysisSeconds
                 << "},\"reports\":{"
-                << "\"univariate\":\"" << jsonEscape(univariate) << "\"," 
-                << "\"bivariate\":\"" << jsonEscape(bivariate) << "\"," 
-                << "\"neural_synthesis\":\"" << jsonEscape(neuralSynthesis) << "\"," 
-                << "\"final_analysis\":\"" << jsonEscape(finalAnalysis) << "\"," 
-                << "\"report\":\"" << jsonEscape(report) << "\"}}";
+                << "\"analysis\":\"" << jsonEscape(reportHtml) << "\"}}";
 
             json(res, 200, out.str());
         });
@@ -1258,7 +1227,7 @@ private:
                 }
                 info = it->second;
             }
-            json(res, 200, "{\"markdown\":\"" + jsonEscape(fileToString(info.notesPath)) + "\"}");
+            json(res, 200, "{\"text\":\"" + jsonEscape(fileToString(info.notesPath)) + "\"}");
         });
 
         server.Post(R"(/api/analyses/([A-Za-z0-9_\-]+)/share)", [&](const httplib::Request& req, httplib::Response& res) {
@@ -1298,7 +1267,10 @@ private:
                 info = it->second;
             }
             const std::string notes = fileToString(info.notesPath);
-            const std::string summary = fileToString(fs::path(info.outputDir) / "final_analysis.md");
+            std::string summary = fileToString(fs::path(info.outputDir) / "analysis_report.html");
+            if (summary.empty()) {
+                summary = fileToString(fs::path(info.outputDir) / "report.html");
+            }
             json(res, 200,
                  "{\"analysis_id\":\"" + jsonEscape(info.id) +
                  "\",\"name\":\"" + jsonEscape(info.name) +
@@ -1410,8 +1382,12 @@ private:
             std::lock_guard<std::mutex> lock(mutex);
             auto it = analyses.find(analysisId);
             if (it == analyses.end()) return;
-            it->second.status = status;
-            it->second.message = message;
+            if (it->second.status == "canceling" && status == "running") {
+                it->second.message = "Canceling";
+            } else {
+                it->second.status = status;
+                it->second.message = message;
+            }
             it->second.step = std::max(0, step);
             it->second.totalSteps = std::max(0, total);
             persistAnalysis(it->second);

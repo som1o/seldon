@@ -19,7 +19,6 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
-#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -33,10 +32,8 @@
 #include <regex>
 #include <sstream>
 #include <future>
-#include <spawn.h>
 #include <set>
 #include <string_view>
-#include <sys/wait.h>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -52,90 +49,7 @@
 #include <omp.h>
 #endif
 
-extern char** environ;
-
 namespace {
-std::string findExecutableInPath(const std::string& command) {
-    if (command.empty()) return "";
-    const char* pathEnv = std::getenv("PATH");
-    if (!pathEnv) return "";
-
-    std::stringstream ss{std::string(pathEnv)};
-    std::string token;
-    while (std::getline(ss, token, ':')) {
-        if (token.empty()) token = ".";
-        std::filesystem::path candidate = std::filesystem::path(token) / command;
-        std::error_code ec;
-        if (std::filesystem::exists(candidate, ec) && !ec && ::access(candidate.c_str(), X_OK) == 0) {
-            return candidate.string();
-        }
-    }
-    return "";
-}
-
-int spawnProcessSilenced(const std::string& executable, const std::vector<std::string>& args) {
-    const int devNull = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
-    if (devNull < 0) return -1;
-
-    const int devNullFlags = ::fcntl(devNull, F_GETFD);
-    if (devNullFlags < 0 || ::fcntl(devNull, F_SETFD, devNullFlags | FD_CLOEXEC) < 0) {
-        ::close(devNull);
-        return -1;
-    }
-
-    posix_spawn_file_actions_t actions;
-    if (::posix_spawn_file_actions_init(&actions) != 0) {
-        ::close(devNull);
-        return -1;
-    }
-
-    if (::posix_spawn_file_actions_adddup2(&actions, devNull, STDOUT_FILENO) != 0 ||
-        ::posix_spawn_file_actions_adddup2(&actions, devNull, STDERR_FILENO) != 0 ||
-        ::posix_spawn_file_actions_addclose(&actions, devNull) != 0) {
-        ::posix_spawn_file_actions_destroy(&actions);
-        ::close(devNull);
-        return -1;
-    }
-
-    posix_spawnattr_t attr;
-    if (::posix_spawnattr_init(&attr) != 0) {
-        ::posix_spawn_file_actions_destroy(&actions);
-        ::close(devNull);
-        return -1;
-    }
-
-    short spawnFlags = 0;
-#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
-    spawnFlags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
-#endif
-    if (spawnFlags != 0 && ::posix_spawnattr_setflags(&attr, spawnFlags) != 0) {
-        ::posix_spawnattr_destroy(&attr);
-        ::posix_spawn_file_actions_destroy(&actions);
-        ::close(devNull);
-        return -1;
-    }
-
-    std::vector<char*> argv;
-    argv.reserve(args.size() + 2);
-    argv.push_back(const_cast<char*>(executable.c_str()));
-    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
-    argv.push_back(nullptr);
-
-    pid_t pid = -1;
-    const int spawnRc = ::posix_spawn(&pid, executable.c_str(), &actions, &attr, argv.data(), environ);
-
-    ::posix_spawnattr_destroy(&attr);
-    ::posix_spawn_file_actions_destroy(&actions);
-    ::close(devNull);
-
-    if (spawnRc != 0 || pid <= 0) return -1;
-
-    int status = 0;
-    if (::waitpid(pid, &status, 0) < 0) return -1;
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    return -1;
-}
-
 #ifdef SELDON_USE_NATIVE_PARQUET
 bool exportParquetNative(const TypedDataset& data,
                         const std::string& parquetPath,
@@ -277,8 +191,7 @@ void addExecutiveDashboard(ReportEngine& report,
                            const std::vector<std::pair<std::string, std::string>>& metrics,
                            const std::vector<std::string>& highlights,
                            const std::string& note = "") {
-    report.addParagraph("---");
-    report.addParagraph("## " + title);
+    report.addTitle(title);
     if (!note.empty()) report.addParagraph(note);
 
     if (!metrics.empty()) {
@@ -289,12 +202,13 @@ void addExecutiveDashboard(ReportEngine& report,
     }
 
     if (!highlights.empty()) {
-        std::string bulletBlock;
+        std::string highlightBlock;
         for (const auto& h : highlights) {
             if (h.empty()) continue;
-            bulletBlock += "- " + h + "\n";
+            if (!highlightBlock.empty()) highlightBlock += " ";
+            highlightBlock += "• " + h;
         }
-        if (!bulletBlock.empty()) report.addParagraph("### Quick Highlights\n" + bulletBlock);
+        if (!highlightBlock.empty()) report.addParagraph("Quick Highlights: " + highlightBlock);
     }
 }
 
@@ -2871,7 +2785,7 @@ std::optional<std::string> writeCausalDagEditor(const AutoConfig& cfg,
     out << "edges.forEach((e,idx)=>{const a=arrow(pos[e.from].x,pos[e.from].y,pos[e.to].x,pos[e.to].y);const l=document.createElementNS(ns,'line');l.setAttribute('x1',a.x1);l.setAttribute('y1',a.y1);l.setAttribute('x2',a.x2);l.setAttribute('y2',a.y2);l.setAttribute('stroke',idx===selected?'#d12':'#666');l.setAttribute('stroke-width',idx===selected?'3':'2');l.style.cursor='pointer';l.onclick=()=>{selected=idx;render();};svg.appendChild(l);const p=document.createElementNS(ns,'polygon');const px=a.x2,py=a.y2;const s=7;const p1=(px)+','+(py);const p2=(px- s*a.ux + s*a.uy)+','+(py- s*a.uy - s*a.ux);const p3=(px- s*a.ux - s*a.uy)+','+(py- s*a.uy + s*a.ux);p.setAttribute('points',p1+' '+p2+' '+p3);p.setAttribute('fill',idx===selected?'#d12':'#666');svg.appendChild(p);});\n";
     out << "nodes.forEach(n=>{const g=document.createElementNS(ns,'g');g.style.cursor='move';const c=document.createElementNS(ns,'circle');c.setAttribute('cx',pos[n].x);c.setAttribute('cy',pos[n].y);c.setAttribute('r',22);c.setAttribute('fill','#f3f7ff');c.setAttribute('stroke','#3366cc');c.setAttribute('stroke-width','2');g.appendChild(c);const t=document.createElementNS(ns,'text');t.setAttribute('x',pos[n].x);t.setAttribute('y',pos[n].y+4);t.setAttribute('font-size','11');t.setAttribute('text-anchor','middle');t.textContent=n;g.appendChild(t);let drag=false;g.onmousedown=(ev)=>{drag=true;ev.preventDefault();};window.addEventListener('mouseup',()=>drag=false);window.addEventListener('mousemove',(ev)=>{if(!drag) return;const r=svg.getBoundingClientRect();pos[n].x=Math.max(30,Math.min(W-30,ev.clientX-r.left));pos[n].y=Math.max(30,Math.min(H-30,ev.clientY-r.top));render();});svg.appendChild(g);});\n";
     out << "const body=document.getElementById('edgeBody');body.innerHTML='';edges.forEach((e,idx)=>{const tr=document.createElement('tr');if(idx===selected) tr.style.background='#fff2f2';tr.onclick=()=>{selected=idx;render();};tr.innerHTML='<td>'+ (idx+1) +'</td><td>'+e.from+'</td><td>'+e.to+'</td>';body.appendChild(tr);});\n";
-    out << "const mer=['```mermaid','flowchart LR'];edges.forEach(e=>{mer.push('    '+safeId(e.from)+'[\"'+escapeMer(e.from)+'\"] --> '+safeId(e.to)+'[\"'+escapeMer(e.to)+'\"]');});mer.push('```');document.getElementById('mermaidOut').value=mer.join('\\n');}\n";
+    out << "const mer=['flowchart LR'];edges.forEach(e=>{mer.push('    '+safeId(e.from)+'[\"'+escapeMer(e.from)+'\"] --> '+safeId(e.to)+'[\"'+escapeMer(e.to)+'\"]');});document.getElementById('mermaidOut').value=mer.join('\\n');}\n";
     out << "function safeId(n){return 'N'+(nodes.indexOf(n)+1);} function escapeMer(s){return String(s).replace(/\"/g,\"'\");}\n";
     out << "const fromSel=document.getElementById('fromSel');const toSel=document.getElementById('toSel');nodes.forEach(n=>{const o1=document.createElement('option');o1.textContent=n;o1.value=n;fromSel.appendChild(o1);const o2=document.createElement('option');o2.textContent=n;o2.value=n;toSel.appendChild(o2);});\n";
     out << "document.getElementById('addBtn').onclick=()=>{const from=fromSel.value,to=toSel.value;if(!from||!to||from===to) return;edges.push({from,to});selected=edges.length-1;render();};\n";
@@ -3186,11 +3100,55 @@ void addUnivariatePlots(ReportEngine& univariate,
 }
 
 struct ReportSaveSummary {
-    bool htmlRequested = false;
-    bool pandocAvailable = false;
-    size_t htmlAttempted = 0;
-    size_t htmlSucceeded = 0;
+    std::string reportPath;
+    size_t combinedBytes = 0;
+    size_t finalBytes = 0;
 };
+
+std::string truncateSectionHtml(const std::string& html, size_t limit) {
+    if (limit == 0 || html.size() <= limit) {
+        return html;
+    }
+    size_t cut = html.rfind('\n', limit);
+    if (cut == std::string::npos || cut < (limit / 2)) {
+        cut = limit;
+    }
+    std::string out = html.substr(0, cut);
+    out += "\n<p><em>Section truncated for high-speed consolidated reporting.</em></p>\n";
+    return out;
+}
+
+std::string buildConsolidatedHtmlReport(const std::vector<std::pair<std::string, std::string>>& sections,
+                                        size_t targetBytes,
+                                        size_t& outputBytes) {
+    const size_t totalRaw = std::accumulate(sections.begin(), sections.end(), static_cast<size_t>(0),
+                                            [](size_t acc, const auto& item) { return acc + item.second.size(); });
+    const size_t effectiveTarget = std::max<size_t>(12000, targetBytes);
+
+    std::ostringstream out;
+    out << "<!doctype html><html><head><meta charset=\"utf-8\"/>"
+        << "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>"
+        << "<title>Seldon Analysis Report</title>"
+        << "<style>body{font-family:Inter,system-ui,sans-serif;line-height:1.45;margin:0;background:#0d1018;color:#c4cad6;}"
+        << "main{max-width:1220px;margin:0 auto;padding:18px;}h1,h2,h3,h4{color:#e8940a;}"
+        << "section{border:1px solid rgba(255,255,255,.09);padding:12px;margin-bottom:10px;background:#111520;}"
+        << "table{border-collapse:collapse;width:100%;}th,td{border:1px solid rgba(255,255,255,.08);padding:4px 6px;}"
+        << "img{max-width:100%;height:auto;display:block;background:#0d1018;margin:6px 0;}"
+        << "p,li{color:#c4cad6;}code{background:rgba(255,255,255,.08);padding:1px 4px;}</style></head><body><main>";
+    out << "<h1>Analysis Report</h1>";
+
+    const size_t perSectionTarget = std::max<size_t>(2400, effectiveTarget / std::max<size_t>(1, sections.size()));
+    for (const auto& [name, body] : sections) {
+        out << "<section><h2>" << name << "</h2>";
+        out << truncateSectionHtml(body, perSectionTarget);
+        out << "</section>";
+    }
+
+    out << "</main></body></html>";
+    std::string html = out.str();
+    outputBytes = html.size();
+    return html;
+}
 
 ReportSaveSummary saveGeneratedReports(const AutoConfig& runCfg,
                           const ReportEngine& univariate,
@@ -3200,59 +3158,63 @@ ReportSaveSummary saveGeneratedReports(const AutoConfig& runCfg,
                           const ReportEngine& heuristicsReport) {
     ReportSaveSummary summary;
     namespace fs = std::filesystem;
-    const std::string uniMd = runCfg.outputDir + "/univariate.md";
-    const std::string biMd = runCfg.outputDir + "/bivariate.md";
-    const std::string finalMd = runCfg.outputDir + "/final_analysis.md";
-    const std::string reportMd = runCfg.outputDir + "/report.md";
-    const std::string neuralHtml = (fs::path(runCfg.reportFile).parent_path() /
-                                    (fs::path(runCfg.reportFile).stem().string() + ".html")).string();
 
-    const std::array<std::pair<const ReportEngine*, std::string>, 5> markdownTargets = {{
-        {&univariate, uniMd},
-        {&bivariate, biMd},
-        {&neuralReport, runCfg.reportFile},
-        {&finalAnalysis, finalMd},
-        {&heuristicsReport, reportMd}
-    }};
-
-    std::vector<std::future<void>> markdownWrites;
-    markdownWrites.reserve(markdownTargets.size());
-    for (const auto& target : markdownTargets) {
-        markdownWrites.push_back(std::async(std::launch::async, [engine = target.first, path = target.second]() {
-            engine->save(path);
-        }));
+    fs::path reportPath(runCfg.reportFile);
+    if (reportPath.extension() != ".html") {
+        reportPath = reportPath.parent_path() / (reportPath.stem().string() + ".html");
     }
-    for (auto& task : markdownWrites) task.get();
 
-    if (runCfg.generateHtml) {
-        summary.htmlRequested = true;
-        const std::string pandocExe = findExecutableInPath("pandoc");
-        if (pandocExe.empty()) {
-            std::cout << "[Seldon][Warning] HTML export requested but 'pandoc' was not found in PATH. Markdown reports were generated only.\n";
-            return summary;
-        }
-        summary.pandocAvailable = true;
-        const std::vector<std::pair<std::string, std::string>> conversions = {
-            {uniMd, runCfg.outputDir + "/univariate.html"},
-            {biMd, runCfg.outputDir + "/bivariate.html"},
-            {runCfg.reportFile, neuralHtml},
-            {finalMd, runCfg.outputDir + "/final_analysis.html"},
-            {reportMd, runCfg.outputDir + "/report.html"}
-        };
-        summary.htmlAttempted = conversions.size();
-        std::vector<std::future<int>> htmlConversions;
-        htmlConversions.reserve(conversions.size());
-        for (const auto& [src, dst] : conversions) {
-            htmlConversions.push_back(std::async(std::launch::async, [pandocExe, src, dst]() {
-                return spawnProcessSilenced(pandocExe, {src, "-o", dst, "--standalone", "--self-contained"});
-            }));
-        }
-        for (auto& task : htmlConversions) {
-            if (task.get() == 0) ++summary.htmlSucceeded;
-        }
-        if (summary.htmlSucceeded < summary.htmlAttempted) {
-            std::cout << "[Seldon][Warning] HTML conversion completed for " << summary.htmlSucceeded
-                      << "/" << summary.htmlAttempted << " files. Check pandoc runtime dependencies.\n";
+    const std::vector<std::pair<std::string, std::string>> sections = {
+        {"Executive + Univariate", univariate.renderBody()},
+        {"Bivariate", bivariate.renderBody()},
+        {"Neural Synthesis", neuralReport.renderBody()},
+        {"Final Analysis", finalAnalysis.renderBody()},
+        {"Deterministic Heuristics", heuristicsReport.renderBody()}
+    };
+    summary.combinedBytes = std::accumulate(sections.begin(), sections.end(), static_cast<size_t>(0),
+                                            [](size_t acc, const auto& item) { return acc + item.second.size(); });
+    const size_t targetBytes = static_cast<size_t>(static_cast<double>(summary.combinedBytes) * 0.30);
+    size_t finalBytes = 0;
+    const std::string consolidated = buildConsolidatedHtmlReport(sections, targetBytes, finalBytes);
+
+    fs::create_directories(reportPath.parent_path());
+    {
+        std::ofstream out(reportPath, std::ios::binary | std::ios::trunc);
+        std::vector<char> ioBuffer(1 << 20, '\0');
+        out.rdbuf()->pubsetbuf(ioBuffer.data(), static_cast<std::streamsize>(ioBuffer.size()));
+        out.write(consolidated.data(), static_cast<std::streamsize>(consolidated.size()));
+    }
+
+    summary.reportPath = reportPath.string();
+    summary.finalBytes = finalBytes;
+
+    const std::array<std::string, 5> legacyPrefixes = {
+        "univariate",
+        "bivariate",
+        "neural_synthesis",
+        "final_analysis",
+        "report"
+    };
+    std::error_code cleanupEc;
+    if (fs::exists(runCfg.outputDir, cleanupEc) && !cleanupEc) {
+        for (const auto& entry : fs::directory_iterator(runCfg.outputDir, cleanupEc)) {
+            if (cleanupEc) break;
+            if (!entry.is_regular_file()) continue;
+
+            const std::string filename = entry.path().filename().string();
+            if (filename == reportPath.filename().string()) continue;
+
+            bool shouldRemove = false;
+            for (const auto& prefix : legacyPrefixes) {
+                if (filename.rfind(prefix, 0) == 0) {
+                    shouldRemove = true;
+                    break;
+                }
+            }
+            if (!shouldRemove) continue;
+
+            std::error_code rmEc;
+            fs::remove(entry.path(), rmEc);
         }
     }
 
@@ -3260,34 +3222,16 @@ ReportSaveSummary saveGeneratedReports(const AutoConfig& runCfg,
 }
 
 void printPipelineCompletion(const AutoConfig& runCfg,
-                             bool htmlRequested,
-                             bool pandocAvailable,
-                             size_t htmlAttempted,
-                             size_t htmlSucceeded) {
-    namespace fs = std::filesystem;
-    const std::string neuralHtml = (fs::path(runCfg.reportFile).parent_path() /
-                                    (fs::path(runCfg.reportFile).stem().string() + ".html")).string();
+                             const ReportSaveSummary& saveSummary) {
     std::cout << "[Seldon] Automated pipeline complete.\n";
     std::cout << "[Seldon] Report directory: " << runCfg.outputDir << "\n";
-    std::cout << "[Seldon] Reports: "
-              << runCfg.outputDir << "/univariate.md, "
-              << runCfg.outputDir << "/bivariate.md, "
-              << runCfg.reportFile << ", "
-              << runCfg.outputDir << "/final_analysis.md, "
-              << runCfg.outputDir << "/report.md\n";
-    if (htmlRequested && pandocAvailable && htmlSucceeded > 0) {
-        std::cout << "[Seldon] HTML reports (self-contained): "
-                  << runCfg.outputDir << "/univariate.html, "
-                  << runCfg.outputDir << "/bivariate.html, "
-                  << neuralHtml << ", "
-                  << runCfg.outputDir << "/final_analysis.html, "
-                  << runCfg.outputDir << "/report.html"
-                  << " (" << htmlSucceeded << "/" << htmlAttempted << " succeeded)\n";
-    } else if (htmlRequested && !pandocAvailable) {
-        std::cout << "[Seldon][Warning] HTML export skipped because pandoc is unavailable.\n";
-    } else if (htmlRequested && pandocAvailable && htmlSucceeded == 0) {
-        std::cout << "[Seldon][Warning] HTML export attempted but no HTML files were produced successfully.\n";
-    }
+    std::cout << "[Seldon] Report: " << saveSummary.reportPath << "\n";
+    std::cout << "[Seldon] Consolidated report size optimization: "
+              << saveSummary.finalBytes << " bytes from " << saveSummary.combinedBytes
+              << " raw bytes (~" << (saveSummary.combinedBytes == 0
+                                       ? 0.0
+                                       : (100.0 * static_cast<double>(saveSummary.finalBytes) / static_cast<double>(saveSummary.combinedBytes)))
+              << "%).\n";
     std::cout << "[Seldon] Plot folders: "
               << plotSubdir(runCfg, "univariate") << ", "
               << plotSubdir(runCfg, "bivariate") << ", "

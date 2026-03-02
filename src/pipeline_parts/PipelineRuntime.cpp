@@ -53,10 +53,13 @@ int AutomationPipeline::run(const AutoConfig& config) {
         runCfg.assetsDir = assetsPath.string();
 
         fs::path reportPath(runCfg.reportFile);
-        if (runCfg.reportFile.empty() || runCfg.reportFile == "neural_synthesis.md") {
-            reportPath = outputPath / "neural_synthesis.md";
+        if (runCfg.reportFile.empty() || runCfg.reportFile == "analysis_report.html") {
+            reportPath = outputPath / "analysis_report.html";
         } else if (reportPath.is_relative()) {
             reportPath = outputPath / reportPath;
+        }
+        if (reportPath.extension() != ".html") {
+            reportPath = reportPath.parent_path() / (reportPath.stem().string() + ".html");
         }
         runCfg.reportFile = reportPath.string();
     }
@@ -1723,7 +1726,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     ReportEngine heuristicsReport;
     heuristicsReport.addTitle("Deterministic Analysis Report");
-    heuristicsReport.addParagraph("This report presents deterministic analysis results and signal-quality controls, generated independently from final_analysis.md.");
+    heuristicsReport.addParagraph("This report presents deterministic analysis results and signal-quality controls, generated independently from the consolidated analysis report.");
 
     size_t adminCount = 0;
     size_t targetCandidateCount = 0;
@@ -1828,7 +1831,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
 #else
         {"Native parquet export", "best-effort", "Current binary lacks Arrow/Parquet linkage", "Rebuild with native parquet dependencies to enable parquet output."},
 #endif
-        {"HTML export", "best-effort", "External pandoc dependency", "Gracefully falls back to markdown when unavailable."},
+        {"HTML export", "stable", "Native consolidated HTML report generation", "No fallback format path."},
         {"GPU acceleration (OpenCL/CUDA)", "best-effort", "Environment and driver dependent optional backends", "CPU path remains authoritative fallback."}
     };
 
@@ -1866,11 +1869,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
     cleanupPlotCacheArtifacts(runCfg);
     advanceTimed("Saved reports", "report_persist");
     progress.done("Pipeline complete");
-    printPipelineCompletion(runCfg,
-                            saveSummary.htmlRequested,
-                            saveSummary.pandocAvailable,
-                            saveSummary.htmlAttempted,
-                            saveSummary.htmlSucceeded);
+    printPipelineCompletion(runCfg, saveSummary);
 
     return 0;
 }

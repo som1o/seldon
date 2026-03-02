@@ -183,7 +183,7 @@ struct AutoConfig {
     // neural_drift_psi_warning, neural_drift_psi_critical,
     // impute.<column_name> (per-column imputation strategy).
     std::string datasetPath;
-    std::string reportFile = "neural_synthesis.md";
+    std::string reportFile = "analysis_report.html";
     std::string assetsDir = "seldon_report_assets";
     std::string outputDir;
     std::string targetColumn;

@@ -38,7 +38,7 @@ function resetSummaryMetrics() {
     summaryMetrics: {
       univariateCount: 0,
       bivariateCount: 0,
-      reportCount: 0,
+      totalGraphs: 0,
       analysisSeconds: 0,
     },
   });
@@ -182,7 +182,7 @@ async function loadWorkspaceNotes() {
     return;
   }
   const notes = await api.getWorkspaceNotes(currentWorkspaceId);
-  setWorkspaceNotes(notes.markdown || '');
+  setWorkspaceNotes(notes.text || '');
 }
 
 async function saveWorkspaceNotes() {
@@ -347,7 +347,7 @@ async function selectAnalysis(analysisId) {
   await refreshAnalysis(analysisId);
 
   const notes = await api.getAnalysisNotes(analysisId);
-  setAnalysisNotes(notes.markdown || '');
+  setAnalysisNotes(notes.text || '');
   await loadAnalysisResults(analysisId);
   updateLiveTimer();
 }
@@ -399,18 +399,14 @@ async function deleteAnalysis(analysisId) {
     renderResults({
       tables: [],
       charts: [],
-      report_markdown: '',
-      final_markdown: '',
+      report_html: '',
       reports: {
-        univariate: '',
-        bivariate: '',
-        neural_synthesis: '',
-        final_analysis: '',
-        report: '',
+        analysis: '',
       },
       summary: {
         univariate_charts: 0,
         bivariate_charts: 0,
+        total_graphs: 0,
         analysis_seconds: 0,
       },
     });
@@ -490,6 +486,31 @@ async function createWorkspace() {
   }
 }
 
+async function renameWorkspace() {
+  const button = el('renameWorkspaceBtn');
+  const nameInput = el('workspaceName');
+  const { currentWorkspaceId } = getState();
+  if (!currentWorkspaceId) {
+    setValidationError('workspaceError', 'Select a workspace to rename.');
+    return;
+  }
+
+  const nextName = nameInput.value.trim();
+  if (!nextName) {
+    setValidationError('workspaceError', 'Enter a non-empty workspace name.');
+    return;
+  }
+
+  setButtonLoading(button, true, 'Renaming…');
+  try {
+    await api.renameWorkspace(currentWorkspaceId, nextName);
+    await refreshWorkspaces();
+    showToast('Workspace renamed.', 'success');
+  } finally {
+    setButtonLoading(button, false);
+  }
+}
+
 async function uploadAndRun(event) {
   event.preventDefault();
   clearValidationErrors();
@@ -545,6 +566,7 @@ async function loadSharedView(token) {
 
 function bindUiEvents() {
   el('createWorkspaceBtn').onclick = () => createWorkspace().catch((error) => showToast(error.message, 'error'));
+  el('renameWorkspaceBtn').onclick = () => renameWorkspace().catch((error) => showToast(error.message, 'error'));
   el('deleteWorkspaceBtn').onclick = () => deleteWorkspace().catch((error) => showToast(error.message, 'error'));
   el('workspaceSelect').onchange = async (event) => {
     updateState({ currentWorkspaceId: event.target.value, currentAnalysisId: null });

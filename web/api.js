@@ -54,6 +54,10 @@ export function createWorkspace(name) {
   return apiRequest(`/api/workspaces?name=${encodeURIComponent(name)}`, { method: 'POST' });
 }
 
+export function renameWorkspace(id, name) {
+  return apiRequest(`/api/workspaces/${encodeURIComponent(id)}/rename?name=${encodeURIComponent(name)}`, { method: 'POST' });
+}
+
 export function deleteWorkspace(id) {
   return apiRequest(`/api/workspaces/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
@@ -62,11 +66,11 @@ export function getWorkspaceNotes(id) {
   return apiRequest(`/api/workspaces/${encodeURIComponent(id)}/notes`);
 }
 
-export function saveWorkspaceNotes(id, markdown) {
+export function saveWorkspaceNotes(id, text) {
   return apiRequest(`/api/workspaces/${encodeURIComponent(id)}/notes`, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
-    body: markdown,
+    body: text,
   });
 }
 
@@ -110,11 +114,11 @@ export function getAnalysisNotes(id) {
   return apiRequest(`/api/analyses/${encodeURIComponent(id)}/notes`);
 }
 
-export function saveAnalysisNotes(id, markdown) {
+export function saveAnalysisNotes(id, text) {
   return apiRequest(`/api/analyses/${encodeURIComponent(id)}/notes`, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
-    body: markdown,
+    body: text,
   });
 }
 

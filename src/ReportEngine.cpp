@@ -1,26 +1,10 @@
 #include "ReportEngine.h"
+
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <algorithm>
-#include <iterator>
 
 namespace {
-std::string escapeMarkdownTableCell(const std::string& value) {
-    std::string escaped;
-    escaped.reserve(value.size() + 8);
-    for (char ch : value) {
-        if (ch == '|') {
-            escaped += "\\|";
-        } else if (ch == '\n') {
-            escaped += "<br>";
-        } else if (ch != '\r') {
-            escaped.push_back(ch);
-        }
-    }
-    return escaped;
-}
-
 std::string escapeHtml(const std::string& value) {
     std::string escaped;
     escaped.reserve(value.size() + 16);
@@ -38,34 +22,9 @@ std::string escapeHtml(const std::string& value) {
     return escaped;
 }
 
-constexpr size_t kTallTableRowCap = 120;
-
-void appendMarkdownTable(std::string& body,
-                         const std::vector<std::string>& headers,
-                         const std::vector<std::vector<std::string>>& rows) {
-    body += "|";
-    for (const auto& h : headers) {
-        body += " " + escapeMarkdownTableCell(h) + " |";
-    }
-    body += "\n|";
-    for (size_t i = 0; i < headers.size(); ++i) {
-        body += " --- |";
-    }
-    body += "\n";
-
-    for (const auto& row : rows) {
-        body += "|";
-        for (size_t i = 0; i < headers.size(); ++i) {
-            body += " " + escapeMarkdownTableCell(i < row.size() ? row[i] : "") + " |";
-        }
-        body += "\n";
-    }
-    body += "\n";
-}
-
-void appendWideHtmlTable(std::string& body,
-                         const std::vector<std::string>& headers,
-                         const std::vector<std::vector<std::string>>& rows) {
+void appendHtmlTable(std::string& body,
+                     const std::vector<std::string>& headers,
+                     const std::vector<std::vector<std::string>>& rows) {
     body += "<div style=\"overflow-x:auto; max-width:100%;\">\n";
     body += "<table>\n";
     body += "  <thead>\n";
@@ -88,176 +47,60 @@ void appendWideHtmlTable(std::string& body,
     body += "</div>\n\n";
 }
 
-bool hasUriScheme(const std::string& target) {
-    const size_t colon = target.find(':');
-    if (colon == std::string::npos) return false;
-    if (colon == 0) return false;
-    for (size_t i = 0; i < colon; ++i) {
-        const char ch = target[i];
-        const bool ok = (ch >= 'a' && ch <= 'z') ||
-                        (ch >= 'A' && ch <= 'Z') ||
-                        (ch >= '0' && ch <= '9') ||
-                        ch == '+' || ch == '-' || ch == '.';
-        if (!ok) return false;
-    }
-    return true;
-}
-
-bool isExternalOrAnchorLink(const std::string& target) {
-    if (target.empty()) return true;
-    if (target[0] == '#') return true;
-    if (hasUriScheme(target)) return true;
-    return false;
-}
-
-std::string toPortablePathString(const std::filesystem::path& path) {
-    return path.generic_string();
-}
-
-std::string normalizeLocalLinkTarget(const std::string& target,
-                                     const std::filesystem::path& reportDir) {
-    if (target.empty() || isExternalOrAnchorLink(target)) return target;
-
-    std::string base = target;
-    std::string suffix;
-    const size_t fragPos = base.find('#');
-    if (fragPos != std::string::npos) {
-        suffix = base.substr(fragPos);
-        base = base.substr(0, fragPos);
-    }
-    if (base.empty()) return target;
-
-    std::error_code ec;
-    const std::filesystem::path rawPath(base);
-    if (rawPath.is_absolute()) {
-        const std::filesystem::path rel = std::filesystem::relative(rawPath, reportDir, ec);
-        if (!ec && !rel.empty()) return toPortablePathString(rel) + suffix;
-        return toPortablePathString(rawPath) + suffix;
-    }
-
-    const std::filesystem::path reportRelative = reportDir / rawPath;
-    if (std::filesystem::exists(reportRelative, ec) && !ec) {
-        return toPortablePathString(rawPath) + suffix;
-    }
-
-    ec.clear();
-    const std::filesystem::path cwd = std::filesystem::current_path(ec);
-    if (ec) return target;
-
-    const std::filesystem::path cwdRelative = cwd / rawPath;
-    if (std::filesystem::exists(cwdRelative, ec) && !ec) {
-        ec.clear();
-        const std::filesystem::path rel = std::filesystem::relative(cwdRelative, reportDir, ec);
-        if (!ec && !rel.empty()) return toPortablePathString(rel) + suffix;
-    }
-
-    return toPortablePathString(rawPath) + suffix;
-}
-
-std::string normalizeMarkdownLinksForReport(const std::string& markdown,
-                                            const std::filesystem::path& reportDir) {
-    std::string out;
-    out.reserve(markdown.size() + 64);
-
-    size_t cursor = 0;
-    while (true) {
-        const size_t start = markdown.find("](", cursor);
-        if (start == std::string::npos) {
-            out.append(markdown.substr(cursor));
-            break;
-        }
-
-        const size_t targetStart = start + 2;
-        const size_t end = markdown.find(')', targetStart);
-        if (end == std::string::npos) {
-            out.append(markdown.substr(cursor));
-            break;
-        }
-
-        out.append(markdown.substr(cursor, targetStart - cursor));
-        const std::string target = markdown.substr(targetStart, end - targetStart);
-        out.append(normalizeLocalLinkTarget(target, reportDir));
-        out.push_back(')');
-        cursor = end + 1;
-    }
-
-    return out;
+std::string buildStandaloneHtml(const std::string& body) {
+    std::ostringstream out;
+    out << "<!doctype html><html><head><meta charset=\"utf-8\"/>"
+        << "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>"
+        << "<title>Seldon Report</title>"
+        << "<style>body{font-family:Inter,system-ui,sans-serif;line-height:1.45;margin:0;background:#0d1018;color:#c4cad6;}"
+        << "main{max-width:1220px;margin:0 auto;padding:18px;}h1,h2,h3,h4{color:#e8940a;}"
+        << "table{border-collapse:collapse;width:100%;}th,td{border:1px solid rgba(255,255,255,.08);padding:4px 6px;}"
+        << "img{max-width:100%;height:auto;display:block;background:#0d1018;margin:6px 0;}"
+        << "p,li{color:#c4cad6;}code{background:rgba(255,255,255,.08);padding:1px 4px;}</style></head><body><main>"
+        << body
+        << "</main></body></html>";
+    return out.str();
 }
 } // namespace
 
 void ReportEngine::addTitle(const std::string& title) {
-    body_ += "# " + title + "\n\n";
+    body_ += "<h1>" + escapeHtml(title) + "</h1>\n\n";
 }
 
 void ReportEngine::addParagraph(const std::string& text) {
-    body_ += text + "\n\n";
+    body_ += "<p>" + escapeHtml(text) + "</p>\n\n";
 }
 
-void ReportEngine::addTable(const std::string& title, const std::vector<std::string>& headers, const std::vector<std::vector<std::string>>& rows) {
-    body_ += "## " + title + "\n";
+void ReportEngine::addTable(const std::string& title,
+                            const std::vector<std::string>& headers,
+                            const std::vector<std::vector<std::string>>& rows) {
+    body_ += "<h2>" + escapeHtml(title) + "</h2>\n";
     if (headers.empty()) {
-        body_ += "(no columns)\n\n";
+        body_ += "<p><em>(no columns)</em></p>\n\n";
         return;
     }
-
-    const bool wideTable = headers.size() >= 10;
-    const bool tallTable = rows.size() > kTallTableRowCap;
-
-    if (wideTable) {
-        body_ += "_Wide table rendered in a scrollable block for readability._\n\n";
-    }
-    if (tallTable) {
-        body_ += "_Tall table preview shown (" + std::to_string(kTallTableRowCap) + " of " + std::to_string(rows.size()) + " rows)._\n\n";
-    }
-
-    const size_t previewCount = tallTable ? kTallTableRowCap : rows.size();
-    const std::vector<std::vector<std::string>> previewRows(rows.begin(), rows.begin() + static_cast<long>(previewCount));
-
-    if (wideTable) {
-        appendWideHtmlTable(body_, headers, previewRows);
-    } else {
-        appendMarkdownTable(body_, headers, previewRows);
-    }
-
-    if (tallTable) {
-        body_ += "<details>\n";
-        body_ += "<summary>Show full table (" + std::to_string(rows.size()) + " rows)</summary>\n\n";
-        if (wideTable) {
-            appendWideHtmlTable(body_, headers, rows);
-        } else {
-            appendMarkdownTable(body_, headers, rows);
-        }
-        body_ += "</details>\n\n";
-    }
+    appendHtmlTable(body_, headers, rows);
 }
 
 void ReportEngine::addImage(const std::string& title, const std::string& imagePath) {
-    body_ += "### " + title + "\n";
-    body_ += "![" + title + "](" + imagePath + ")\n\n";
+    body_ += "<h3>" + escapeHtml(title) + "</h3>\n";
+    body_ += "<img src=\"" + escapeHtml(imagePath) + "\" alt=\"" + escapeHtml(title) + "\"/>\n\n";
+}
+
+std::string ReportEngine::renderBody() const {
+    return body_;
 }
 
 void ReportEngine::save(const std::string& filePath) const {
+    const std::filesystem::path outPath(filePath);
     std::error_code ec;
-    const std::filesystem::path reportDir = std::filesystem::path(filePath).parent_path().empty()
-        ? std::filesystem::current_path(ec)
-        : std::filesystem::path(filePath).parent_path();
+    std::filesystem::create_directories(outPath.parent_path(), ec);
 
-    const std::string normalized = (body_.find("](") == std::string::npos)
-        ? body_
-        : normalizeMarkdownLinksForReport(body_, reportDir);
-
-    {
-        std::ifstream in(filePath, std::ios::binary);
-        if (in) {
-            const std::string existing((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            if (existing == normalized) {
-                return;
-            }
-        }
-    }
+    const bool htmlOut = outPath.extension() == ".html";
+    const std::string payload = htmlOut ? buildStandaloneHtml(body_) : body_;
 
     std::ofstream out(filePath, std::ios::binary | std::ios::trunc);
     std::vector<char> ioBuffer(1 << 20, '\0');
     out.rdbuf()->pubsetbuf(ioBuffer.data(), static_cast<std::streamsize>(ioBuffer.size()));
-    out.write(normalized.data(), static_cast<std::streamsize>(normalized.size()));
+    out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
 }
