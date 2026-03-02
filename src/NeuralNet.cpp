@@ -893,7 +893,11 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
     std::vector<std::vector<Scalar>> bestW(m_layers.size());
     std::vector<std::vector<Scalar>> bestB(m_layers.size());
 
+    static const std::string kCancelSignal = "__seldon_cancelled__";
     for (size_t epoch = 0; epoch < hp.epochs; ++epoch) {
+        if (hpEffective.cancelHook && hpEffective.cancelHook()) {
+            throw std::runtime_error(kCancelSignal);
+        }
         if (hp.verbose && (epoch % std::max<size_t>(1, hp.epochs / 10) == 0)) {
             std::cout << "\r[Seldon][Neural] Training: ["
                       << (epoch * 100 / std::max<size_t>(1, hp.epochs)) << "%] " << std::flush;

@@ -151,6 +151,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         };
 
         hp.epochs = std::clamp<size_t>(120 + data.rowCount() / 2, 100, 320);
+        hp.cancelHook = AutomationPipeline::shouldCancel;
         hp.batchSize = std::clamp<size_t>(data.rowCount() / 24, 4, 64);
         hp.learningRate = config.neuralLearningRate;
         hp.earlyStoppingPatience = std::clamp<int>(static_cast<int>(hp.epochs / 12), 6, 24);
@@ -746,6 +747,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         probeHp.seed = config.neuralSeed + 17;
         probeHp.importanceMaxRows = std::min<size_t>(config.neuralImportanceMaxRows, 2000);
         probeHp.importanceParallel = config.neuralImportanceParallel;
+        probeHp.cancelHook = AutomationPipeline::shouldCancel;
         probeNet.train(probeX, probeY, probeHp);
 
         const std::vector<double> probeImportance = probeNet.calculateFeatureImportance(
@@ -952,6 +954,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     };
 
     hp.epochs = dynamicEpochs;
+    hp.cancelHook = AutomationPipeline::shouldCancel;
     hp.batchSize = dynamicBatch;
     hp.learningRate = config.neuralLearningRate;
     hp.earlyStoppingPatience = dynamicPatience;
@@ -2019,10 +2022,16 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         }
     };
 
+    static const std::string kBivariateCancelSignal = "__seldon_cancelled__";
+    auto bivariateShouldCancel = [&]() {
+        return AutomationPipeline::shouldCancel && AutomationPipeline::shouldCancel();
+    };
+
     if (verbose) {
         const size_t reservePairs = evalNumericIdx.size() < 2 ? 0 : (evalNumericIdx.size() * (evalNumericIdx.size() - 1)) / 2;
         pairs.reserve(reservePairs);
         for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
+            if (bivariateShouldCancel()) throw std::runtime_error(kBivariateCancelSignal);
             appendPairsForRange(aPos, aPos + 1, pairs, true);
             printProgressBar("pair-generation", aPos + 1, evalNumericIdx.size());
         }
@@ -2034,16 +2043,24 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         const size_t reservePerThread = reservePairs / static_cast<size_t>(threadCount) + 16;
         for (auto& local : threadPairs) local.reserve(reservePerThread);
 
-        #pragma omp parallel default(none) shared(threadPairs, evalNumericIdx, appendPairsForRange)
+        // Snapshot the cancel state before entering the parallel region (thread_local
+        // is not accessible from OpenMP worker threads). Workers check this atomic flag.
+        std::atomic<bool> ompCancelFlag{bivariateShouldCancel()};
+        auto isCanceledForOmp = [&ompCancelFlag]() { return ompCancelFlag.load(std::memory_order_relaxed); };
+
+        #pragma omp parallel default(none) shared(threadPairs, evalNumericIdx, appendPairsForRange, ompCancelFlag)
         {
             const int tid = omp_get_thread_num();
             std::vector<PairInsight>& localPairs = threadPairs[static_cast<size_t>(tid)];
 
             #pragma omp for schedule(dynamic)
             for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
+                if (ompCancelFlag.load(std::memory_order_relaxed)) continue;
                 appendPairsForRange(aPos, aPos + 1, localPairs, false);
             }
         }
+
+        if (bivariateShouldCancel()) throw std::runtime_error(kBivariateCancelSignal);
 
         for (auto& local : threadPairs) {
             pairs.insert(pairs.end(), std::make_move_iterator(local.begin()), std::make_move_iterator(local.end()));
@@ -2051,6 +2068,7 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
         printProgressBar("pair-generation", evalNumericIdx.size(), evalNumericIdx.size());
         #else
         for (size_t aPos = 0; aPos < evalNumericIdx.size(); ++aPos) {
+            if (bivariateShouldCancel()) throw std::runtime_error(kBivariateCancelSignal);
             appendPairsForRange(aPos, aPos + 1, pairs, false);
             if (((aPos + 1) % std::max<size_t>(1, evalNumericIdx.size() / 20)) == 0 || (aPos + 1) == evalNumericIdx.size()) {
                 printProgressBar("pair-generation", aPos + 1, evalNumericIdx.size());

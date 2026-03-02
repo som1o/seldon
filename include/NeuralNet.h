@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <vector>
 #include <string>
 #include <random>
@@ -76,6 +77,9 @@ public:
         bool importanceParallel = true;
         uint32_t seed = 1337;
         bool verbose = true;
+        // Optional cancellation probe: called at the start of each epoch.
+        // Return true to abort training immediately (throws std::runtime_error).
+        std::function<bool()> cancelHook;
     };
 
     struct UncertaintyEstimate {

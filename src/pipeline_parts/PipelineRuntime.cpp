@@ -672,12 +672,6 @@ int AutomationPipeline::run(const AutoConfig& config) {
     size_t strictSuppressedPairs = 0;
     size_t strictSuppressedSelected = 0;
     size_t identitySuppressedPairs = 0;
-    auto plotFlagText = [&](const PairInsight& p, bool enabled) {
-        if (!canPlot) return std::string("n/a");
-        if (!p.selected) return std::string("n/a");
-        if (p.plotPath.empty()) return std::string("n/a");
-        return enabled ? std::string("yes") : std::string("no");
-    };
     for (const auto& p : bivariatePairs) {
         if (identityBlockedColumnNames.count(p.featureA) > 0 || identityBlockedColumnNames.count(p.featureB) > 0) {
             ++identitySuppressedPairs;
@@ -727,13 +721,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
                 p.filteredAsStructural ? "yes" : "no",
                 p.leakageRisk ? "yes" : "no",
                 p.redundancyGroup.empty() ? "-" : p.redundancyGroup,
-                p.relationLabel.empty() ? "-" : p.relationLabel,
-                plotFlagText(p, p.fitLineAdded),
-                plotFlagText(p, p.confidenceBandAdded),
-                p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
-                p.residualPlotPath.empty() ? "-" : p.residualPlotPath,
-                p.facetedPlotPath.empty() ? "-" : p.facetedPlotPath,
-                p.plotPath.empty() ? "-" : p.plotPath
+                p.relationLabel.empty() ? "-" : p.relationLabel
             });
             if (compactBivariateRows && !p.selected) {
                 ++compactRejectedCount;
@@ -757,26 +745,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
                 toFixed(p.neuralScore, 6),
                 std::to_string(p.significanceTier),
                 p.selectionReason.empty() ? "-" : p.selectionReason,
-                p.relationLabel.empty() ? "-" : p.relationLabel,
-                plotFlagText(p, p.fitLineAdded),
-                plotFlagText(p, p.confidenceBandAdded),
-                p.stackedPlotPath.empty() ? "-" : p.stackedPlotPath,
-                p.residualPlotPath.empty() ? "-" : p.residualPlotPath,
-                p.facetedPlotPath.empty() ? "-" : p.facetedPlotPath,
-                p.plotPath.empty() ? "-" : p.plotPath
+                p.relationLabel.empty() ? "-" : p.relationLabel
             });
-            if (!p.plotPath.empty()) {
-                bivariate.addImage("Significant Pair: " + p.featureA + " vs " + p.featureB, p.plotPath);
-            }
-            if (!p.stackedPlotPath.empty()) {
-                bivariate.addImage("Stacked Profile: " + p.featureA + " vs " + p.featureB, p.stackedPlotPath);
-            }
-            if (!p.residualPlotPath.empty()) {
-                bivariate.addImage("Residual Plot: " + p.featureA + " vs " + p.featureB, p.residualPlotPath);
-            }
-            if (!p.facetedPlotPath.empty()) {
-                bivariate.addImage("Faceted Scatter: " + p.featureA + " vs " + p.featureB, p.facetedPlotPath);
-            }
         }
     }
 
@@ -911,9 +881,6 @@ int AutomationPipeline::run(const AutoConfig& config) {
             bivSummary << " Identity block removed " << identitySuppressedPairs << " near-identical pairs.";
         bivariate.addParagraph(bivSummary.str());
     }
-    if (!canPlot) {
-        bivariate.addParagraph("Plot columns are 'n/a': visual generation is disabled in this run mode.");
-    }
     addExecutiveDashboard(
         bivariate,
         "Executive Dashboard",
@@ -963,40 +930,8 @@ int AutomationPipeline::run(const AutoConfig& config) {
         }
     }
 
-    auto trimNonInformativeColumns = [](std::vector<std::string>& headers,
-                                        std::vector<std::vector<std::string>>& rows,
-                                        const std::vector<std::string>& candidates) {
-        auto isNonInformative = [](const std::string& v) {
-            const std::string t = CommonUtils::toLower(CommonUtils::trim(v));
-            return t.empty() || t == "-" || t == "no" || t == "n/a";
-        };
-
-        for (const auto& name : candidates) {
-            auto it = std::find(headers.begin(), headers.end(), name);
-            if (it == headers.end()) continue;
-            const size_t idx = static_cast<size_t>(std::distance(headers.begin(), it));
-
-            bool allNonInformative = true;
-            for (const auto& row : rows) {
-                if (idx < row.size() && !isNonInformative(row[idx])) {
-                    allNonInformative = false;
-                    break;
-                }
-            }
-            if (!allNonInformative) continue;
-
-            headers.erase(headers.begin() + static_cast<long>(idx));
-            for (auto& row : rows) {
-                if (idx < row.size()) row.erase(row.begin() + static_cast<long>(idx));
-            }
-        }
-    };
-
-    std::vector<std::string> allHeaders = {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "significance_tier", "selection_reason", "selected", "redundant", "structural", "leakage_risk", "cluster_rep", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"};
-    std::vector<std::string> sigHeaders = {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "significance_tier", "selection_reason", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"};
-    const std::vector<std::string> optionalColumns = {"fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"};
-    trimNonInformativeColumns(allHeaders, allRows, optionalColumns);
-    trimNonInformativeColumns(sigHeaders, sigRows, optionalColumns);
+    std::vector<std::string> allHeaders = {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "stat_sig", "neural_score", "significance_tier", "selection_reason", "selected", "redundant", "structural", "leakage_risk", "cluster_rep", "relation_label"};
+    std::vector<std::string> sigHeaders = {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "significance_tier", "selection_reason", "relation_label"};
 
     if (compactBivariateRows) {
         bivariate.addParagraph("Low-memory mode: omitted full pair table and kept only selected + capped rejected samples for diagnostics.");
@@ -1639,7 +1574,7 @@ int AutomationPipeline::run(const AutoConfig& config) {
         finalAnalysis.addTable("Segmented Population Findings", {"Segment Column", "Numeric Feature", "Groups", "Rows", "eta_squared", "separation", "group_means"}, rows);
     }
 
-    finalAnalysis.addTable("Selected Significant Bivariate Findings", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "significance_tier", "selection_reason", "relation_label", "fit_line", "confidence_band", "stacked_plot", "residual_plot", "faceted_plot", "scatter_plot"}, sigRows);
+    finalAnalysis.addTable("Selected Significant Bivariate Findings", {"Feature A", "Feature B", "pearson_r", "spearman_rho", "kendall_tau", "r2", "effect_size", "fold_stability", "slope", "intercept", "t_stat", "p_value", "neural_score", "significance_tier", "selection_reason", "relation_label"}, sigRows);
 
     finalAnalysis.addTable("Data Health Signal Card", {"Component", "Value"}, {
         {"Score (0-100)", toFixed(dataHealth.score, 1)},

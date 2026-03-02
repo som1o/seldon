@@ -2984,7 +2984,9 @@ void applyDynamicPlotDefaultsIfUnset(AutoConfig& runCfg, const TypedDataset& dat
 
 bool configurePlotAvailability(AutoConfig& runCfg, ReportEngine& univariate, const GnuplotEngine& plotterBivariate) {
     const bool canPlot = plotterBivariate.isAvailable();
-    univariate.addParagraph(canPlot ? "Gnuplot detected." : "Gnuplot not available: visualizations were omitted for runtime/portability and analysis continues normally.");
+    if (!canPlot) {
+        univariate.addParagraph("Gnuplot not available: visualizations were omitted for runtime/portability and analysis continues normally.");
+    }
     if (!canPlot && (runCfg.plotUnivariate || runCfg.plotOverall || runCfg.plotBivariateSignificant)) {
         runCfg.plotUnivariate = false;
         runCfg.plotOverall = false;
@@ -3001,47 +3003,28 @@ void addUnivariatePlots(ReportEngine& univariate,
                         GnuplotEngine& plotterUnivariate,
                         const std::unordered_set<size_t>& neuralApprovedNumericFeatures) {
     if (!(runCfg.plotUnivariate && canPlot)) {
-        univariate.addParagraph("Supervised setting disabled: univariate plots skipped.");
         return;
     }
 
     if (neuralApprovedNumericFeatures.empty()) {
-        univariate.addParagraph("No neural-approved significant numeric features were found: univariate plots skipped.");
         return;
     }
 
-    univariate.addParagraph("Supervised setting enabled: univariate plots generated in a dedicated folder.");
     if (runCfg.verboseAnalysis) {
         std::cout << "[Seldon][Univariate] Generating supervised univariate plots...\n";
     }
 
-    auto logGeneratedPlot = [&](const std::string& img) {
-        if (runCfg.verboseAnalysis) std::cout << "[Seldon][Univariate] Plot generated: " << img << "\n";
-    };
-
     for (size_t idx : data.numericColumnIndices()) {
         if (neuralApprovedNumericFeatures.find(idx) == neuralApprovedNumericFeatures.end()) continue;
         const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
-        std::string img = plotterUnivariate.histogram("uni_hist_" + std::to_string(idx), vals, "Histogram: " + data.columns()[idx].name);
-        if (!img.empty()) {
-            univariate.addImage("Histogram: " + data.columns()[idx].name, img);
-            logGeneratedPlot(img);
-        }
+        plotterUnivariate.histogram("uni_hist_" + std::to_string(idx), vals, "Histogram: " + data.columns()[idx].name);
 
         if (shouldAddOgive(vals, runCfg.tuning)) {
-            std::string ogive = plotterUnivariate.ogive("uni_ogive_" + std::to_string(idx), vals, "Ogive: " + data.columns()[idx].name);
-            if (!ogive.empty()) {
-                univariate.addImage("Ogive: " + data.columns()[idx].name, ogive);
-                logGeneratedPlot(ogive);
-            }
+            plotterUnivariate.ogive("uni_ogive_" + std::to_string(idx), vals, "Ogive: " + data.columns()[idx].name);
         }
 
         if (shouldAddBoxPlot(vals, runCfg.tuning, runCfg.tuning.numericEpsilon)) {
-            std::string box = plotterUnivariate.box("uni_box_" + std::to_string(idx), vals, "Box Plot: " + data.columns()[idx].name);
-            if (!box.empty()) {
-                univariate.addImage("Box Plot: " + data.columns()[idx].name, box);
-                logGeneratedPlot(box);
-            }
+            plotterUnivariate.box("uni_box_" + std::to_string(idx), vals, "Box Plot: " + data.columns()[idx].name);
         }
 
         if (vals.size() >= 20) {
@@ -3062,41 +3045,20 @@ void addUnivariatePlots(ReportEngine& univariate,
                 qExp[i] = -std::log(std::max(runCfg.tuning.numericEpsilon, 1.0 - p)) / lambda;
             }
 
-            std::string qqNorm = plotterUnivariate.scatter("uni_qqnorm_" + std::to_string(idx),
-                                                            qNorm,
-                                                            sorted,
-                                                            "Q-Q (Normal): " + data.columns()[idx].name,
-                                                            false,
-                                                            0.0,
-                                                            0.0,
-                                                            "",
-                                                            false,
-                                                            1.96,
-                                                            5000);
-            if (!qqNorm.empty()) {
-                univariate.addImage("Q-Q Plot (Normal): " + data.columns()[idx].name, qqNorm);
-                logGeneratedPlot(qqNorm);
-            }
+            plotterUnivariate.scatter("uni_qqnorm_" + std::to_string(idx),
+                                      qNorm,
+                                      sorted,
+                                      "Q-Q (Normal): " + data.columns()[idx].name,
+                                      false, 0.0, 0.0, "", false, 1.96, 5000);
 
-            std::string qqExp = plotterUnivariate.scatter("uni_qqexp_" + std::to_string(idx),
-                                                           qExp,
-                                                           sorted,
-                                                           "Q-Q (Exponential): " + data.columns()[idx].name,
-                                                           false,
-                                                           0.0,
-                                                           0.0,
-                                                           "",
-                                                           false,
-                                                           1.96,
-                                                           5000);
-            if (!qqExp.empty()) {
-                univariate.addImage("Q-Q Plot (Exponential): " + data.columns()[idx].name, qqExp);
-                logGeneratedPlot(qqExp);
-            }
+            plotterUnivariate.scatter("uni_qqexp_" + std::to_string(idx),
+                                      qExp,
+                                      sorted,
+                                      "Q-Q (Exponential): " + data.columns()[idx].name,
+                                      false, 0.0, 0.0, "", false, 1.96, 5000);
         }
     }
 
-    univariate.addParagraph("Categorical and category-numeric univariate plots were skipped because they do not have direct per-column neural significance attribution.");
 }
 
 struct ReportSaveSummary {
