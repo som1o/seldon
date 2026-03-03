@@ -1291,11 +1291,9 @@ void addOverallSections(ReportEngine& report,
                         GnuplotEngine* overallPlotter,
                         bool canPlotOverall,
                         bool verbose,
-                        const NumericStatsCache& statsCache) {
-    (void)config;
-    (void)overallPlotter;
-    (void)canPlotOverall;
-    (void)statsCache;
+                        const NumericStatsCache& statsCache,
+                        const std::vector<int>& featureIdx,
+                        const std::vector<PairInsight>& bivariatePairs) {
     report.addParagraph("Overall: dataset health, model baselines, neural training, and global visual diagnostics.");
     addDatasetHealthTable(report, data, prep, health);
 
@@ -1326,8 +1324,253 @@ void addOverallSections(ReportEngine& report,
 
     addBenchmarkSection(report, benchmarks);
     addNeuralLossSummaryTable(report, neural);
-    report.addParagraph("Overall plots were intentionally disabled to keep post-bivariate reporting fast. Core overall insights are preserved via summary tables.");
+
+    std::unordered_map<size_t, double> importanceByFeature;
+    importanceByFeature.reserve(featureIdx.size());
+    for (size_t i = 0; i < featureIdx.size() && i < neural.featureImportance.size(); ++i) {
+        if (featureIdx[i] < 0) continue;
+        importanceByFeature[static_cast<size_t>(featureIdx[i])] = std::max(0.0, neural.featureImportance[i]);
+    }
+
+    std::vector<const PairInsight*> significantModelPairs;
+    significantModelPairs.reserve(bivariatePairs.size());
+    for (const auto& pair : bivariatePairs) {
+        if (!pair.selected) continue;
+        if (pair.significanceTier < 2) continue;
+        if (pair.leakageRisk) continue;
+        significantModelPairs.push_back(&pair);
+    }
+
+    if (significantModelPairs.empty()) {
+        report.addParagraph("Overall graphs were skipped because no model-selected statistically significant pair findings were available.");
+        if (verbose) {
+            std::cout << "[Seldon][Overall] Skipped overall charts: no model-selected significant findings.\n";
+        }
+        return;
+    }
+
+    std::unordered_map<size_t, size_t> selectedFrequency;
+    for (const auto* pair : significantModelPairs) {
+        selectedFrequency[pair->idxA]++;
+        selectedFrequency[pair->idxB]++;
+    }
+
+    std::vector<size_t> modeledNumeric;
+    modeledNumeric.reserve(selectedFrequency.size());
+    for (const auto& kv : selectedFrequency) {
+        if (kv.first >= data.columns().size()) continue;
+        if (data.columns()[kv.first].type != ColumnType::NUMERIC) continue;
+        modeledNumeric.push_back(kv.first);
+    }
+
+    std::sort(modeledNumeric.begin(), modeledNumeric.end(), [&](size_t a, size_t b) {
+        const size_t fa = selectedFrequency.count(a) ? selectedFrequency.at(a) : 0;
+        const size_t fb = selectedFrequency.count(b) ? selectedFrequency.at(b) : 0;
+        if (fa != fb) return fa > fb;
+        const double ia = importanceByFeature.count(a) ? importanceByFeature.at(a) : 0.0;
+        const double ib = importanceByFeature.count(b) ? importanceByFeature.at(b) : 0.0;
+        if (ia != ib) return ia > ib;
+        return data.columns()[a].name < data.columns()[b].name;
+    });
+
+    struct OverallPlotRow {
+        std::string plotType;
+        std::string driver;
+        std::string status;
+    };
+    std::vector<OverallPlotRow> overallRows;
+
+    auto addOverallImage = [&](const std::string& title,
+                               const std::string& plotType,
+                               const std::string& driver,
+                               const std::string& path) {
+        if (!path.empty()) {
+            report.addImage(title, path);
+            overallRows.push_back({plotType, driver, "generated"});
+        } else {
+            overallRows.push_back({plotType, driver, "skipped"});
+        }
+    };
+
+    if (!canPlotOverall || overallPlotter == nullptr) {
+        report.addParagraph("Overall findings are available, but overall charts are disabled by runtime plot settings.");
+        if (verbose) {
+            std::cout << "[Seldon][Overall] Significant findings available, but plotting is disabled.\n";
+        }
+        return;
+    }
+
+    if (modeledNumeric.size() >= 2) {
+        const size_t maxCols = std::max<size_t>(2, config.tuning.overallCorrHeatmapMaxColumns);
+        const size_t useCols = std::min(maxCols, modeledNumeric.size());
+        std::vector<size_t> heatmapCols(modeledNumeric.begin(), modeledNumeric.begin() + useCols);
+        std::vector<std::vector<double>> corr(useCols, std::vector<double>(useCols, 0.0));
+        std::vector<std::string> labels;
+        labels.reserve(useCols);
+        for (size_t idx : heatmapCols) labels.push_back(data.columns()[idx].name);
+
+        for (size_t i = 0; i < useCols; ++i) {
+            corr[i][i] = 1.0;
+            const auto& vi = std::get<std::vector<double>>(data.columns()[heatmapCols[i]].values);
+            const ColumnStats si = statsCache.count(heatmapCols[i])
+                ? statsCache.at(heatmapCols[i])
+                : Statistics::calculateStats(vi);
+            for (size_t j = i + 1; j < useCols; ++j) {
+                const auto& vj = std::get<std::vector<double>>(data.columns()[heatmapCols[j]].values);
+                const ColumnStats sj = statsCache.count(heatmapCols[j])
+                    ? statsCache.at(heatmapCols[j])
+                    : Statistics::calculateStats(vj);
+                const double r = MathUtils::calculatePearson(vi, vj, si, sj).value_or(0.0);
+                corr[i][j] = r;
+                corr[j][i] = r;
+            }
+        }
+
+        const std::string heatmapPath = overallPlotter->heatmap("overall_sig_corr_heatmap",
+                                                                 corr,
+                                                                 "Overall Correlation Heatmap (Model-Selected Significant Features)",
+                                                                 labels);
+        addOverallImage("Overall Correlation Heatmap", "correlation_heatmap", "selected_significant_pairs", heatmapPath);
+    } else {
+        overallRows.push_back({"correlation_heatmap", "selected_significant_pairs", "skipped_insufficient_numeric_features"});
+    }
+
+    if (modeledNumeric.size() >= 3) {
+        const size_t idxA = modeledNumeric[0];
+        const size_t idxB = modeledNumeric[1];
+        const size_t idxC = modeledNumeric[2];
+        const auto& a = std::get<std::vector<double>>(data.columns()[idxA].values);
+        const auto& b = std::get<std::vector<double>>(data.columns()[idxB].values);
+        const auto& c = std::get<std::vector<double>>(data.columns()[idxC].values);
+        const size_t n = std::min({a.size(), b.size(), c.size(), data.rowCount()});
+
+        std::vector<double> x;
+        std::vector<double> y;
+        std::vector<double> z;
+        x.reserve(n);
+        y.reserve(n);
+        z.reserve(n);
+        const size_t sampleCap = 8000;
+        const size_t step = std::max<size_t>(1, n / sampleCap);
+        for (size_t r = 0; r < n; r += step) {
+            if (r < data.columns()[idxA].missing.size() && data.columns()[idxA].missing[r]) continue;
+            if (r < data.columns()[idxB].missing.size() && data.columns()[idxB].missing[r]) continue;
+            if (r < data.columns()[idxC].missing.size() && data.columns()[idxC].missing[r]) continue;
+            if (!std::isfinite(a[r]) || !std::isfinite(b[r]) || !std::isfinite(c[r])) continue;
+            x.push_back(a[r]);
+            y.push_back(b[r]);
+            z.push_back(c[r]);
+        }
+
+        std::string scatter3dPath;
+        if (x.size() >= 24) {
+            scatter3dPath = overallPlotter->scatter3D("overall_sig_scatter3d",
+                                                      x,
+                                                      y,
+                                                      z,
+                                                      "3D Scatter (Top Model-Selected Significant Features)");
+        }
+        addOverallImage("Overall 3D Scatter", "scatter3d", data.columns()[idxA].name + ", " + data.columns()[idxB].name + ", " + data.columns()[idxC].name, scatter3dPath);
+    } else {
+        overallRows.push_back({"scatter3d", "top_modeled_numeric", "skipped_insufficient_numeric_features"});
+    }
+
+    {
+        std::string piePath;
+        std::string pieDriver = "none";
+        if (!modeledNumeric.empty()) {
+            const size_t anchor = modeledNumeric.front();
+            const auto& anchorVals = std::get<std::vector<double>>(data.columns()[anchor].values);
+            const auto cats = data.categoricalColumnIndices();
+            double bestEta = 0.0;
+            std::vector<std::pair<std::string, size_t>> bestCounts;
+            std::string bestCatName;
+
+            for (size_t cidx : cats) {
+                const auto& col = data.columns()[cidx];
+                const auto& labels = std::get<std::vector<std::string>>(col.values);
+                std::unordered_map<std::string, size_t> freq;
+                std::unordered_map<std::string, double> sum;
+                std::unordered_map<std::string, double> sumSq;
+                size_t total = 0;
+                double globalSum = 0.0;
+                double globalSumSq = 0.0;
+                const size_t n = std::min({labels.size(), anchorVals.size(), data.rowCount()});
+                for (size_t r = 0; r < n; ++r) {
+                    if (r < col.missing.size() && col.missing[r]) continue;
+                    if (r < data.columns()[anchor].missing.size() && data.columns()[anchor].missing[r]) continue;
+                    if (!std::isfinite(anchorVals[r])) continue;
+                    const std::string key = CommonUtils::trim(labels[r]);
+                    if (key.empty()) continue;
+                    freq[key]++;
+                    sum[key] += anchorVals[r];
+                    sumSq[key] += anchorVals[r] * anchorVals[r];
+                    globalSum += anchorVals[r];
+                    globalSumSq += anchorVals[r] * anchorVals[r];
+                    ++total;
+                }
+
+                if (total < 30) continue;
+                if (freq.size() < config.tuning.pieMinCategories || freq.size() > config.tuning.pieMaxCategories) continue;
+                std::vector<std::pair<std::string, size_t>> counts(freq.begin(), freq.end());
+                std::sort(counts.begin(), counts.end(), [](const auto& a, const auto& b) {
+                    if (a.second == b.second) return a.first < b.first;
+                    return a.second > b.second;
+                });
+                const double dominance = static_cast<double>(counts.front().second) / static_cast<double>(total);
+                if (dominance > config.tuning.pieMaxDominanceRatio) continue;
+
+                const double grandMean = globalSum / static_cast<double>(total);
+                const double sst = std::max(0.0, globalSumSq - globalSum * grandMean);
+                if (sst <= 1e-12) continue;
+
+                double ssb = 0.0;
+                for (const auto& kv : freq) {
+                    const double mu = sum[kv.first] / static_cast<double>(std::max<size_t>(1, kv.second));
+                    const double d = mu - grandMean;
+                    ssb += static_cast<double>(kv.second) * d * d;
+                }
+                const double eta2 = std::clamp(ssb / sst, 0.0, 1.0);
+                if (eta2 > bestEta) {
+                    bestEta = eta2;
+                    bestCounts = std::move(counts);
+                    bestCatName = col.name;
+                }
+            }
+
+            if (!bestCounts.empty()) {
+                std::vector<std::string> labels;
+                std::vector<double> values;
+                labels.reserve(bestCounts.size());
+                values.reserve(bestCounts.size());
+                for (const auto& kv : bestCounts) {
+                    labels.push_back(kv.first);
+                    values.push_back(static_cast<double>(kv.second));
+                }
+                piePath = overallPlotter->pie("overall_sig_categorical_pie",
+                                              labels,
+                                              values,
+                                              "Categorical Pie (Top Model-Aligned Segment)");
+                pieDriver = bestCatName + " vs " + data.columns()[anchor].name;
+            }
+        }
+        addOverallImage("Overall Categorical Pie", "categorical_pie", pieDriver, piePath);
+    }
+
+    std::vector<std::vector<std::string>> plotRows;
+    plotRows.reserve(overallRows.size());
+    for (const auto& row : overallRows) {
+        plotRows.push_back({row.plotType, row.driver, row.status});
+    }
+    report.addTable("Overall Graph Coverage", {"Plot Type", "Model Driver", "Status"}, plotRows);
+
     if (verbose) {
-        std::cout << "[Seldon][Overall] Plot-heavy overall diagnostics were disabled for performance-first execution.\n";
+        size_t generated = 0;
+        for (const auto& row : overallRows) {
+            if (row.status == "generated") ++generated;
+        }
+        std::cout << "[Seldon][Overall] Generated " << generated
+                  << " model-driven overall chart(s) from " << significantModelPairs.size()
+                  << " selected significant pair finding(s).\n";
     }
-    }
+}

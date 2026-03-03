@@ -30,8 +30,6 @@ int AutomationPipeline::run(const AutoConfig& config) {
         runCfg.generateHtml = false;
     }
 
-    runCfg.plotOverall = false;
-
     runCfg.plot.format = "png";
     {
         namespace fs = std::filesystem;
@@ -150,12 +148,23 @@ int AutomationPipeline::run(const AutoConfig& config) {
     const std::optional<std::string> protectedTargetName = config.targetColumn.empty()
         ? std::optional<std::string>{}
         : std::optional<std::string>{config.targetColumn};
+    const auto resolvePreflightSparseThreshold = [&]() {
+        if (runCfg.maxFeatureMissingRatio >= 0.0) {
+            return std::clamp(runCfg.maxFeatureMissingRatio + 0.05, 0.75, 0.995);
+        }
+        const std::string mode = CommonUtils::toLower(CommonUtils::trim(runCfg.featureStrategy));
+        if (mode == "aggressive") return 0.85;
+        if (mode == "lenient") return 0.97;
+        if (mode == "adaptive") return 0.92;
+        return 0.93;
+    };
+    const double preflightSparseThreshold = resolvePreflightSparseThreshold();
     const PreflightCullSummary preflightCull = applyPreflightSparseColumnCull(data,
                                                                                protectedTargetName,
                                                                                runCfg.verboseAnalysis,
-                                                                               0.95);
+                                                                               preflightSparseThreshold);
     if (data.colCount() == 0) {
-        throw Seldon::DatasetException("All columns were removed by pre-flight missingness cull (>95% missing)");
+        throw Seldon::DatasetException("All columns were removed by pre-flight missingness cull");
     }
     const size_t rawColumnsAfterPreflight = data.colCount();
     const TypedDataset reportingData = data;
@@ -308,7 +317,9 @@ int AutomationPipeline::run(const AutoConfig& config) {
 
     GnuplotEngine plotterBivariate(plotSubdir(runCfg, "bivariate"), runCfg.plot);
     GnuplotEngine plotterUnivariate(plotSubdir(runCfg, "univariate"), runCfg.plot);
+    GnuplotEngine plotterOverall(plotSubdir(runCfg, "overall"), runCfg.plot);
     const bool canPlot = configurePlotAvailability(runCfg, univariate, plotterBivariate);
+    const bool canPlotOverall = canPlot && runCfg.plotOverall;
 
     FeatureSelectionResult selectedFeatures = collectFeatureIndices(data, targetIdx, runCfg, prep);
     std::vector<int> featureIdx = selectedFeatures.included;
@@ -1335,10 +1346,12 @@ int AutomationPipeline::run(const AutoConfig& config) {
                        neural,
                        dataHealth,
                        runCfg,
-                       nullptr,
-                       false,
+                       canPlotOverall ? &plotterOverall : nullptr,
+                       canPlotOverall,
                        runCfg.verboseAnalysis,
-                       statsCache);
+                       statsCache,
+                       featureIdx,
+                       bivariatePairs);
     advanceTimed("Built overall sections", "overall_sections");
 
     ReportEngine finalAnalysis;

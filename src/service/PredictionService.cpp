@@ -18,6 +18,8 @@
 
 namespace {
 using Clock = std::chrono::steady_clock;
+constexpr size_t kMaxPredictFeatures = 65536;
+constexpr size_t kMaxBatchInstances = 8192;
 
 struct JsonValue {
     enum class Type { Null, Bool, Number, String, Array, Object };
@@ -352,6 +354,12 @@ std::vector<double> parseFeatureVector(const JsonValue& value, const std::string
     if (!value.isArray()) {
         throw Seldon::ConfigurationException(label + " must be a numeric array");
     }
+    if (value.arrayValue.empty()) {
+        throw Seldon::ConfigurationException(label + " must not be empty");
+    }
+    if (value.arrayValue.size() > kMaxPredictFeatures) {
+        throw Seldon::ConfigurationException(label + " exceeds maximum supported feature size");
+    }
 
     std::vector<double> out;
     out.reserve(value.arrayValue.size());
@@ -370,11 +378,24 @@ std::vector<std::vector<double>> parseBatchFeatureVectors(const JsonValue& value
     if (!value.isArray()) {
         throw Seldon::ConfigurationException("instances must be a 2D numeric array");
     }
+    if (value.arrayValue.empty()) {
+        throw Seldon::ConfigurationException("instances must not be empty");
+    }
+    if (value.arrayValue.size() > kMaxBatchInstances) {
+        throw Seldon::ConfigurationException("instances exceed maximum supported batch size");
+    }
 
     std::vector<std::vector<double>> out;
     out.reserve(value.arrayValue.size());
+    size_t expectedDim = 0;
     for (size_t i = 0; i < value.arrayValue.size(); ++i) {
-        out.push_back(parseFeatureVector(value.arrayValue[i], "instances[" + std::to_string(i) + "]"));
+        auto row = parseFeatureVector(value.arrayValue[i], "instances[" + std::to_string(i) + "]");
+        if (expectedDim == 0) {
+            expectedDim = row.size();
+        } else if (row.size() != expectedDim) {
+            throw Seldon::ConfigurationException("all instances must have the same feature dimension");
+        }
+        out.push_back(std::move(row));
     }
     return out;
 }
@@ -730,12 +751,20 @@ int PredictionService::start(const Config& config) {
                                                        latencyMs,
                                                        snapshot.totalRequests));
             logMonitoringLine("/predict", latencyMs, snapshot);
-        } catch (const std::exception& e) {
+        } catch (const Seldon::ConfigurationException& e) {
             const auto ended = Clock::now();
             const double latencyMs = std::chrono::duration<double, std::milli>(ended - started).count();
             monitor.recordError("/predict", latencyMs);
             const MonitoringSnapshot snapshot = monitor.snapshot();
             setJsonResponse(response, 400, makeErrorResponse(e.what(), latencyMs));
+            logMonitoringLine("/predict", latencyMs, snapshot);
+        } catch (const std::exception& e) {
+            const auto ended = Clock::now();
+            const double latencyMs = std::chrono::duration<double, std::milli>(ended - started).count();
+            monitor.recordError("/predict", latencyMs);
+            const MonitoringSnapshot snapshot = monitor.snapshot();
+            setJsonResponse(response, 500, makeErrorResponse("internal server error", latencyMs));
+            std::cerr << "[SeldonService] /predict internal_error=" << e.what() << "\n";
             logMonitoringLine("/predict", latencyMs, snapshot);
         }
     });
@@ -781,12 +810,20 @@ int PredictionService::start(const Config& config) {
                                                      latencyMs,
                                                      snapshot.totalRequests));
             logMonitoringLine("/batch_predict", latencyMs, snapshot);
-        } catch (const std::exception& e) {
+        } catch (const Seldon::ConfigurationException& e) {
             const auto ended = Clock::now();
             const double latencyMs = std::chrono::duration<double, std::milli>(ended - started).count();
             monitor.recordError("/batch_predict", latencyMs);
             const MonitoringSnapshot snapshot = monitor.snapshot();
             setJsonResponse(response, 400, makeErrorResponse(e.what(), latencyMs));
+            logMonitoringLine("/batch_predict", latencyMs, snapshot);
+        } catch (const std::exception& e) {
+            const auto ended = Clock::now();
+            const double latencyMs = std::chrono::duration<double, std::milli>(ended - started).count();
+            monitor.recordError("/batch_predict", latencyMs);
+            const MonitoringSnapshot snapshot = monitor.snapshot();
+            setJsonResponse(response, 500, makeErrorResponse("internal server error", latencyMs));
+            std::cerr << "[SeldonService] /batch_predict internal_error=" << e.what() << "\n";
             logMonitoringLine("/batch_predict", latencyMs, snapshot);
         }
     });

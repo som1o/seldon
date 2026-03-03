@@ -47,11 +47,12 @@ const state = {
   chartGroups: {
     univariate: [],
     bivariate: [],
+    overall: [],
   },
   summaryMetrics: {
     univariateCount: 0,
     bivariateCount: 0,
-    totalGraphs: 0,
+    overallCount: 0,
     analysisSeconds: 0,
   },
   chartsVisibleCount: 12,

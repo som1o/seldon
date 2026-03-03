@@ -13,12 +13,14 @@ function parseAnalysisId() {
 }
 
 function groupedCharts(charts) {
-  const grouped = { univariate: [], bivariate: [] };
+  const grouped = { univariate: [], bivariate: [], overall: [] };
   (charts || []).forEach((chart) => {
     if (chart.includes('/univariate/')) {
       grouped.univariate.push(chart);
     } else if (chart.includes('/bivariate/')) {
       grouped.bivariate.push(chart);
+    } else if (chart.includes('/overall/')) {
+      grouped.overall.push(chart);
     }
   });
   return grouped;
@@ -82,9 +84,18 @@ async function init() {
 
   id('analysisStatus').textContent = `${analysis.id}: ${analysis.status} — ${analysis.message || 'no message'}`;
 
-  const groups = groupedCharts(results.charts || []);
+  const apiGroups = results?.chart_groups || {};
+  const hasApiGroups = Array.isArray(apiGroups.univariate) || Array.isArray(apiGroups.bivariate) || Array.isArray(apiGroups.overall);
+  const groups = hasApiGroups
+    ? {
+      univariate: Array.isArray(apiGroups.univariate) ? apiGroups.univariate : [],
+      bivariate: Array.isArray(apiGroups.bivariate) ? apiGroups.bivariate : [],
+      overall: Array.isArray(apiGroups.overall) ? apiGroups.overall : [],
+    }
+    : groupedCharts(results.charts || []);
   renderChartGroup('univariateCharts', groups.univariate, 'Univariate');
   renderChartGroup('bivariateCharts', groups.bivariate, 'Bivariate');
+  renderChartGroup('overallCharts', groups.overall, 'Overall');
 
   const reportHtml = results?.report_html || results?.reports?.analysis || '';
   renderReport(reportHtml);

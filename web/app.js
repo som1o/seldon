@@ -38,7 +38,7 @@ function resetSummaryMetrics() {
     summaryMetrics: {
       univariateCount: 0,
       bivariateCount: 0,
-      totalGraphs: 0,
+      overallCount: 0,
       analysisSeconds: 0,
     },
   });
@@ -46,7 +46,7 @@ function resetSummaryMetrics() {
 }
 
 function normalizedPlotModes(raw) {
-  const allowed = new Set(['univariate', 'bivariate']);
+  const allowed = new Set(['univariate', 'bivariate', 'overall']);
   const ordered = [];
   String(raw || '')
     .split(',')
@@ -57,7 +57,7 @@ function normalizedPlotModes(raw) {
       }
       ordered.push(token);
     });
-  return ordered.length ? ordered.join(',') : 'bivariate,univariate';
+  return ordered.length ? ordered.join(',') : 'bivariate,univariate,overall';
 }
 
 function formatElapsed(totalSeconds) {
@@ -406,6 +406,7 @@ async function deleteAnalysis(analysisId) {
       summary: {
         univariate_charts: 0,
         bivariate_charts: 0,
+        overall_charts: 0,
         total_graphs: 0,
         analysis_seconds: 0,
       },
@@ -540,7 +541,7 @@ async function uploadAndRun(event) {
       bivariate_strategy: params.bivariate_strategy,
       plots: normalizedPlotModes(params.plots),
       plot_univariate: true,
-      plot_overall: false,
+      plot_overall: true,
       plot_bivariate: true,
       benchmark_mode: true,
       generate_html: false,

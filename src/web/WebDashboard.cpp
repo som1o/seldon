@@ -927,7 +927,7 @@ private:
             const std::string featureStrategy = req.has_param("feature_strategy") ? req.get_param_value("feature_strategy") : "auto";
             const std::string neuralStrategy = req.has_param("neural_strategy") ? req.get_param_value("neural_strategy") : "auto";
             const std::string bivariateStrategy = req.has_param("bivariate_strategy") ? req.get_param_value("bivariate_strategy") : "auto";
-            const std::string plots = req.has_param("plots") ? req.get_param_value("plots") : "bivariate,univariate";
+            const std::string plots = req.has_param("plots") ? req.get_param_value("plots") : "bivariate,univariate,overall";
             const std::string plotUnivariate = req.has_param("plot_univariate") ? req.get_param_value("plot_univariate") : "true";
             const std::string plotOverall = req.has_param("plot_overall") ? req.get_param_value("plot_overall") : "false";
             const std::string plotBivariate = req.has_param("plot_bivariate") ? req.get_param_value("plot_bivariate") : "true";
@@ -1118,6 +1118,7 @@ private:
 
             std::vector<std::string> univariateCharts;
             std::vector<std::string> bivariateCharts;
+            std::vector<std::string> overallCharts;
 
             std::ostringstream out;
             out << "{\"report_html\":\"" << jsonEscape(reportHtml)
@@ -1146,6 +1147,8 @@ private:
                     univariateCharts.push_back(chartUrl);
                 } else if (relative.find("bivariate/") != std::string::npos) {
                     bivariateCharts.push_back(chartUrl);
+                } else if (relative.find("overall/") != std::string::npos) {
+                    overallCharts.push_back(chartUrl);
                 }
             }
 
@@ -1163,9 +1166,15 @@ private:
                 if (i > 0) out << ',';
                 out << "\"" << jsonEscape(bivariateCharts[i]) << "\"";
             }
+            out << "],\"overall\":[";
+            for (size_t i = 0; i < overallCharts.size(); ++i) {
+                if (i > 0) out << ',';
+                out << "\"" << jsonEscape(overallCharts[i]) << "\"";
+            }
             out << "]},\"summary\":{"
                 << "\"univariate_charts\":" << univariateCharts.size() << ','
                 << "\"bivariate_charts\":" << bivariateCharts.size() << ','
+                << "\"overall_charts\":" << overallCharts.size() << ','
                 << "\"total_graphs\":" << totalGraphs << ','
                 << "\"analysis_seconds\":" << analysisSeconds
                 << "},\"reports\":{"
@@ -1419,9 +1428,10 @@ private:
         const auto requestedPlotModes = splitCsv(plots);
         const bool plotListHasUnivariate = std::find(requestedPlotModes.begin(), requestedPlotModes.end(), "univariate") != requestedPlotModes.end();
         const bool plotListHasBivariate = std::find(requestedPlotModes.begin(), requestedPlotModes.end(), "bivariate") != requestedPlotModes.end();
+        const bool plotListHasOverall = std::find(requestedPlotModes.begin(), requestedPlotModes.end(), "overall") != requestedPlotModes.end();
         pipelineCfg.plotModesExplicit = true;
         pipelineCfg.plotUnivariate = parseBool(plotUnivariate, plotListHasUnivariate);
-        pipelineCfg.plotOverall = parseBool(plotOverall, false);
+        pipelineCfg.plotOverall = parseBool(plotOverall, plotListHasOverall);
         pipelineCfg.plotBivariateSignificant = parseBool(plotBivariate, plotListHasBivariate);
 
         if (pipelineCfg.plotUnivariate || pipelineCfg.plotOverall || pipelineCfg.plotBivariateSignificant) {

@@ -258,26 +258,41 @@ export function renderResults(results) {
   const grouped = {
     univariate: [],
     bivariate: [],
+    overall: [],
   };
+  const apiGroups = results?.chart_groups || {};
+  if (Array.isArray(apiGroups.univariate)) {
+    grouped.univariate = [...apiGroups.univariate];
+  }
+  if (Array.isArray(apiGroups.bivariate)) {
+    grouped.bivariate = [...apiGroups.bivariate];
+  }
+  if (Array.isArray(apiGroups.overall)) {
+    grouped.overall = [...apiGroups.overall];
+  }
   const charts = Array.isArray(results?.charts) ? results.charts : [];
-  charts.forEach((chartUrl) => {
-    if (chartUrl.includes('/univariate/')) {
-      grouped.univariate.push(chartUrl);
-    } else if (chartUrl.includes('/bivariate/')) {
-      grouped.bivariate.push(chartUrl);
-    }
-  });
+  if (grouped.univariate.length === 0 && grouped.bivariate.length === 0 && grouped.overall.length === 0) {
+    charts.forEach((chartUrl) => {
+      if (chartUrl.includes('/univariate/')) {
+        grouped.univariate.push(chartUrl);
+      } else if (chartUrl.includes('/bivariate/')) {
+        grouped.bivariate.push(chartUrl);
+      } else if (chartUrl.includes('/overall/')) {
+        grouped.overall.push(chartUrl);
+      }
+    });
+  }
 
   const summary = results?.summary || {};
-  const totalGraphs = Number.isFinite(Number(summary.total_graphs))
-    ? Number(summary.total_graphs)
-    : charts.length;
   const univariateCount = Number.isFinite(Number(summary.univariate_charts))
     ? Number(summary.univariate_charts)
     : grouped.univariate.length;
   const bivariateCount = Number.isFinite(Number(summary.bivariate_charts))
     ? Number(summary.bivariate_charts)
     : grouped.bivariate.length;
+  const overallCount = Number.isFinite(Number(summary.overall_charts))
+    ? Number(summary.overall_charts)
+    : grouped.overall.length;
   const analysisSeconds = Number.isFinite(Number(summary.analysis_seconds))
     ? Math.max(0, Number(summary.analysis_seconds))
     : 0;
@@ -298,7 +313,7 @@ export function renderResults(results) {
     summaryMetrics: {
       univariateCount,
       bivariateCount,
-      totalGraphs,
+      overallCount,
       analysisSeconds,
     },
   });
@@ -321,7 +336,7 @@ function renderResultStats() {
   const data = [
     { label: 'Univariate', value: Number(metrics.univariateCount || 0), sub: 'charts' },
     { label: 'Bivariate', value: Number(metrics.bivariateCount || 0), sub: 'charts' },
-    { label: 'Total Graphs', value: Number(metrics.totalGraphs || 0), sub: 'available' },
+    { label: 'Overall Graphs', value: Number(metrics.overallCount || 0), sub: 'charts' },
     { label: 'Analysis Time', value: Number(metrics.analysisSeconds || 0), sub: 'seconds' },
   ];
 
@@ -468,6 +483,7 @@ export function renderCharts() {
   const grouped = [
     { key: 'univariate', title: 'Univariate Charts', charts: chartGroups.univariate },
     { key: 'bivariate', title: 'Bivariate Charts', charts: chartGroups.bivariate },
+    { key: 'overall', title: 'Overall Charts', charts: chartGroups.overall },
   ];
 
   grouped.forEach((group) => {

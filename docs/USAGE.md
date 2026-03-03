@@ -9,6 +9,7 @@ This guide focuses on practical build/run usage for the current Seldon pipeline.
 ### 1.1 Clean Release build with OpenCL
 
 ```bash
+cmake --build build --target clean || true
 rm -rf build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSELDON_ENABLE_OPENCL=ON -DSELDON_ENABLE_OPENMP=ON
 cmake --build build -j"$(nproc)"

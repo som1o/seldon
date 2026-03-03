@@ -2902,6 +2902,49 @@ PreflightCullSummary applyPreflightSparseColumnCull(TypedDataset& data,
         if (missingRatio > threshold) {
             keep[c] = false;
             summary.droppedColumns.push_back(col.name + " (missing=" + toFixed(100.0 * missingRatio, 2) + "%)");
+            continue;
+        }
+
+        if (col.type == ColumnType::NUMERIC) {
+            const auto& values = std::get<std::vector<double>>(col.values);
+            size_t finiteCount = 0;
+            double minVal = std::numeric_limits<double>::infinity();
+            double maxVal = -std::numeric_limits<double>::infinity();
+            for (size_t r = 0; r < values.size() && r < col.missing.size(); ++r) {
+                if (col.missing[r]) continue;
+                if (!std::isfinite(values[r])) continue;
+                ++finiteCount;
+                minVal = std::min(minVal, values[r]);
+                maxVal = std::max(maxVal, values[r]);
+            }
+            const size_t minUsable = std::max<size_t>(3, data.rowCount() / 200);
+            const bool tooSparseAfterMissing = finiteCount < minUsable;
+            const bool nearConstant = finiteCount >= minUsable && std::isfinite(minVal) && std::isfinite(maxVal)
+                && std::abs(maxVal - minVal) <= 1e-12;
+            if (tooSparseAfterMissing || nearConstant) {
+                keep[c] = false;
+                summary.droppedColumns.push_back(col.name + (nearConstant ? " (degenerate_numeric_constant)" : " (degenerate_numeric_sparse_valid)"));
+            }
+            continue;
+        }
+
+        if (col.type == ColumnType::CATEGORICAL) {
+            const auto& values = std::get<std::vector<std::string>>(col.values);
+            std::unordered_set<std::string> unique;
+            unique.reserve(4);
+            size_t usable = 0;
+            for (size_t r = 0; r < values.size() && r < col.missing.size(); ++r) {
+                if (col.missing[r]) continue;
+                const std::string token = CommonUtils::trim(values[r]);
+                if (token.empty()) continue;
+                ++usable;
+                unique.insert(token);
+                if (unique.size() > 2) break;
+            }
+            if (usable == 0 || unique.size() <= 1) {
+                keep[c] = false;
+                summary.droppedColumns.push_back(col.name + " (degenerate_categorical_single_level)");
+            }
         }
     }
 
