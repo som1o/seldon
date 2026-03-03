@@ -2175,6 +2175,20 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             const auto& vb = std::get<std::vector<double>>(data.columns()[p.idxB].values);
             const size_t sampleSize = std::min(va.size(), vb.size());
             std::string id = "sig_" + p.featureA + "_" + p.featureB;
+            auto compactName = [](std::string name, size_t maxLen = 48) {
+                name = CommonUtils::trim(name);
+                if (name.empty()) return std::string("Unnamed");
+                if (name.size() > maxLen) {
+                    return name.substr(0, maxLen - 3) + "...";
+                }
+                return name;
+            };
+            const std::string aName = compactName(p.featureA);
+            const std::string bName = compactName(p.featureB);
+            const std::string baseTitle = aName + " vs " + bName;
+            const std::string metaTag = " [T" + std::to_string(std::max(1, p.significanceTier))
+                + ", r=" + toFixed(p.r, 3)
+                + ", p=" + toFixed(p.pValue, 4) + "]";
             const bool addFit = shouldOverlayFittedLine(p.r,
                                                         p.statSignificant,
                                                         va,
@@ -2191,7 +2205,7 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             p.plotPath = plotter->scatter(id,
                                           va,
                                           vb,
-                                          p.featureA + " vs " + p.featureB,
+                                          "Bivariate Scatter: " + baseTitle + metaTag,
                                           addFit,
                                           p.slope,
                                           p.intercept,
@@ -2218,16 +2232,17 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
                 p.residualPlotPath = plotter->residual("resid_" + p.featureA + "_" + p.featureB,
                                                        fitted,
                                                        residuals,
-                                                       "Residuals: " + p.featureA + " -> " + p.featureB);
+                                                       "Bivariate Residuals: " + bName + " on " + aName + metaTag);
             }
 
             if (auto facetIdx = chooseFacetingColumn(data, p.idxA, p.idxB, tuning); facetIdx.has_value()) {
+                const std::string facetName = compactName(data.columns()[*facetIdx].name);
                 const auto& facetVals = std::get<std::vector<std::string>>(data.columns()[*facetIdx].values);
                 p.facetedPlotPath = plotter->facetedScatter("facet_" + p.featureA + "_" + p.featureB,
                                                             va,
                                                             vb,
                                                             facetVals,
-                                                            p.featureA + " vs " + p.featureB + " by " + data.columns()[*facetIdx].name,
+                                                            "Bivariate Faceted Scatter: " + baseTitle + " by " + facetName,
                                                             tuning.facetMaxCategories);
             }
 
@@ -2235,9 +2250,9 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
             if (stacked.valid) {
                 p.stackedPlotPath = plotter->stackedBar("sigstack_" + p.featureA + "_" + p.featureB,
                                                         stacked.categories,
-                                                        {p.featureB + " <= median", p.featureB + " > median"},
+                                                        {bName + " <= median", bName + " > median"},
                                                         {stacked.lowCounts, stacked.highCounts},
-                                                        "Stacked Profile: " + p.featureA + " x " + p.featureB,
+                                                        "Bivariate Stacked Profile: " + baseTitle,
                                                         "Count");
             }
         }

@@ -3111,24 +3111,14 @@ struct ReportSaveSummary {
 };
 
 std::string truncateSectionHtml(const std::string& html, size_t limit) {
-    if (limit == 0 || html.size() <= limit) {
-        return html;
-    }
-    size_t cut = html.rfind('\n', limit);
-    if (cut == std::string::npos || cut < (limit / 2)) {
-        cut = limit;
-    }
-    std::string out = html.substr(0, cut);
-    out += "\n<p><em>Section truncated for high-speed consolidated reporting.</em></p>\n";
-    return out;
+    (void)limit;
+    return html;
 }
 
 std::string buildConsolidatedHtmlReport(const std::vector<std::pair<std::string, std::string>>& sections,
                                         size_t targetBytes,
                                         size_t& outputBytes) {
-    const size_t totalRaw = std::accumulate(sections.begin(), sections.end(), static_cast<size_t>(0),
-                                            [](size_t acc, const auto& item) { return acc + item.second.size(); });
-    const size_t effectiveTarget = std::max<size_t>(12000, targetBytes);
+    (void)targetBytes;
 
     std::ostringstream out;
     out << "<!doctype html><html><head><meta charset=\"utf-8\"/>"
@@ -3142,10 +3132,9 @@ std::string buildConsolidatedHtmlReport(const std::vector<std::pair<std::string,
         << "p,li{color:#c4cad6;}code{background:rgba(255,255,255,.08);padding:1px 4px;}</style></head><body><main>";
     out << "<h1>Analysis Report</h1>";
 
-    const size_t perSectionTarget = std::max<size_t>(2400, effectiveTarget / std::max<size_t>(1, sections.size()));
     for (const auto& [name, body] : sections) {
         out << "<section><h2>" << name << "</h2>";
-        out << truncateSectionHtml(body, perSectionTarget);
+        out << body;
         out << "</section>";
     }
 
@@ -3178,9 +3167,8 @@ ReportSaveSummary saveGeneratedReports(const AutoConfig& runCfg,
     };
     summary.combinedBytes = std::accumulate(sections.begin(), sections.end(), static_cast<size_t>(0),
                                             [](size_t acc, const auto& item) { return acc + item.second.size(); });
-    const size_t targetBytes = static_cast<size_t>(static_cast<double>(summary.combinedBytes) * 0.30);
     size_t finalBytes = 0;
-    const std::string consolidated = buildConsolidatedHtmlReport(sections, targetBytes, finalBytes);
+    const std::string consolidated = buildConsolidatedHtmlReport(sections, 0, finalBytes);
 
     fs::create_directories(reportPath.parent_path());
     {
@@ -3231,12 +3219,9 @@ void printPipelineCompletion(const AutoConfig& runCfg,
     std::cout << "[Seldon] Automated pipeline complete.\n";
     std::cout << "[Seldon] Report directory: " << runCfg.outputDir << "\n";
     std::cout << "[Seldon] Report: " << saveSummary.reportPath << "\n";
-    std::cout << "[Seldon] Consolidated report size optimization: "
-              << saveSummary.finalBytes << " bytes from " << saveSummary.combinedBytes
-              << " raw bytes (~" << (saveSummary.combinedBytes == 0
-                                       ? 0.0
-                                       : (100.0 * static_cast<double>(saveSummary.finalBytes) / static_cast<double>(saveSummary.combinedBytes)))
-              << "%).\n";
+    std::cout << "[Seldon] Consolidated report size: "
+              << saveSummary.finalBytes << " bytes (raw section aggregate: "
+              << saveSummary.combinedBytes << " bytes).\n";
     std::cout << "[Seldon] Plot folders: "
               << plotSubdir(runCfg, "univariate") << ", "
               << plotSubdir(runCfg, "bivariate") << ", "

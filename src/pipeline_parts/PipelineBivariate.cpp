@@ -1295,6 +1295,7 @@ void addOverallSections(ReportEngine& report,
                         const std::vector<int>& featureIdx,
                         const std::vector<PairInsight>& bivariatePairs) {
     report.addParagraph("Overall: dataset health, model baselines, neural training, and global visual diagnostics.");
+    report.addParagraph("Overall plots are generated from selected significant findings and are labeled with concrete feature names for fast identification.");
     addDatasetHealthTable(report, data, prep, health);
 
     {
@@ -1401,90 +1402,126 @@ void addOverallSections(ReportEngine& report,
     }
 
     if (modeledNumeric.size() >= 2) {
-        const size_t maxCols = std::max<size_t>(2, config.tuning.overallCorrHeatmapMaxColumns);
-        const size_t useCols = std::min(maxCols, modeledNumeric.size());
-        std::vector<size_t> heatmapCols(modeledNumeric.begin(), modeledNumeric.begin() + useCols);
-        std::vector<std::vector<double>> corr(useCols, std::vector<double>(useCols, 0.0));
-        std::vector<std::string> labels;
-        labels.reserve(useCols);
-        for (size_t idx : heatmapCols) labels.push_back(data.columns()[idx].name);
+        const size_t effectiveMaxCols = std::max<size_t>(8, std::max<size_t>(config.tuning.overallCorrHeatmapMaxColumns, 120));
+        const size_t windowSize = std::min(effectiveMaxCols, modeledNumeric.size());
+        const size_t heatmapCount = std::min<size_t>(3, (modeledNumeric.size() + windowSize - 1) / windowSize);
 
-        for (size_t i = 0; i < useCols; ++i) {
-            corr[i][i] = 1.0;
-            const auto& vi = std::get<std::vector<double>>(data.columns()[heatmapCols[i]].values);
-            const ColumnStats si = statsCache.count(heatmapCols[i])
-                ? statsCache.at(heatmapCols[i])
-                : Statistics::calculateStats(vi);
-            for (size_t j = i + 1; j < useCols; ++j) {
-                const auto& vj = std::get<std::vector<double>>(data.columns()[heatmapCols[j]].values);
-                const ColumnStats sj = statsCache.count(heatmapCols[j])
-                    ? statsCache.at(heatmapCols[j])
-                    : Statistics::calculateStats(vj);
-                const double r = MathUtils::calculatePearson(vi, vj, si, sj).value_or(0.0);
-                corr[i][j] = r;
-                corr[j][i] = r;
+        for (size_t h = 0; h < heatmapCount; ++h) {
+            const size_t start = h * windowSize;
+            if (start >= modeledNumeric.size()) break;
+            const size_t end = std::min(modeledNumeric.size(), start + windowSize);
+            const size_t useCols = end - start;
+            if (useCols < 2) continue;
+
+            std::vector<size_t> heatmapCols(modeledNumeric.begin() + static_cast<std::ptrdiff_t>(start),
+                                            modeledNumeric.begin() + static_cast<std::ptrdiff_t>(end));
+            std::vector<std::vector<double>> corr(useCols, std::vector<double>(useCols, 0.0));
+            std::vector<std::string> labels;
+            labels.reserve(useCols);
+            for (size_t idx : heatmapCols) labels.push_back(data.columns()[idx].name);
+
+            for (size_t i = 0; i < useCols; ++i) {
+                corr[i][i] = 1.0;
+                const auto& vi = std::get<std::vector<double>>(data.columns()[heatmapCols[i]].values);
+                const ColumnStats si = statsCache.count(heatmapCols[i])
+                    ? statsCache.at(heatmapCols[i])
+                    : Statistics::calculateStats(vi);
+                for (size_t j = i + 1; j < useCols; ++j) {
+                    const auto& vj = std::get<std::vector<double>>(data.columns()[heatmapCols[j]].values);
+                    const ColumnStats sj = statsCache.count(heatmapCols[j])
+                        ? statsCache.at(heatmapCols[j])
+                        : Statistics::calculateStats(vj);
+                    const double r = MathUtils::calculatePearson(vi, vj, si, sj).value_or(0.0);
+                    corr[i][j] = r;
+                    corr[j][i] = r;
+                }
             }
-        }
 
-        const std::string heatmapPath = overallPlotter->heatmap("overall_sig_corr_heatmap",
-                                                                 corr,
-                                                                 "Overall Correlation Heatmap (Model-Selected Significant Features)",
-                                                                 labels);
-        addOverallImage("Overall Correlation Heatmap", "correlation_heatmap", "selected_significant_pairs", heatmapPath);
+            const std::string suffix = (h == 0) ? "" : ("_" + std::to_string(h + 1));
+            std::string featureSpan;
+            const size_t preview = std::min<size_t>(4, labels.size());
+            for (size_t i = 0; i < preview; ++i) {
+                if (i > 0) featureSpan += ", ";
+                featureSpan += labels[i];
+            }
+            if (labels.size() > preview) {
+                featureSpan += ", ...";
+            }
+
+            const std::string heatmapTitle = "Overall Correlation Heatmap: " + featureSpan;
+            const std::string heatmapPath = overallPlotter->heatmap("overall_sig_corr_heatmap" + suffix,
+                                                                     corr,
+                                                                     heatmapTitle,
+                                                                     labels);
+            addOverallImage("Overall Correlation Heatmap" + (h == 0 ? std::string() : (" " + std::to_string(h + 1))) + " — " + featureSpan,
+                            "correlation_heatmap",
+                            "selected_significant_pairs_window",
+                            heatmapPath);
+        }
     } else {
         overallRows.push_back({"correlation_heatmap", "selected_significant_pairs", "skipped_insufficient_numeric_features"});
     }
 
     if (modeledNumeric.size() >= 3) {
-        const size_t idxA = modeledNumeric[0];
-        const size_t idxB = modeledNumeric[1];
-        const size_t idxC = modeledNumeric[2];
-        const auto& a = std::get<std::vector<double>>(data.columns()[idxA].values);
-        const auto& b = std::get<std::vector<double>>(data.columns()[idxB].values);
-        const auto& c = std::get<std::vector<double>>(data.columns()[idxC].values);
-        const size_t n = std::min({a.size(), b.size(), c.size(), data.rowCount()});
+        const size_t scatterCount = std::min<size_t>(4, modeledNumeric.size() - 2);
+        for (size_t s = 0; s < scatterCount; ++s) {
+            const size_t idxA = modeledNumeric[s];
+            const size_t idxB = modeledNumeric[s + 1];
+            const size_t idxC = modeledNumeric[s + 2];
+            const auto& a = std::get<std::vector<double>>(data.columns()[idxA].values);
+            const auto& b = std::get<std::vector<double>>(data.columns()[idxB].values);
+            const auto& c = std::get<std::vector<double>>(data.columns()[idxC].values);
+            const size_t n = std::min({a.size(), b.size(), c.size(), data.rowCount()});
 
-        std::vector<double> x;
-        std::vector<double> y;
-        std::vector<double> z;
-        x.reserve(n);
-        y.reserve(n);
-        z.reserve(n);
-        const size_t sampleCap = 8000;
-        const size_t step = std::max<size_t>(1, n / sampleCap);
-        for (size_t r = 0; r < n; r += step) {
-            if (r < data.columns()[idxA].missing.size() && data.columns()[idxA].missing[r]) continue;
-            if (r < data.columns()[idxB].missing.size() && data.columns()[idxB].missing[r]) continue;
-            if (r < data.columns()[idxC].missing.size() && data.columns()[idxC].missing[r]) continue;
-            if (!std::isfinite(a[r]) || !std::isfinite(b[r]) || !std::isfinite(c[r])) continue;
-            x.push_back(a[r]);
-            y.push_back(b[r]);
-            z.push_back(c[r]);
-        }
+            std::vector<double> x;
+            std::vector<double> y;
+            std::vector<double> z;
+            x.reserve(n);
+            y.reserve(n);
+            z.reserve(n);
+            const size_t sampleCap = 30000;
+            const size_t step = std::max<size_t>(1, n / sampleCap);
+            for (size_t r = 0; r < n; r += step) {
+                if (r < data.columns()[idxA].missing.size() && data.columns()[idxA].missing[r]) continue;
+                if (r < data.columns()[idxB].missing.size() && data.columns()[idxB].missing[r]) continue;
+                if (r < data.columns()[idxC].missing.size() && data.columns()[idxC].missing[r]) continue;
+                if (!std::isfinite(a[r]) || !std::isfinite(b[r]) || !std::isfinite(c[r])) continue;
+                x.push_back(a[r]);
+                y.push_back(b[r]);
+                z.push_back(c[r]);
+            }
 
-        std::string scatter3dPath;
-        if (x.size() >= 24) {
-            scatter3dPath = overallPlotter->scatter3D("overall_sig_scatter3d",
-                                                      x,
-                                                      y,
-                                                      z,
-                                                      "3D Scatter (Top Model-Selected Significant Features)");
+            std::string scatter3dPath;
+            if (x.size() >= 18) {
+                const std::string suffix = (s == 0) ? "" : ("_" + std::to_string(s + 1));
+                const std::string scatterTitle = "Overall 3D Scatter: "
+                    + data.columns()[idxA].name + " vs "
+                    + data.columns()[idxB].name + " vs "
+                    + data.columns()[idxC].name;
+                scatter3dPath = overallPlotter->scatter3D("overall_sig_scatter3d" + suffix,
+                                                          x,
+                                                          y,
+                                                          z,
+                                                          scatterTitle);
+            }
+            addOverallImage("Overall 3D Scatter" + (s == 0 ? std::string() : (" " + std::to_string(s + 1))) + " — "
+                                + data.columns()[idxA].name + " / "
+                                + data.columns()[idxB].name + " / "
+                                + data.columns()[idxC].name,
+                            "scatter3d",
+                            data.columns()[idxA].name + ", " + data.columns()[idxB].name + ", " + data.columns()[idxC].name,
+                            scatter3dPath);
         }
-        addOverallImage("Overall 3D Scatter", "scatter3d", data.columns()[idxA].name + ", " + data.columns()[idxB].name + ", " + data.columns()[idxC].name, scatter3dPath);
     } else {
         overallRows.push_back({"scatter3d", "top_modeled_numeric", "skipped_insufficient_numeric_features"});
     }
 
     {
-        std::string piePath;
-        std::string pieDriver = "none";
+        std::vector<std::tuple<double, std::string, std::vector<std::pair<std::string, size_t>>>> rankedPies;
         if (!modeledNumeric.empty()) {
             const size_t anchor = modeledNumeric.front();
             const auto& anchorVals = std::get<std::vector<double>>(data.columns()[anchor].values);
             const auto cats = data.categoricalColumnIndices();
-            double bestEta = 0.0;
-            std::vector<std::pair<std::string, size_t>> bestCounts;
-            std::string bestCatName;
 
             for (size_t cidx : cats) {
                 const auto& col = data.columns()[cidx];
@@ -1511,14 +1548,15 @@ void addOverallSections(ReportEngine& report,
                 }
 
                 if (total < 30) continue;
-                if (freq.size() < config.tuning.pieMinCategories || freq.size() > config.tuning.pieMaxCategories) continue;
+                const size_t relaxedPieMax = std::max<size_t>(config.tuning.pieMaxCategories, 20);
+                if (freq.size() < config.tuning.pieMinCategories || freq.size() > relaxedPieMax) continue;
                 std::vector<std::pair<std::string, size_t>> counts(freq.begin(), freq.end());
                 std::sort(counts.begin(), counts.end(), [](const auto& a, const auto& b) {
                     if (a.second == b.second) return a.first < b.first;
                     return a.second > b.second;
                 });
                 const double dominance = static_cast<double>(counts.front().second) / static_cast<double>(total);
-                if (dominance > config.tuning.pieMaxDominanceRatio) continue;
+                if (dominance > std::min(0.98, config.tuning.pieMaxDominanceRatio + 0.08)) continue;
 
                 const double grandMean = globalSum / static_cast<double>(total);
                 const double sst = std::max(0.0, globalSumSq - globalSum * grandMean);
@@ -1531,30 +1569,38 @@ void addOverallSections(ReportEngine& report,
                     ssb += static_cast<double>(kv.second) * d * d;
                 }
                 const double eta2 = std::clamp(ssb / sst, 0.0, 1.0);
-                if (eta2 > bestEta) {
-                    bestEta = eta2;
-                    bestCounts = std::move(counts);
-                    bestCatName = col.name;
-                }
+                rankedPies.push_back({eta2, col.name, std::move(counts)});
             }
+            std::sort(rankedPies.begin(), rankedPies.end(), [](const auto& a, const auto& b) {
+                return std::get<0>(a) > std::get<0>(b);
+            });
 
-            if (!bestCounts.empty()) {
+            const size_t pieCount = std::min<size_t>(3, rankedPies.size());
+            for (size_t p = 0; p < pieCount; ++p) {
+                const auto& counts = std::get<2>(rankedPies[p]);
                 std::vector<std::string> labels;
                 std::vector<double> values;
-                labels.reserve(bestCounts.size());
-                values.reserve(bestCounts.size());
-                for (const auto& kv : bestCounts) {
+                labels.reserve(counts.size());
+                values.reserve(counts.size());
+                for (const auto& kv : counts) {
                     labels.push_back(kv.first);
                     values.push_back(static_cast<double>(kv.second));
                 }
-                piePath = overallPlotter->pie("overall_sig_categorical_pie",
-                                              labels,
-                                              values,
-                                              "Categorical Pie (Top Model-Aligned Segment)");
-                pieDriver = bestCatName + " vs " + data.columns()[anchor].name;
+                const std::string suffix = (p == 0) ? "" : ("_" + std::to_string(p + 1));
+                const std::string pieDriver = std::get<1>(rankedPies[p]) + " vs " + data.columns()[anchor].name;
+                const std::string piePath = overallPlotter->pie("overall_sig_categorical_pie" + suffix,
+                                                                 labels,
+                                                                 values,
+                                                                 "Overall Categorical Pie: " + pieDriver);
+                addOverallImage("Overall Categorical Pie" + (p == 0 ? std::string() : (" " + std::to_string(p + 1))) + " — " + pieDriver,
+                                "categorical_pie",
+                                pieDriver,
+                                piePath);
             }
         }
-        addOverallImage("Overall Categorical Pie", "categorical_pie", pieDriver, piePath);
+        if (rankedPies.empty()) {
+            overallRows.push_back({"categorical_pie", "none", "skipped"});
+        }
     }
 
     std::vector<std::vector<std::string>> plotRows;
