@@ -17,38 +17,47 @@ struct FeatureScaler {
     std::vector<double> stddev;
 };
 
-FeatureScaler fitFeatureScaler(const Matrix& X) {
+FeatureScaler fitFeatureScaler(const Matrix& X, const std::vector<size_t>& trainRows) {
     FeatureScaler scaler;
-    if (X.empty()) return scaler;
+    if (X.empty() || trainRows.empty()) return scaler;
 
     size_t p = X[0].size();
     scaler.mean.assign(p, 0.0);
     scaler.stddev.assign(p, 0.0);
 
-    for (const auto& row : X) {
+    for (size_t idx : trainRows) {
+        const auto& row = X[idx];
         for (size_t j = 0; j < p; ++j) scaler.mean[j] += row[j];
     }
-    for (size_t j = 0; j < p; ++j) scaler.mean[j] /= static_cast<double>(X.size());
+    for (size_t j = 0; j < p; ++j) scaler.mean[j] /= static_cast<double>(trainRows.size());
 
-    for (const auto& row : X) {
+    for (size_t idx : trainRows) {
+        const auto& row = X[idx];
         for (size_t j = 0; j < p; ++j) {
             double d = row[j] - scaler.mean[j];
             scaler.stddev[j] += d * d;
         }
     }
     for (size_t j = 0; j < p; ++j) {
-        scaler.stddev[j] = std::sqrt(scaler.stddev[j] / static_cast<double>(std::max<size_t>(1, X.size() - 1)));
+        scaler.stddev[j] = std::sqrt(scaler.stddev[j] / static_cast<double>(std::max<size_t>(1, trainRows.size() - 1)));
         if (scaler.stddev[j] < 1e-12) scaler.stddev[j] = 1.0;
     }
     return scaler;
 }
 
-Matrix applyFeatureScaler(const Matrix& X, const FeatureScaler& scaler) {
-    Matrix out = X;
-    for (auto& row : out) {
-        for (size_t j = 0; j < row.size() && j < scaler.mean.size(); ++j) {
-            row[j] = (row[j] - scaler.mean[j]) / scaler.stddev[j];
-        }
+void scaleRowInPlace(std::vector<double>& row, const FeatureScaler& scaler) {
+    for (size_t j = 0; j < row.size() && j < scaler.mean.size(); ++j) {
+        row[j] = (row[j] - scaler.mean[j]) / scaler.stddev[j];
+    }
+}
+
+Matrix gatherAndScaleRows(const Matrix& X, const std::vector<size_t>& rows, const FeatureScaler& scaler) {
+    Matrix out;
+    out.reserve(rows.size());
+    for (size_t idx : rows) {
+        std::vector<double> row = X[idx];
+        scaleRowInPlace(row, scaler);
+        out.push_back(std::move(row));
     }
     return out;
 }
@@ -121,33 +130,27 @@ BenchmarkResult evalLinear(const std::string& name, const Matrix& X, const std::
     for (int f = 0; f < folds; ++f) {
         size_t s = static_cast<size_t>(f) * foldSize;
         size_t e = (f == folds - 1) ? n : std::min(n, s + foldSize);
-        size_t testCount = e - s;
-        size_t trainCount = n - testCount;
-
-        Matrix Xtr;
-        Matrix Xte;
         std::vector<double> ytr;
         std::vector<size_t> testRows;
-        Xtr.reserve(trainCount);
-        Xte.reserve(testCount);
-        ytr.reserve(trainCount);
-        testRows.reserve(testCount);
+        std::vector<size_t> trainRows;
+        ytr.reserve(n - (e - s));
+        testRows.reserve(e - s);
+        trainRows.reserve(n - (e - s));
         for (size_t i = 0; i < n; ++i) {
             size_t idx = order[i];
             if (i >= s && i < e) {
-                Xte.push_back(X[idx]);
                 testRows.push_back(idx);
                 continue;
             }
-            Xtr.push_back(X[idx]);
+            trainRows.push_back(idx);
             ytr.push_back(y[idx]);
         }
 
-        if (Xtr.empty() || Xte.empty()) continue;
+        if (trainRows.empty() || testRows.empty()) continue;
 
-        FeatureScaler xScaler = fitFeatureScaler(Xtr);
-        Matrix XtrScaled = applyFeatureScaler(Xtr, xScaler);
-        Matrix XteScaled = applyFeatureScaler(Xte, xScaler);
+        FeatureScaler xScaler = fitFeatureScaler(X, trainRows);
+        Matrix XtrScaled = gatherAndScaleRows(X, trainRows, xScaler);
+        Matrix XteScaled = gatherAndScaleRows(X, testRows, xScaler);
 
         auto [yMean, yStd] = fitTargetScaler(ytr);
         std::vector<double> ytrScaled = ytr;

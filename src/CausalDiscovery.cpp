@@ -157,11 +157,24 @@ std::vector<double> regressResidual(const std::vector<double>& y,
 
 double medianDistance(const std::vector<double>& v) {
     if (v.size() < 4) return 1.0;
+    constexpr size_t kMaxSample = 200;
+    std::vector<size_t> sampleIdx;
+    if (v.size() <= kMaxSample) {
+        sampleIdx.resize(v.size());
+        std::iota(sampleIdx.begin(), sampleIdx.end(), 0);
+    } else {
+        std::vector<size_t> all(v.size());
+        std::iota(all.begin(), all.end(), 0);
+        std::mt19937 localRng(0x5E1D05u);
+        std::shuffle(all.begin(), all.end(), localRng);
+        sampleIdx.assign(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(kMaxSample));
+    }
+
     std::vector<double> dist;
-    dist.reserve((v.size() * (v.size() - 1)) / 2);
-    for (size_t i = 0; i < v.size(); ++i) {
-        for (size_t j = i + 1; j < v.size(); ++j) {
-            dist.push_back(std::abs(v[i] - v[j]));
+    dist.reserve((sampleIdx.size() * (sampleIdx.size() - 1)) / 2);
+    for (size_t i = 0; i < sampleIdx.size(); ++i) {
+        for (size_t j = i + 1; j < sampleIdx.size(); ++j) {
+            dist.push_back(std::abs(v[sampleIdx[i]] - v[sampleIdx[j]]));
         }
     }
     if (dist.empty()) return 1.0;
@@ -179,8 +192,6 @@ double hsicRbf(const std::vector<double>& x, const std::vector<double>& y) {
     const double gx = 1.0 / (2.0 * sx * sx);
     const double gy = 1.0 / (2.0 * sy * sy);
 
-    std::vector<std::vector<double>> K(n, std::vector<double>(n, 0.0));
-    std::vector<std::vector<double>> L(n, std::vector<double>(n, 0.0));
     std::vector<double> rowK(n, 0.0), rowL(n, 0.0);
     double meanK = 0.0;
     double meanL = 0.0;
@@ -189,12 +200,12 @@ double hsicRbf(const std::vector<double>& x, const std::vector<double>& y) {
         for (size_t j = 0; j < n; ++j) {
             const double dx = x[i] - x[j];
             const double dy = y[i] - y[j];
-            K[i][j] = std::exp(-gx * dx * dx);
-            L[i][j] = std::exp(-gy * dy * dy);
-            rowK[i] += K[i][j];
-            rowL[i] += L[i][j];
-            meanK += K[i][j];
-            meanL += L[i][j];
+            const double kij = std::exp(-gx * dx * dx);
+            const double lij = std::exp(-gy * dy * dy);
+            rowK[i] += kij;
+            rowL[i] += lij;
+            meanK += kij;
+            meanL += lij;
         }
     }
 
@@ -208,8 +219,12 @@ double hsicRbf(const std::vector<double>& x, const std::vector<double>& y) {
     double stat = 0.0;
     for (size_t i = 0; i < n; ++i) {
         for (size_t j = 0; j < n; ++j) {
-            const double Kc = K[i][j] - rowK[i] - rowK[j] + meanK;
-            const double Lc = L[i][j] - rowL[i] - rowL[j] + meanL;
+            const double dx = x[i] - x[j];
+            const double dy = y[i] - y[j];
+            const double kij = std::exp(-gx * dx * dx);
+            const double lij = std::exp(-gy * dy * dy);
+            const double Kc = kij - rowK[i] - rowK[j] + meanK;
+            const double Lc = lij - rowL[i] - rowL[j] + meanL;
             stat += Kc * Lc;
         }
     }
@@ -379,6 +394,24 @@ double nonGaussianityScore(const std::vector<double>& v) {
 
 std::vector<size_t> directLingamOrder(const std::vector<std::vector<double>>& rows) {
     const size_t p = rows.empty() ? 0 : rows.front().size();
+    if (p == 0 || rows.empty()) return {};
+
+    std::vector<std::vector<double>> columns(p, std::vector<double>(rows.size(), 0.0));
+    for (size_t r = 0; r < rows.size(); ++r) {
+        for (size_t c = 0; c < p; ++c) {
+            columns[c][r] = rows[r][c];
+        }
+    }
+
+    std::vector<std::vector<double>> pairDep(p, std::vector<double>(p, 0.0));
+    for (size_t i = 0; i < p; ++i) {
+        for (size_t j = 0; j < p; ++j) {
+            if (i == j) continue;
+            const std::vector<double> resid = regressResidual(columns[j], {columns[i]});
+            pairDep[i][j] = safeAbsCorr(columns[i], resid);
+        }
+    }
+
     std::vector<size_t> remaining(p);
     std::iota(remaining.begin(), remaining.end(), 0);
     std::vector<size_t> order;
@@ -390,16 +423,16 @@ std::vector<size_t> directLingamOrder(const std::vector<std::vector<double>>& ro
         for (size_t cand : remaining) {
             double dep = 0.0;
             size_t cnt = 0;
-            std::vector<double> x(rows.size(), 0.0);
-            for (size_t r = 0; r < rows.size(); ++r) x[r] = rows[r][cand];
-
             for (size_t oth : remaining) {
                 if (oth == cand) continue;
-                std::vector<double> y(rows.size(), 0.0);
-                for (size_t r = 0; r < rows.size(); ++r) y[r] = rows[r][oth];
-                const std::vector<double> resid = regressResidual(y, {x});
-                dep += safeAbsCorr(x, resid);
+                dep += pairDep[cand][oth];
                 ++cnt;
+
+                // Fast prune: once we already exceed the best score, no need to keep scanning.
+                if (cnt > 0) {
+                    const double running = dep / static_cast<double>(cnt);
+                    if (running > bestScore) break;
+                }
             }
             const double score = (cnt == 0) ? 0.0 : (dep / static_cast<double>(cnt));
             if (score < bestScore) {

@@ -218,17 +218,19 @@ void DenseLayer::computeOutputGradients(const std::vector<double>& targetValues,
 }
 
 void DenseLayer::accumulateHiddenGradients(const DenseLayer& next) {
-    std::fill(m_gradients.begin(), m_gradients.end(), static_cast<NeuralScalar>(0.0));
-
-    for (size_t nn = 0; nn < next.size(); ++nn) {
-        const NeuralScalar nextGrad = next.gradients()[nn];
-        const size_t weightOffset = nn * m_size;
+    #ifdef USE_OPENMP
+    #pragma omp parallel for
+    #endif
+    for (size_t n = 0; n < m_size; ++n) {
+        NeuralScalar sum = static_cast<NeuralScalar>(0.0);
         #ifdef USE_OPENMP
-        #pragma omp simd
+        #pragma omp simd reduction(+:sum)
         #endif
-        for (size_t n = 0; n < m_size; ++n) {
-            m_gradients[n] += next.weights()[weightOffset + n] * nextGrad;
+        for (size_t nn = 0; nn < next.size(); ++nn) {
+            const size_t weightOffset = nn * m_size;
+            sum += next.weights()[weightOffset + n] * next.gradients()[nn];
         }
+        m_gradients[n] = sum;
     }
 }
 

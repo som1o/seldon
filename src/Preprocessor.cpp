@@ -5,6 +5,7 @@
 #include "Statistics.h"
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cctype>
 #include <cmath>
 #include <functional>
@@ -269,7 +270,7 @@ void imputeNumericKnnWithSnapshot(NumVec& targetVals,
         return;
     }
 
-    const bool useKdTree = targetVals.size() >= 4000 && predictors.size() >= 2;
+    const bool useKdTree = targetVals.size() >= 500 && !predictors.empty();
     if (useKdTree) {
         const size_t dims = predictors.size();
         std::vector<double> means(dims, 0.0);
@@ -358,7 +359,12 @@ void imputeNumericKnnWithSnapshot(NumVec& targetVals,
         }
     }
 
-    for (size_t row = 0; row < targetVals.size() && row < targetMissing.size(); ++row) {
+    const size_t bruteRows = std::min(targetVals.size(), targetMissing.size());
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
+    for (std::ptrdiff_t rowSigned = 0; rowSigned < static_cast<std::ptrdiff_t>(bruteRows); ++rowSigned) {
+        const size_t row = static_cast<size_t>(rowSigned);
         if (!targetMissing[row] && std::isfinite(targetVals[row])) continue;
 
         std::vector<std::pair<double, double>> neighbors;

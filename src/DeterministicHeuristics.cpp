@@ -9,7 +9,6 @@
 #include <limits>
 #include <numeric>
 #include <sstream>
-#include <regex>
 #include <set>
 #include <unordered_map>
 
@@ -77,19 +76,39 @@ size_t uniqueCountForColumn(const TypedColumn& col) {
 }
 
 bool isMetadataName(const std::string& name) {
-    static const std::regex strictAdminPattern(
-        R"((^id$)|(^idx$)|(^index$)|(_id$)|(^id_)|(_index$)|(_idx$)|(^row_?id$)|(^row_?num(ber)?$)|(^uuid$)|(_uuid$)|(^guid$)|(_guid$)|(^timestamp$)|(_timestamp$)|(^created(_at)?$)|(_created(_at)?$)|(^updated(_at)?$)|(_updated(_at)?$)|(^date$)|(_date$)|(^time$)|(_time$)|(^lat$)|(^latitude$)|(_lat$)|(^lon$)|(^lng$)|(_lon$)|(_lng$)|(^coord(inate)?s?$)|(_coord(inate)?s?$))",
-        std::regex::icase);
-    if (std::regex_search(name, strictAdminPattern)) return true;
     const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
+    if (lower.empty()) return false;
+
+    auto endsWith = [&](const std::string& suffix) {
+        return lower.size() >= suffix.size() &&
+               lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    if (lower == "id" || lower == "idx" || lower == "index" ||
+        lower == "rowid" || lower == "row_id" || lower == "rownum" || lower == "row_num" || lower == "rownumber" ||
+        lower == "uuid" || lower == "guid" || lower == "timestamp" || lower == "created" || lower == "created_at" ||
+        lower == "updated" || lower == "updated_at" || lower == "date" || lower == "time" ||
+        lower == "lat" || lower == "latitude" || lower == "lon" || lower == "lng" || lower == "coords" || lower == "coordinate" || lower == "coordinates") {
+        return true;
+    }
+    if (lower.rfind("id_", 0) == 0 || endsWith("_id") || endsWith("_idx") || endsWith("_index") ||
+        endsWith("_uuid") || endsWith("_guid") || endsWith("_timestamp") ||
+        endsWith("_created") || endsWith("_created_at") || endsWith("_updated") || endsWith("_updated_at") ||
+        endsWith("_date") || endsWith("_time") || endsWith("_lat") || endsWith("_lon") || endsWith("_lng") ||
+        endsWith("_coord") || endsWith("_coords") || endsWith("_coordinate") || endsWith("_coordinates")) {
+        return true;
+    }
     return lower.find("metadata") != std::string::npos ||
            lower.find("audit") != std::string::npos ||
            lower.find("ingest") != std::string::npos;
 }
 
 bool isTargetCandidateName(const std::string& name) {
-    static const std::regex re("(score|target|label|total|class)", std::regex::icase);
-    return std::regex_search(name, re);
+    const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
+    return lower.find("score") != std::string::npos ||
+           lower.find("target") != std::string::npos ||
+           lower.find("label") != std::string::npos ||
+           lower.find("total") != std::string::npos ||
+           lower.find("class") != std::string::npos;
 }
 
 enum class UnitSemanticKind {
@@ -242,9 +261,13 @@ std::vector<int> lassoTopK(const TypedDataset& data,
     const double lambda = (n < 200) ? 0.12 : 0.08;
 
     for (size_t iter = 0; iter < 80; ++iter) {
+        double maxDelta = 0.0;
         for (size_t j = 0; j < p; ++j) {
             double rho = 0.0;
             double z = 0.0;
+            #ifdef USE_OPENMP
+            #pragma omp simd reduction(+:rho,z)
+            #endif
             for (size_t i = 0; i < n; ++i) {
                 const double r = y[i] - (pred[i] - X[i][j] * beta[j]);
                 rho += X[i][j] * r;
@@ -255,9 +278,14 @@ std::vector<int> lassoTopK(const TypedDataset& data,
             const double delta = newBeta - beta[j];
             if (std::abs(delta) > 0.0) {
                 beta[j] = newBeta;
+                maxDelta = std::max(maxDelta, std::abs(delta));
+                #ifdef USE_OPENMP
+                #pragma omp simd
+                #endif
                 for (size_t i = 0; i < n; ++i) pred[i] += X[i][j] * delta;
             }
         }
+        if (maxDelta < 1e-6) break;
     }
 
     std::vector<std::pair<int, double>> ranked;

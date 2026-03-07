@@ -531,10 +531,15 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
             const auto& g = m_layers[l].gradients();
             auto& gb = gradBAccum[l];
             auto& gw = gradWAccum[l];
+            const size_t prevSize = prevOut.size();
             for (size_t n = 0; n < g.size(); ++n) {
-                gb[n] += static_cast<Scalar>(g[n]);
-                const size_t offset = n * prevOut.size();
-                for (size_t pn = 0; pn < prevOut.size(); ++pn) {
+                const Scalar gn = static_cast<Scalar>(g[n]);
+                gb[n] += gn;
+                const size_t offset = n * prevSize;
+                #ifdef USE_OPENMP
+                #pragma omp simd
+                #endif
+                for (size_t pn = 0; pn < prevSize; ++pn) {
                     gw[offset + pn] += static_cast<Scalar>(g[n] * prevOut[pn]);
                 }
             }

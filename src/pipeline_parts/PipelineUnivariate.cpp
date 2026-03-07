@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -3057,8 +3058,19 @@ void addUnivariatePlots(ReportEngine& univariate,
         std::cout << "[Seldon][Univariate] Generating supervised univariate plots...\n";
     }
 
+    std::vector<size_t> approvedNumeric;
+    approvedNumeric.reserve(data.numericColumnIndices().size());
     for (size_t idx : data.numericColumnIndices()) {
-        if (neuralApprovedNumericFeatures.find(idx) == neuralApprovedNumericFeatures.end()) continue;
+        if (neuralApprovedNumericFeatures.find(idx) != neuralApprovedNumericFeatures.end()) {
+            approvedNumeric.push_back(idx);
+        }
+    }
+
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(dynamic, 1)
+    #endif
+    for (std::ptrdiff_t idxPos = 0; idxPos < static_cast<std::ptrdiff_t>(approvedNumeric.size()); ++idxPos) {
+        const size_t idx = approvedNumeric[static_cast<size_t>(idxPos)];
         const auto& vals = std::get<std::vector<double>>(data.columns()[idx].values);
         plotterUnivariate.histogram("uni_hist_" + std::to_string(idx), vals, "Histogram: " + data.columns()[idx].name);
 
