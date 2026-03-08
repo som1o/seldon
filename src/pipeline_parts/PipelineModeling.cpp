@@ -76,6 +76,47 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         }
     };
 
+    auto fitMinMaxScales = [](const std::vector<std::vector<double>>& matrix,
+                              std::vector<NeuralNet::ScaleInfo>& scales) {
+        const size_t rows = matrix.size();
+        const size_t cols = rows == 0 ? 0 : matrix.front().size();
+        scales.assign(cols, NeuralNet::ScaleInfo{0.0, 1.0});
+        if (rows == 0 || cols == 0) return;
+
+        for (size_t c = 0; c < cols; ++c) {
+            double mn = std::numeric_limits<double>::infinity();
+            double mx = -std::numeric_limits<double>::infinity();
+            for (size_t r = 0; r < rows; ++r) {
+                if (c >= matrix[r].size()) continue;
+                const double v = matrix[r][c];
+                if (!std::isfinite(v)) continue;
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+            }
+            if (!std::isfinite(mn) || !std::isfinite(mx)) {
+                scales[c] = {0.0, 1.0};
+            } else if (std::abs(mx - mn) <= 1e-12) {
+                scales[c] = {mn, mn + 1.0};
+            } else {
+                scales[c] = {mn, mx};
+            }
+        }
+    };
+
+    auto applyMinMaxScales = [](std::vector<std::vector<double>>& matrix,
+                                const std::vector<NeuralNet::ScaleInfo>& scales) {
+        if (matrix.empty() || scales.empty()) return;
+        const size_t cols = scales.size();
+        for (auto& row : matrix) {
+            const size_t limit = std::min(cols, row.size());
+            for (size_t c = 0; c < limit; ++c) {
+                double range = scales[c].max - scales[c].min;
+                if (std::abs(range) <= 1e-12) range = 1.0;
+                row[c] = (row[c] - scales[c].min) / range;
+            }
+        }
+    };
+
     const auto& y = std::get<std::vector<double>>(data.columns()[targetIdx].values);
 
     std::vector<int> targetIndices;
@@ -155,6 +196,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         hp.batchSize = std::clamp<size_t>(data.rowCount() / 24, 4, 64);
         hp.learningRate = config.neuralLearningRate;
         hp.earlyStoppingPatience = std::clamp<int>(static_cast<int>(hp.epochs / 12), 6, 24);
+        hp.minDelta = config.neuralEarlyStoppingMinDelta;
         hp.lrDecay = config.neuralLrDecay;
         hp.lrPlateauPatience = config.neuralLrPlateauPatience;
         hp.lrCooldownEpochs = config.neuralLrCooldownEpochs;
@@ -209,6 +251,8 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         const size_t chunkRows = std::max<size_t>(16, config.neuralStreamingChunkRows);
         std::vector<double> streamingMeans;
         std::vector<double> streamingStds;
+        std::vector<NeuralNet::ScaleInfo> streamingInputScales;
+        std::vector<NeuralNet::ScaleInfo> streamingOutputScales;
         {
             std::vector<std::vector<double>> scaleSample;
             std::vector<std::vector<double>> scaleRows;
@@ -222,6 +266,20 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
                 if (scaleSample.size() >= 2048) break;
             }
             fitStandardScaler(scaleSample, streamingMeans, streamingStds);
+            applyStandardScaler(scaleSample, streamingMeans, streamingStds);
+            fitMinMaxScales(scaleSample, streamingInputScales);
+
+            std::vector<std::vector<double>> yScaleSample;
+            const size_t yRows = std::min<size_t>(data.rowCount(), static_cast<size_t>(2048));
+            yScaleSample.assign(yRows, std::vector<double>(outputNodes, 0.0));
+            for (size_t r = 0; r < yRows; ++r) {
+                for (size_t t = 0; t < targetIndices.size(); ++t) {
+                    const int idx = targetIndices[t];
+                    const auto& targetVals = std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values);
+                    yScaleSample[r][t] = (r < targetVals.size()) ? targetVals[r] : 0.0;
+                }
+            }
+            fitMinMaxScales(yScaleSample, streamingOutputScales);
         }
 
         char xTmp[] = "/tmp/seldon_nn_x_XXXXXX";
@@ -261,6 +319,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
             const size_t end = std::min(start + chunkRows, data.rowCount());
             encodeNeuralRows(data, plan, start, end, chunkX);
             applyStandardScaler(chunkX, streamingMeans, streamingStds);
+            applyMinMaxScales(chunkX, streamingInputScales);
 
             chunkY.assign(end - start, std::vector<double>(outputNodes, 0.0));
             #ifdef USE_OPENMP
@@ -274,6 +333,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
                     chunkY[local][t] = (r < targetVals.size()) ? targetVals[r] : 0.0;
                 }
             }
+            applyMinMaxScales(chunkY, streamingOutputScales);
 
             std::vector<float> xRow(static_cast<size_t>(inputNodes), 0.0f);
             for (size_t r = 0; r < chunkX.size(); ++r) {
@@ -302,7 +362,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         hp.streamingChunkRows = chunkRows;
         hp.useMemoryMappedInput = true;
 
-        nn.train({}, {}, hp);
+        nn.train({}, {}, hp, streamingInputScales, streamingOutputScales);
         xTmpGuard.release();
         yTmpGuard.release();
         ::unlink(xTmp);
@@ -740,6 +800,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
         probeHp.dropoutRate = 0.05;
         probeHp.valSplit = 0.2;
         probeHp.earlyStoppingPatience = 6;
+        probeHp.minDelta = config.neuralEarlyStoppingMinDelta;
         probeHp.activation = NeuralNet::Activation::RELU;
         probeHp.outputActivation = useCrossEntropy ? NeuralNet::Activation::SIGMOID : NeuralNet::Activation::LINEAR;
         probeHp.loss = useCrossEntropy ? NeuralNet::LossFunction::CROSS_ENTROPY : NeuralNet::LossFunction::MSE;
@@ -958,6 +1019,7 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
     hp.batchSize = dynamicBatch;
     hp.learningRate = config.neuralLearningRate;
     hp.earlyStoppingPatience = dynamicPatience;
+    hp.minDelta = config.neuralEarlyStoppingMinDelta;
     hp.lrDecay = config.neuralLrDecay;
     hp.lrPlateauPatience = config.neuralLrPlateauPatience;
     hp.lrCooldownEpochs = config.neuralLrCooldownEpochs;
@@ -1106,10 +1168,17 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
 
     nn.setInputL2Scales(inputL2Scales);
 
+    std::vector<NeuralNet::ScaleInfo> nnInputScales;
+    std::vector<NeuralNet::ScaleInfo> nnOutputScales;
+    fitMinMaxScales(Xnn, nnInputScales);
+    fitMinMaxScales(Ynn, nnOutputScales);
+    applyMinMaxScales(Xnn, nnInputScales);
+    applyMinMaxScales(Ynn, nnOutputScales);
+
     if (config.neuralStreamingMode) {
-        nn.trainIncremental(Xnn, Ynn, hp, std::max<size_t>(16, config.neuralStreamingChunkRows));
+        nn.trainIncremental(Xnn, Ynn, hp, std::max<size_t>(16, config.neuralStreamingChunkRows), nnInputScales, nnOutputScales);
     } else {
-        nn.train(Xnn, Ynn, hp);
+        nn.train(Xnn, Ynn, hp, nnInputScales, nnOutputScales);
     }
 
     const double stabilityProbe = estimateTrainingStability(nn.getTrainLossHistory(), nn.getValLossHistory());
@@ -1123,9 +1192,9 @@ NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
             hp.epochs = std::min<size_t>(hp.epochs, 180);
             hp.earlyStoppingPatience = std::min(hp.earlyStoppingPatience, 10);
             if (config.neuralStreamingMode) {
-                nn.trainIncremental(Xnn, Ynn, hp, std::max<size_t>(16, config.neuralStreamingChunkRows));
+                nn.trainIncremental(Xnn, Ynn, hp, std::max<size_t>(16, config.neuralStreamingChunkRows), nnInputScales, nnOutputScales);
             } else {
-                nn.train(Xnn, Ynn, hp);
+                nn.train(Xnn, Ynn, hp, nnInputScales, nnOutputScales);
             }
             analysis.policyUsed = policy.name + "+stability_shrink";
         }
@@ -2007,8 +2076,11 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     };
 
     auto appendPairsForRange = [&](size_t startAPos, size_t endAPos, std::vector<PairInsight>& out, bool emitVerboseRows) {
+        const double prefilterAbsR = std::clamp(0.5 * tuning.scatterFitMinAbsCorr, 0.05, 0.20);
         for (size_t aPos = startAPos; aPos < endAPos; ++aPos) {
             for (size_t bPos = aPos + 1; bPos < evalNumericIdx.size(); ++bPos) {
+                const double fastAbsR = std::abs(static_cast<double>(pearsonMatrix[pairSlot(aPos, bPos)]));
+                if (fastAbsR < prefilterAbsR) continue;
                 PairInsight p = buildPair(aPos, bPos);
                 if (emitVerboseRows) {
                     std::cout << "[Seldon][Bivariate] " << p.featureA << " vs " << p.featureB

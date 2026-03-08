@@ -173,6 +173,7 @@ public:
      * @throws std::invalid_argument when row dimensions mismatch.
      */
     static std::vector<double> multipleLinearRegression(const Matrix& X, const Matrix& Y);
+    static std::vector<double> multipleLinearRegression(Matrix&& X, Matrix&& Y);
 
     /**
      * @brief Performs MLR and returns coefficients with diagnostics.

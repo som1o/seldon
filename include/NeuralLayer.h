@@ -93,6 +93,7 @@ private:
     std::vector<NeuralScalar> m_bnGamma;
     std::vector<NeuralScalar> m_bnBeta;
     std::vector<NeuralScalar> m_bnBackpropScale;
+    size_t m_bnStepsAccumulated = 0;
     std::vector<NeuralScalar> m_lnBackpropScale;
 
     NeuralActivation m_activation = NeuralActivation::RELU;

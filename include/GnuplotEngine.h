@@ -26,6 +26,7 @@ public:
      * @post assets directory is created if possible.
      */
     GnuplotEngine(std::string assetsDir, PlotConfig cfg);
+    ~GnuplotEngine();
 
     /**
      * @brief Checks whether gnuplot executable is available in PATH.
@@ -190,5 +191,5 @@ private:
     static std::string quoteForGnuplot(const std::string& value);
     static std::string terminalForFormat(const std::string& format, int width, int height);
     std::string styledHeader(const std::string& id, const std::string& title) const;
-    std::string runScript(const std::string& id, const std::string& dataContent, const std::string& scriptContent);
+    std::string runScript(const std::string& id, const std::string& dataContent, const std::string& scriptContent) const;
 };

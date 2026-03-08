@@ -24,9 +24,11 @@
 #endif
 
 namespace {
-constexpr uint32_t kModelFormatVersion = 3;
+constexpr uint32_t kModelFormatVersion = 4;
 constexpr uint64_t kChecksumOffsetBasis = 1469598103934665603ULL;
 constexpr uint64_t kChecksumPrime = 1099511628211ULL;
+constexpr uint32_t kCrc32Init = 0xFFFFFFFFu;
+constexpr uint32_t kCrc32XorOut = 0xFFFFFFFFu;
 constexpr size_t kHardMaxTopologyNodes = 65536;
 constexpr size_t kHardMaxTrainableParams = 100000000;
 constexpr double kNumericEps = 1e-12;
@@ -207,6 +209,34 @@ void updateChecksum(uint64_t& checksum, const T& value) {
     }
 }
 
+void updateCrc32Bytes(uint32_t& crc, const unsigned char* bytes, size_t len) {
+    static uint32_t table[256] = {0};
+    static bool initialized = false;
+    if (!initialized) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            table[i] = c;
+        }
+        initialized = true;
+    }
+
+    for (size_t i = 0; i < len; ++i) {
+        const uint32_t idx = (crc ^ static_cast<uint32_t>(bytes[i])) & 0xFFu;
+        crc = table[idx] ^ (crc >> 8);
+    }
+}
+
+template <typename T>
+void updateCrc32(uint32_t& crc, const T& value) {
+    T copy = value;
+    if (!isLittleEndian()) swapEndian(copy);
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&copy);
+    updateCrc32Bytes(crc, bytes, sizeof(T));
+}
+
 template <typename T>
 void writeLE(std::ostream& out, T value) {
     if (!isLittleEndian()) swapEndian(value);
@@ -234,25 +264,115 @@ double meanSquaredError(const std::vector<NeuralScalar>& prediction,
     return err;
 }
 
+class MeanSquaredErrorLoss final : public NeuralNet::LossInterface {
+public:
+    double computeLoss(double prediction, double target) const override {
+        const double d = prediction - target;
+        return d * d;
+    }
+
+    double computeGradient(double prediction, double target) const override {
+        return 2.0 * (prediction - target);
+    }
+};
+
+class CrossEntropyLoss final : public NeuralNet::LossInterface {
+public:
+    double computeLoss(double prediction, double target) const override {
+        const double p = std::clamp(prediction, 1e-15, 1.0 - 1e-15);
+        const double y = std::clamp(target, 0.0, 1.0);
+        return -(y * std::log(p) + (1.0 - y) * std::log(1.0 - p));
+    }
+
+    double computeGradient(double prediction, double target) const override {
+        const double p = std::clamp(prediction, 1e-15, 1.0 - 1e-15);
+        const double y = std::clamp(target, 0.0, 1.0);
+        return (p - y) / std::max(1e-15, p * (1.0 - p));
+    }
+};
+
+double splitTargetScalar(const std::vector<double>& targetRow) {
+    if (targetRow.empty()) return 0.0;
+    if (std::isfinite(targetRow[0])) return targetRow[0];
+    double sum = 0.0;
+    size_t count = 0;
+    for (double v : targetRow) {
+        if (!std::isfinite(v)) continue;
+        sum += v;
+        ++count;
+    }
+    return (count > 0) ? (sum / static_cast<double>(count)) : 0.0;
+}
+
+std::vector<size_t> buildQuantileStratifiedOrder(const std::vector<std::vector<double>>& Y,
+                                                 size_t valSize) {
+    const size_t n = Y.size();
+    std::vector<size_t> indices(n);
+    std::iota(indices.begin(), indices.end(), 0);
+    if (n == 0 || valSize == 0 || valSize >= n) return indices;
+
+    std::vector<std::pair<double, size_t>> ranked;
+    ranked.reserve(n);
+    for (size_t i = 0; i < n; ++i) ranked.push_back({splitTargetScalar(Y[i]), i});
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        if (a.first == b.first) return a.second < b.second;
+        return a.first < b.first;
+    });
+
+    std::vector<size_t> train;
+    std::vector<size_t> val;
+    train.reserve(n - valSize);
+    val.reserve(valSize);
+
+    const size_t stride = std::max<size_t>(2, static_cast<size_t>(std::llround(static_cast<double>(n) / static_cast<double>(valSize))));
+    for (size_t rank = 0; rank < ranked.size(); ++rank) {
+        const size_t idx = ranked[rank].second;
+        if (val.size() < valSize && (rank % stride == 0)) {
+            val.push_back(idx);
+        } else {
+            train.push_back(idx);
+        }
+    }
+
+    while (val.size() < valSize && !train.empty()) {
+        val.push_back(train.back());
+        train.pop_back();
+    }
+
+    std::vector<size_t> out;
+    out.reserve(n);
+    out.insert(out.end(), train.begin(), train.end());
+    out.insert(out.end(), val.begin(), val.end());
+    return out;
+}
+
 } // namespace
 
+const NeuralNet::LossInterface& NeuralNet::resolveLoss(LossFunction loss) {
+    static const MeanSquaredErrorLoss kMse;
+    static const CrossEntropyLoss kCrossEntropy;
+    return (loss == LossFunction::CROSS_ENTROPY)
+        ? static_cast<const LossInterface&>(kCrossEntropy)
+        : static_cast<const LossInterface&>(kMse);
+}
+
 NeuralNet::NeuralNet(std::vector<size_t> topologyConfig)
-    : topology(std::move(topologyConfig)) {
-    if (topology.size() < 2) {
+    : m_topology(std::move(topologyConfig)) {
+    if (m_topology.size() < 2) {
         throw Seldon::NeuralNetException("Topology must include at least input and output layers");
     }
 
     size_t totalNodes = 0;
     size_t totalParams = 0;
-    for (size_t i = 0; i < topology.size(); ++i) {
-        const size_t layerSize = topology[i];
+    for (size_t i = 0; i < m_topology.size(); ++i) {
+        const size_t layerSize = m_topology[i];
         if (layerSize == 0) {
             throw Seldon::NeuralNetException("Layer size cannot be zero");
         }
         totalNodes += layerSize;
         if (i > 0) {
-            totalParams += topology[i - 1] * topology[i];
-            totalParams += topology[i];
+            totalParams += m_topology[i - 1] * m_topology[i];
+            totalParams += m_topology[i];
         }
     }
 
@@ -264,11 +384,11 @@ NeuralNet::NeuralNet(std::vector<size_t> topologyConfig)
     }
 
     rng.seed(seedState);
-    m_layers.reserve(topology.size());
-    for (size_t l = 0; l < topology.size(); ++l) {
-        const Activation act = (l + 1 == topology.size()) ? Activation::SIGMOID : Activation::GELU;
-        const size_t prev = (l == 0) ? 0 : topology[l - 1];
-        m_layers.emplace_back(topology[l], prev, act, rng);
+    m_layers.reserve(m_topology.size());
+    for (size_t l = 0; l < m_topology.size(); ++l) {
+        const Activation act = (l + 1 == m_topology.size()) ? Activation::SIGMOID : Activation::GELU;
+        const size_t prev = (l == 0) ? 0 : m_topology[l - 1];
+        m_layers.emplace_back(m_topology[l], prev, act, rng);
     }
 }
 
@@ -353,6 +473,22 @@ void NeuralNet::applyEmaWeights() {
     }
 }
 
+bool NeuralNet::applyBatchNorm(size_t layerIndex) const {
+    const bool hidden = layerIndex + 1 < m_layers.size();
+    return m_useBatchNorm && hidden;
+}
+
+bool NeuralNet::applyLayerNorm(size_t layerIndex) const {
+    const bool hidden = layerIndex + 1 < m_layers.size();
+    return m_useLayerNorm && hidden;
+}
+
+double NeuralNet::applyDropout(bool isTraining, size_t layerIndex, double dropoutRate) const {
+    const bool hidden = layerIndex + 1 < m_layers.size();
+    if (!isTraining || !hidden) return 0.0;
+    return std::clamp(dropoutRate, 0.0, 0.95);
+}
+
 void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTraining, double dropoutRate) {
     if (m_layers.empty()) throw Seldon::NeuralNetException("Network has no layers");
 
@@ -365,19 +501,19 @@ void NeuralNet::feedForward(const std::vector<double>& inputValues, bool isTrain
     if (isTraining) {
         runCounter = ++forwardCounter;
     }
-    const double safeDropout = std::clamp(dropoutRate, 0.0, 0.95);
     for (size_t l = 1; l < m_layers.size(); ++l) {
         const bool hidden = l + 1 < m_layers.size();
-        const bool applyBatchNorm = m_useBatchNorm && hidden;
-        const bool applyLayerNorm = m_useLayerNorm && hidden;
+        const bool useBatchNorm = applyBatchNorm(l);
+        const bool useLayerNorm = applyLayerNorm(l);
+        const double layerDropout = applyDropout(isTraining, l, dropoutRate);
         m_layers[l].forward(
             m_layers[l - 1],
             isTraining && hidden,
-            safeDropout,
-            applyBatchNorm,
+            layerDropout,
+            useBatchNorm,
             m_batchNormMomentum,
             m_batchNormEpsilon,
-            applyLayerNorm,
+            useLayerNorm,
             m_layerNormEpsilon,
             seedState,
             runCounter + l * 1315423911ULL);
@@ -480,6 +616,7 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
                            size_t& t_step) {
     double batchLoss = 0.0;
     const size_t outDim = m_layers.back().size();
+    const LossInterface& lossImpl = resolveLoss(hp.loss);
     const size_t accumSteps = std::max<size_t>(1, hp.gradientAccumulationSteps);
 
     Optimizer fastOptimizer = hp.optimizer;
@@ -550,15 +687,18 @@ double NeuralNet::runBatch(const std::vector<std::vector<double>>& X,
         const auto& out = m_layers.back().outputs();
         if (hp.loss == LossFunction::CROSS_ENTROPY) {
             for (size_t j = 0; j < out.size() && j < Y[idx].size(); ++j) {
-                const double p = static_cast<double>(std::clamp(out[j], static_cast<NeuralScalar>(1e-15), static_cast<NeuralScalar>(1.0 - 1e-15)));
-                const double y = Y[idx][j];
-                batchLoss -= (y * std::log(p) + (1.0 - y) * std::log(1.0 - p));
+                batchLoss += lossImpl.computeLoss(static_cast<double>(out[j]), Y[idx][j]);
             }
         } else {
-            batchLoss += meanSquaredError(out, Y[idx], std::min(out.size(), Y[idx].size()));
+            const size_t d = std::min(out.size(), Y[idx].size());
+            for (size_t j = 0; j < d; ++j) {
+                batchLoss += lossImpl.computeLoss(static_cast<double>(out[j]), Y[idx][j]);
+            }
         }
 
-        const bool shouldStep = (microCount >= accumSteps) || (b + 1 == batchEnd);
+        const size_t batchMicroIndex = (b - batchStart) + 1;
+        const bool hitAccumBoundary = (batchMicroIndex % accumSteps) == 0;
+        const bool shouldStep = hitAccumBoundary || (b + 1 == batchEnd);
         if (!shouldStep) continue;
 
         const double invMicro = 1.0 / static_cast<double>(std::max<size_t>(1, microCount));
@@ -754,6 +894,7 @@ double NeuralNet::validate(const std::vector<std::vector<double>>& X,
 
     double loss = 0.0;
     const size_t outDim = m_layers.back().size();
+    const LossInterface& lossImpl = resolveLoss(hp.loss);
     for (size_t i = trainSize; i < X.size(); ++i) {
         const size_t idx = indices[i];
         feedForward(X[idx], false);
@@ -761,12 +902,13 @@ double NeuralNet::validate(const std::vector<std::vector<double>>& X,
 
         if (hp.loss == LossFunction::CROSS_ENTROPY) {
             for (size_t j = 0; j < out.size() && j < Y[idx].size(); ++j) {
-                const double p = static_cast<double>(std::clamp(out[j], static_cast<NeuralScalar>(1e-15), static_cast<NeuralScalar>(1.0 - 1e-15)));
-                const double y = Y[idx][j];
-                loss -= (y * std::log(p) + (1.0 - y) * std::log(1.0 - p));
+                loss += lossImpl.computeLoss(static_cast<double>(out[j]), Y[idx][j]);
             }
         } else {
-            loss += meanSquaredError(out, Y[idx], std::min(out.size(), Y[idx].size()));
+            const size_t d = std::min(out.size(), Y[idx].size());
+            for (size_t j = 0; j < d; ++j) {
+                loss += lossImpl.computeLoss(static_cast<double>(out[j]), Y[idx][j]);
+            }
         }
     }
 
@@ -880,8 +1022,7 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
         valSize = 0;
     }
 
-    std::vector<size_t> indices(X.size());
-    std::iota(indices.begin(), indices.end(), 0);
+    std::vector<size_t> indices = buildQuantileStratifiedOrder(Y, valSize);
 
     double bestVal = std::numeric_limits<double>::infinity();
     bool hasBest = false;
@@ -908,7 +1049,12 @@ void NeuralNet::train(const std::vector<std::vector<double>>& X,
                       << (epoch * 100 / std::max<size_t>(1, hp.epochs)) << "%] " << std::flush;
         }
 
-        std::shuffle(indices.begin(), indices.end(), rng);
+        if (trainSize > 0) {
+            std::shuffle(indices.begin(), indices.begin() + static_cast<std::ptrdiff_t>(trainSize), rng);
+        }
+        if (valSize > 1) {
+            std::shuffle(indices.begin() + static_cast<std::ptrdiff_t>(trainSize), indices.end(), rng);
+        }
 
         Hyperparameters h = hpEffective;
         const size_t warmupEpochs = std::min(hpEffective.lrWarmupEpochs, hpEffective.epochs);
@@ -1148,7 +1294,13 @@ void NeuralNet::trainIncrementalFromBinary(const std::string& inputBinaryPath,
 
 std::vector<double> NeuralNet::predict(const std::vector<double>& inputValues) {
     std::vector<double> scaled = inputValues;
-    if (!inputScales.empty() && inputScales.size() == inputValues.size()) {
+    bool appearsPreScaled = false;
+    if (!scaled.empty()) {
+        appearsPreScaled = std::all_of(scaled.begin(), scaled.end(), [](double v) {
+            return std::isfinite(v) && v >= -1e-9 && v <= 1.0 + 1e-9;
+        });
+    }
+    if (!appearsPreScaled && !inputScales.empty() && inputScales.size() == inputValues.size()) {
         for (size_t i = 0; i < scaled.size(); ++i) {
             double range = inputScales[i].max - inputScales[i].min;
             if (std::abs(range) <= kNumericEps) range = 1.0;
@@ -1185,7 +1337,13 @@ NeuralNet::UncertaintyEstimate NeuralNet::predictWithUncertainty(const std::vect
     out.ciHigh.assign(outDim, 0.0);
 
     std::vector<double> scaled = inputValues;
-    if (!inputScales.empty()) {
+    bool appearsPreScaled = false;
+    if (!scaled.empty()) {
+        appearsPreScaled = std::all_of(scaled.begin(), scaled.end(), [](double v) {
+            return std::isfinite(v) && v >= -1e-9 && v <= 1.0 + 1e-9;
+        });
+    }
+    if (!appearsPreScaled && !inputScales.empty()) {
         const size_t n = std::min(scaled.size(), inputScales.size());
         for (size_t i = 0; i < n; ++i) {
             double range = inputScales[i].max - inputScales[i].min;
@@ -1466,22 +1624,27 @@ void NeuralNet::saveModelBinary(const std::string& filename) const {
     writeLE(out, kModelFormatVersion);
 
     uint64_t checksum = kChecksumOffsetBasis;
+    uint32_t crc32 = kCrc32Init;
     updateChecksum(checksum, kModelFormatVersion);
+    updateCrc32(crc32, kModelFormatVersion);
 
-    const uint64_t topSize = static_cast<uint64_t>(topology.size());
+    const uint64_t topSize = static_cast<uint64_t>(m_topology.size());
     writeLE(out, topSize);
     updateChecksum(checksum, topSize);
+    updateCrc32(crc32, topSize);
 
-    for (size_t layer : topology) {
+    for (size_t layer : m_topology) {
         const uint64_t width = static_cast<uint64_t>(layer);
         writeLE(out, width);
         updateChecksum(checksum, width);
+        updateCrc32(crc32, width);
     }
 
     for (const auto& layer : m_layers) {
         const int32_t act = static_cast<int32_t>(layer.activation());
         writeLE(out, act);
         updateChecksum(checksum, act);
+        updateCrc32(crc32, act);
     }
 
     const uint64_t inS = static_cast<uint64_t>(inputScales.size());
@@ -1490,18 +1653,24 @@ void NeuralNet::saveModelBinary(const std::string& filename) const {
     writeLE(out, outS);
     updateChecksum(checksum, inS);
     updateChecksum(checksum, outS);
+    updateCrc32(crc32, inS);
+    updateCrc32(crc32, outS);
 
     for (const auto& s : inputScales) {
         writeLE(out, s.min);
         writeLE(out, s.max);
         updateChecksum(checksum, s.min);
         updateChecksum(checksum, s.max);
+        updateCrc32(crc32, s.min);
+        updateCrc32(crc32, s.max);
     }
     for (const auto& s : outputScales) {
         writeLE(out, s.min);
         writeLE(out, s.max);
         updateChecksum(checksum, s.min);
         updateChecksum(checksum, s.max);
+        updateCrc32(crc32, s.min);
+        updateCrc32(crc32, s.max);
     }
 
     for (size_t l = 1; l < m_layers.size(); ++l) {
@@ -1509,14 +1678,26 @@ void NeuralNet::saveModelBinary(const std::string& filename) const {
         for (double b : layer.biases()) {
             writeLE(out, b);
             updateChecksum(checksum, b);
+            updateCrc32(crc32, b);
         }
         for (double w : layer.weights()) {
             writeLE(out, w);
             updateChecksum(checksum, w);
+            updateCrc32(crc32, w);
         }
     }
 
     writeLE(out, checksum);
+    writeLE(out, static_cast<uint32_t>(crc32 ^ kCrc32XorOut));
+
+    out.flush();
+    if (!out.good()) {
+        throw Seldon::IOException("Failed writing model file (flush error): " + filename);
+    }
+    out.close();
+    if (!out.good()) {
+        throw Seldon::IOException("Failed writing model file (close error): " + filename);
+    }
 }
 
 void NeuralNet::loadModelBinary(const std::string& filename) {
@@ -1533,16 +1714,19 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
 
     uint32_t version = 0;
     readLE(in, version);
-    if (version != kModelFormatVersion) {
+    if (version != 3 && version != kModelFormatVersion) {
         throw Seldon::NeuralNetException("Unsupported model version in file: " + filename);
     }
 
     uint64_t checksum = kChecksumOffsetBasis;
+    uint32_t crc32 = kCrc32Init;
     updateChecksum(checksum, version);
+    if (version >= 4) updateCrc32(crc32, version);
 
     uint64_t topSize = 0;
     readLE(in, topSize);
     updateChecksum(checksum, topSize);
+    if (version >= 4) updateCrc32(crc32, topSize);
     if (topSize < 2 || topSize > 1000000ULL) {
         throw Seldon::NeuralNetException("Invalid topology size in model file: " + filename);
     }
@@ -1553,6 +1737,7 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
         uint64_t width = 0;
         readLE(in, width);
         updateChecksum(checksum, width);
+        if (version >= 4) updateCrc32(crc32, width);
         if (width == 0 || width > 1000000ULL) {
             throw Seldon::NeuralNetException("Invalid layer width in model file: " + filename);
         }
@@ -1565,6 +1750,7 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
         int32_t act = 0;
         readLE(in, act);
         updateChecksum(checksum, act);
+        if (version >= 4) updateCrc32(crc32, act);
         m_layers[i].setActivation(static_cast<Activation>(act));
     }
 
@@ -1574,6 +1760,10 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
     readLE(in, outS);
     updateChecksum(checksum, inS);
     updateChecksum(checksum, outS);
+    if (version >= 4) {
+        updateCrc32(crc32, inS);
+        updateCrc32(crc32, outS);
+    }
 
     inputScales.resize(static_cast<size_t>(inS));
     outputScales.resize(static_cast<size_t>(outS));
@@ -1583,12 +1773,20 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
         readLE(in, inputScales[static_cast<size_t>(i)].max);
         updateChecksum(checksum, inputScales[static_cast<size_t>(i)].min);
         updateChecksum(checksum, inputScales[static_cast<size_t>(i)].max);
+        if (version >= 4) {
+            updateCrc32(crc32, inputScales[static_cast<size_t>(i)].min);
+            updateCrc32(crc32, inputScales[static_cast<size_t>(i)].max);
+        }
     }
     for (uint64_t i = 0; i < outS; ++i) {
         readLE(in, outputScales[static_cast<size_t>(i)].min);
         readLE(in, outputScales[static_cast<size_t>(i)].max);
         updateChecksum(checksum, outputScales[static_cast<size_t>(i)].min);
         updateChecksum(checksum, outputScales[static_cast<size_t>(i)].max);
+        if (version >= 4) {
+            updateCrc32(crc32, outputScales[static_cast<size_t>(i)].min);
+            updateCrc32(crc32, outputScales[static_cast<size_t>(i)].max);
+        }
     }
 
     for (size_t l = 1; l < m_layers.size(); ++l) {
@@ -1596,10 +1794,12 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
         for (auto& b : layer.biases()) {
             readLE(in, b);
             updateChecksum(checksum, b);
+            if (version >= 4) updateCrc32(crc32, b);
         }
         for (auto& w : layer.weights()) {
             readLE(in, w);
             updateChecksum(checksum, w);
+            if (version >= 4) updateCrc32(crc32, w);
         }
     }
 
@@ -1607,5 +1807,14 @@ void NeuralNet::loadModelBinary(const std::string& filename) {
     readLE(in, storedChecksum);
     if (storedChecksum != checksum) {
         throw Seldon::NeuralNetException("Model checksum mismatch (corrupt file): " + filename);
+    }
+
+    if (version >= 4) {
+        uint32_t storedCrc32 = 0;
+        readLE(in, storedCrc32);
+        const uint32_t expected = static_cast<uint32_t>(crc32 ^ kCrc32XorOut);
+        if (storedCrc32 != expected) {
+            throw Seldon::NeuralNetException("Model CRC32 mismatch (corrupt file): " + filename);
+        }
     }
 }

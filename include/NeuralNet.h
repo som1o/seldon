@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
 #include <string>
 #include <random>
@@ -12,6 +13,14 @@ public:
     using Scalar = NeuralScalar;
     using Activation = NeuralActivation;
     enum class LossFunction { MSE, CROSS_ENTROPY };
+
+    class LossInterface {
+    public:
+        virtual ~LossInterface() = default;
+        virtual double computeLoss(double prediction, double target) const = 0;
+        virtual double computeGradient(double prediction, double target) const = 0;
+    };
+
     using Optimizer = NeuralOptimizer;
 
     struct ScaleInfo {
@@ -20,6 +29,7 @@ public:
     };
 
     struct Hyperparameters {
+        // Learning rate and scheduler controls.
         double learningRate = 0.001;
         double lrDecay = 0.5;
         int lrPlateauPatience = 5;
@@ -31,6 +41,8 @@ public:
         bool useCyclicalLr = false;
         size_t lrCycleEpochs = 24;
         double lrScheduleMinFactor = 0.15;
+
+        // Core training loop controls.
         size_t epochs = 100;
         size_t batchSize = 32;
         Activation activation = Activation::GELU;
@@ -43,16 +55,22 @@ public:
         double l2Lambda = 0.001;
         double categoricalInputL2Boost = 3.0;
         double dropoutRate = 0.0;
+
+        // Normalization layers.
         bool useBatchNorm = true;
         double batchNormMomentum = 0.95;
         double batchNormEpsilon = 1e-5;
         bool useLayerNorm = true;
         double layerNormEpsilon = 1e-5;
+
+        // Validation and early stop behavior.
         double valSplit = 0.2;
         bool useValidationLossEma = true;
         double validationLossEmaBeta = 0.6;
         int earlyStoppingPatience = 10;
         double minDelta = 1e-4;       // Minimum improvement for early stopping
+
+        // Gradient stability and regularization helpers.
         double gradientClipNorm = 5.0;
         bool adaptiveGradientClipping = true;
         double adaptiveClipBeta = 0.90;
@@ -64,6 +82,8 @@ public:
         double emaDecay = 0.995;
         double labelSmoothing = 0.02;
         size_t gradientAccumulationSteps = 2;
+
+        // Optional streaming mode for large datasets.
         bool incrementalMode = false;
         bool useDiskStreaming = false;
         std::string inputBinaryPath;
@@ -149,7 +169,11 @@ public:
     void loadModelBinary(const std::string& filename);
 
 private:
+    static const LossInterface& resolveLoss(LossFunction loss);
     void ensureBatchWorkspace();
+    bool applyBatchNorm(size_t layerIndex) const;
+    bool applyLayerNorm(size_t layerIndex) const;
+    double applyDropout(bool isTraining, size_t layerIndex, double dropoutRate) const;
     void feedForward(const std::vector<double>& inputValues, bool isTraining, double dropoutRate = 0.0);
     void backpropagate(const std::vector<double>& targetValues, const Hyperparameters& hp, size_t t_step);
     
@@ -169,7 +193,7 @@ private:
     void applyEmaWeights();
 
     std::vector<DenseLayer> m_layers;
-    std::vector<size_t> topology;
+    std::vector<size_t> m_topology;
     std::vector<ScaleInfo> inputScales;
     std::vector<ScaleInfo> outputScales;
     std::vector<double> trainLossHistory;

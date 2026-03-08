@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -23,6 +24,12 @@
 namespace {
 constexpr double kBicSigma2Floor = 1e-12;
 constexpr double kBicTieThreshold = 1e-6;
+constexpr size_t kMinCiRows = 12;
+constexpr size_t kKernelFallbackMaxRows = 220;
+constexpr size_t kMinRowsForDirectionalScoring = 30;
+constexpr size_t kMaxReportedEdges = 12;
+constexpr double kPcBaseWeight = 0.30;
+constexpr double kComputationEpsilon = 1e-9;
 
 
 struct CausalDataView {
@@ -43,12 +50,38 @@ struct CiTestResult {
     bool usedKernel = false;
 };
 
+std::vector<uint8_t> buildValidMask(const std::vector<double>& values,
+                                    const std::vector<bool>& missing,
+                                    size_t nRows) {
+    std::vector<uint8_t> mask(nRows, static_cast<uint8_t>(0));
+    const size_t n = std::min(nRows, std::min(values.size(), missing.size()));
+    for (size_t i = 0; i < n; ++i) {
+        mask[i] = (!missing[i] && std::isfinite(values[i])) ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+    }
+    return mask;
+}
+
 struct DiscoveryCoreResult {
     std::vector<std::vector<bool>> directed;
     std::vector<std::vector<bool>> undirected;
     std::vector<std::vector<std::unordered_set<size_t>>> sepsets;
+    std::vector<std::vector<double>> ciEdgeStrength;
+    std::vector<std::vector<double>> gesBicGain;
+    std::vector<std::vector<double>> lingamSignal;
     bool usedLiNGAM = false;
 };
+
+size_t binomialCount(size_t n, size_t k) {
+    if (k > n) return 0;
+    if (k == 0 || k == n) return 1;
+    k = std::min(k, n - k);
+    size_t c = 1;
+    for (size_t i = 1; i <= k; ++i) {
+        const size_t numer = n - (k - i);
+        c = (c * numer) / i;
+    }
+    return c;
+}
 
 bool hasToken(const std::string& text, const std::vector<std::string>& tokens) {
     const std::string lower = CommonUtils::toLower(text);
@@ -239,7 +272,7 @@ CiTestResult conditionalIndependenceTest(const std::vector<std::vector<double>>&
                                          bool enableKernelFallback,
                                          std::mt19937& rng) {
     CiTestResult out;
-    if (rows.size() < 12) {
+    if (rows.size() < kMinCiRows) {
         out.independent = true;
         return out;
     }
@@ -264,17 +297,23 @@ CiTestResult conditionalIndependenceTest(const std::vector<std::vector<double>>&
 
     // Step 2: Fisher z-transform approximates p-value for partial correlation.
     if (n > condSet.size() + 3) {
-        const double fisher = 0.5 * std::log((1.0 + r) / (1.0 - r));
-        const double z = std::abs(fisher) * std::sqrt(static_cast<double>(n) - static_cast<double>(condSet.size()) - 3.0);
-        out.pValue = std::erfc(z / std::sqrt(2.0));
-        out.independent = out.pValue > alpha;
+        constexpr double kNearOneThreshold = 0.9999999;
+        if (std::abs(r) >= kNearOneThreshold) {
+            out.pValue = 0.0;
+            out.independent = false;
+        } else {
+            const double fisher = 0.5 * std::log((1.0 + r) / (1.0 - r));
+            const double z = std::abs(fisher) * std::sqrt(static_cast<double>(n) - static_cast<double>(condSet.size()) - 3.0);
+            out.pValue = std::erfc(z / std::sqrt(2.0));
+            out.independent = out.pValue > alpha;
+        }
     }
 
     // Step 3: if close to decision boundary, use lightweight kernel fallback.
     if (!enableKernelFallback) return out;
-    if (out.pValue < alpha * 0.5 || out.pValue > alpha * 2.0) return out;
+    if (out.pValue < alpha * 0.1 || out.pValue > alpha * 5.0) return out;
 
-    const size_t kernelMaxN = 220;
+    const size_t kernelMaxN = kKernelFallbackMaxRows;
     std::vector<double> kx;
     std::vector<double> ky;
     kx.reserve(std::min(n, kernelMaxN));
@@ -296,7 +335,7 @@ CiTestResult conditionalIndependenceTest(const std::vector<std::vector<double>>&
     if (!std::isfinite(observed)) return out;
 
     size_t ge = 1;
-    const size_t perms = 30;
+    const size_t perms = 128;
     std::vector<double> perm = ky;
     for (size_t p = 0; p < perms; ++p) {
         std::shuffle(perm.begin(), perm.end(), rng);
@@ -385,7 +424,7 @@ std::vector<std::vector<size_t>> combinations(const std::vector<size_t>& items, 
 }
 
 double nonGaussianityScore(const std::vector<double>& v) {
-    if (v.size() < 12) return 0.0;
+    if (v.size() < kMinCiRows) return 0.0;
     const ColumnStats s = Statistics::calculateStats(v);
     const double skew = std::abs(s.skewness);
     const double kurt = std::abs(s.kurtosis - 3.0);
@@ -507,22 +546,29 @@ CausalDataView buildCompleteCaseView(const TypedDataset& data,
     const size_t nRows = data.rowCount();
     out.nodeColumnIdx = nodes;
     out.rows.reserve(nRows);
+
+    std::vector<const std::vector<double>*> nodeValues(nodes.size(), nullptr);
+    std::vector<std::vector<uint8_t>> nodeValidMasks;
+    nodeValidMasks.reserve(nodes.size());
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        const auto& col = data.columns()[nodes[i]];
+        const auto& vals = std::get<std::vector<double>>(col.values);
+        nodeValues[i] = &vals;
+        nodeValidMasks.push_back(buildValidMask(vals, col.missing, nRows));
+    }
+
     for (size_t r = 0; r < nRows; ++r) {
         std::vector<double> row;
         row.reserve(nodes.size());
         bool ok = true;
-        for (size_t idx : nodes) {
-            const auto& col = data.columns()[idx];
-            const auto& vals = std::get<std::vector<double>>(col.values);
-            if (r >= vals.size()) { ok = false; break; }
-            if (r < col.missing.size() && col.missing[r]) { ok = false; break; }
-            if (!std::isfinite(vals[r])) { ok = false; break; }
-            row.push_back(vals[r]);
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            if (!nodeValidMasks[i][r]) { ok = false; break; }
+            row.push_back((*nodeValues[i])[r]);
         }
         if (ok) out.rows.push_back(std::move(row));
     }
 
-    if (out.rows.size() < 30) {
+    if (out.rows.size() < kMinRowsForDirectionalScoring) {
         out.nodeColumnIdx.clear();
         out.rows.clear();
         return out;
@@ -582,10 +628,13 @@ DiscoveryCoreResult discoverCore(const std::vector<std::vector<double>>& rows,
     out.directed.assign(p, std::vector<bool>(p, false));
     out.undirected.assign(p, std::vector<bool>(p, false));
     out.sepsets.assign(p, std::vector<std::unordered_set<size_t>>(p));
+    out.ciEdgeStrength.assign(p, std::vector<double>(p, 0.0));
+    out.gesBicGain.assign(p, std::vector<double>(p, 0.0));
+    out.lingamSignal.assign(p, std::vector<double>(p, 0.0));
     std::unordered_map<std::string, CiTestResult> ciCache;
     ciCache.reserve(p * p * 4);
 
-    if (p < 3 || rows.size() < 30) return out;
+    if (p < 3 || rows.size() < kMinRowsForDirectionalScoring) return out;
 
     for (size_t i = 0; i < p; ++i) {
         for (size_t j = i + 1; j < p; ++j) {
@@ -597,6 +646,24 @@ DiscoveryCoreResult discoverCore(const std::vector<std::vector<double>>& rows,
 
     for (size_t level = 0; level <= options.maxConditionSet; ++level) {
         bool removedAny = false;
+
+        size_t testsAtLevel = 0;
+        for (size_t i = 0; i < p; ++i) {
+            for (size_t j = i + 1; j < p; ++j) {
+                if (!out.undirected[i][j]) continue;
+                std::vector<size_t> adjI;
+                for (size_t k = 0; k < p; ++k) {
+                    if (k == i || k == j) continue;
+                    if (out.undirected[i][k] || out.directed[i][k] || out.directed[k][i]) adjI.push_back(k);
+                }
+                if (adjI.size() < level) continue;
+                testsAtLevel += binomialCount(adjI.size(), level);
+            }
+        }
+        const double adjustedAlpha = (testsAtLevel > 0)
+            ? std::max(1e-8, options.alpha / static_cast<double>(testsAtLevel))
+            : options.alpha;
+
         for (size_t i = 0; i < p; ++i) {
             for (size_t j = i + 1; j < p; ++j) {
                 if (!out.undirected[i][j]) continue;
@@ -622,10 +689,15 @@ DiscoveryCoreResult discoverCore(const std::vector<std::vector<double>>& rows,
                     if (cacheIt != ciCache.end()) {
                         ci = cacheIt->second;
                     } else {
-                        ci = conditionalIndependenceTest(rows, i, j, cond, options.alpha,
+                        ci = conditionalIndependenceTest(rows, i, j, cond, adjustedAlpha,
                                                          options.enableKernelCiFallback,
                                                          rng);
                         ciCache.emplace(std::move(cacheKey), ci);
+                    }
+                    if (!ci.independent) {
+                        const double pStrength = 1.0 - std::min(1.0, ci.pValue / std::max(1e-12, adjustedAlpha));
+                        out.ciEdgeStrength[i][j] = std::max(out.ciEdgeStrength[i][j], pStrength);
+                        out.ciEdgeStrength[j][i] = std::max(out.ciEdgeStrength[j][i], pStrength);
                     }
                     if (!ci.independent) continue;
                     out.undirected[i][j] = false;
@@ -714,11 +786,19 @@ DiscoveryCoreResult discoverCore(const std::vector<std::vector<double>>& rows,
             const std::vector<size_t> order = directLingamOrder(rows);
             std::vector<size_t> pos(p, 0);
             for (size_t i = 0; i < order.size(); ++i) pos[order[i]] = i;
+            const double lingamConfidence = std::clamp((ng - 0.80) / 1.20, 0.0, 1.0);
             for (size_t i = 0; i < p; ++i) {
                 for (size_t j = i + 1; j < p; ++j) {
                     if (!out.undirected[i][j]) continue;
-                    if (pos[i] < pos[j]) orientEdge(out.directed, out.undirected, forbidden, i, j);
-                    else orientEdge(out.directed, out.undirected, forbidden, j, i);
+                    if (pos[i] < pos[j]) {
+                        if (orientEdge(out.directed, out.undirected, forbidden, i, j)) {
+                            out.lingamSignal[i][j] = std::max(out.lingamSignal[i][j], lingamConfidence);
+                        }
+                    } else {
+                        if (orientEdge(out.directed, out.undirected, forbidden, j, i)) {
+                            out.lingamSignal[j][i] = std::max(out.lingamSignal[j][i], lingamConfidence);
+                        }
+                    }
                 }
             }
             out.usedLiNGAM = true;
@@ -800,6 +880,8 @@ void applyGesOrientation(DiscoveryCoreResult& core,
     while (improved) {
         improved = false;
         double bestDelta = 0.0;
+        size_t bestFrom = static_cast<size_t>(-1);
+        size_t bestTo = static_cast<size_t>(-1);
         std::vector<std::vector<bool>> bestDirected = core.directed;
         std::vector<std::vector<bool>> bestUndirected = core.undirected;
 
@@ -821,6 +903,8 @@ void applyGesOrientation(DiscoveryCoreResult& core,
                     const double delta = currentScore - candScore;
                     if (delta > bestDelta + kBicTieThreshold) {
                         bestDelta = delta;
+                        bestFrom = from;
+                        bestTo = to;
                         bestDirected = std::move(directedCand);
                         bestUndirected = std::move(undirectedCand);
                     }
@@ -831,6 +915,9 @@ void applyGesOrientation(DiscoveryCoreResult& core,
         if (bestDelta > kBicTieThreshold) {
             core.directed = std::move(bestDirected);
             core.undirected = std::move(bestUndirected);
+            if (bestFrom != static_cast<size_t>(-1) && bestTo != static_cast<size_t>(-1)) {
+                core.gesBicGain[bestFrom][bestTo] += bestDelta;
+            }
             currentScore -= bestDelta;
             improved = true;
         }
@@ -841,6 +928,8 @@ void applyGesOrientation(DiscoveryCoreResult& core,
     while (improved) {
         improved = false;
         double bestDelta = 0.0;
+        size_t bestFrom = static_cast<size_t>(-1);
+        size_t bestTo = static_cast<size_t>(-1);
         std::vector<std::vector<bool>> bestDirected = core.directed;
 
         for (size_t from = 0; from < p; ++from) {
@@ -859,6 +948,8 @@ void applyGesOrientation(DiscoveryCoreResult& core,
                 const double delta = currentScore - candScore;
                 if (delta > bestDelta + kBicTieThreshold) {
                     bestDelta = delta;
+                    bestFrom = from;
+                    bestTo = to;
                     bestDirected = std::move(directedCand);
                 }
             }
@@ -866,6 +957,9 @@ void applyGesOrientation(DiscoveryCoreResult& core,
 
         if (bestDelta > kBicTieThreshold) {
             core.directed = std::move(bestDirected);
+            if (bestFrom != static_cast<size_t>(-1) && bestTo != static_cast<size_t>(-1)) {
+                core.gesBicGain[bestTo][bestFrom] += bestDelta;
+            }
             currentScore -= bestDelta;
             improved = true;
         }
@@ -909,14 +1003,21 @@ std::optional<double> grangerPValue(const TypedDataset& data,
 
     const auto& x = std::get<std::vector<double>>(data.columns()[fromCol].values);
     const auto& y = std::get<std::vector<double>>(data.columns()[toCol].values);
+    const auto& xMissing = data.columns()[fromCol].missing;
+    const auto& yMissing = data.columns()[toCol].missing;
     const size_t n = std::min({x.size(), y.size(), ts.axis.size()});
+
+    const std::vector<uint8_t> xMask = buildValidMask(x, xMissing, n);
+    const std::vector<uint8_t> yMask = buildValidMask(y, yMissing, n);
+    std::vector<uint8_t> tMask(n, static_cast<uint8_t>(0));
+    for (size_t i = 0; i < n; ++i) {
+        tMask[i] = std::isfinite(ts.axis[i]) ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+    }
 
     std::vector<std::array<double, 3>> obs;
     obs.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-        if (!std::isfinite(x[i]) || !std::isfinite(y[i]) || !std::isfinite(ts.axis[i])) continue;
-        if (i < data.columns()[fromCol].missing.size() && data.columns()[fromCol].missing[i]) continue;
-        if (i < data.columns()[toCol].missing.size() && data.columns()[toCol].missing[i]) continue;
+        if (!xMask[i] || !yMask[i] || !tMask[i]) continue;
         obs.push_back({ts.axis[i], x[i], y[i]});
     }
     if (obs.size() < 24) return std::nullopt;
@@ -974,14 +1075,21 @@ std::optional<double> icpStabilityScore(const TypedDataset& data,
     if (!ts.valid) return std::nullopt;
     const auto& x = std::get<std::vector<double>>(data.columns()[fromCol].values);
     const auto& y = std::get<std::vector<double>>(data.columns()[toCol].values);
+    const auto& xMissing = data.columns()[fromCol].missing;
+    const auto& yMissing = data.columns()[toCol].missing;
     const size_t n = std::min({x.size(), y.size(), ts.axis.size()});
+
+    const std::vector<uint8_t> xMask = buildValidMask(x, xMissing, n);
+    const std::vector<uint8_t> yMask = buildValidMask(y, yMissing, n);
+    std::vector<uint8_t> tMask(n, static_cast<uint8_t>(0));
+    for (size_t i = 0; i < n; ++i) {
+        tMask[i] = std::isfinite(ts.axis[i]) ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+    }
 
     std::vector<std::array<double, 3>> obs;
     obs.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-        if (!std::isfinite(x[i]) || !std::isfinite(y[i]) || !std::isfinite(ts.axis[i])) continue;
-        if (i < data.columns()[fromCol].missing.size() && data.columns()[fromCol].missing[i]) continue;
-        if (i < data.columns()[toCol].missing.size() && data.columns()[toCol].missing[i]) continue;
+        if (!xMask[i] || !yMask[i] || !tMask[i]) continue;
         obs.push_back({ts.axis[i], x[i], y[i]});
     }
     if (obs.size() < 30) return std::nullopt;
@@ -1199,8 +1307,34 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
             const double proxyScore = (grangerScore > 0.0 || icpScore > 0.0)
                 ? std::max(grangerScore, icpScore)
                 : 0.0;
-            double confidence = std::clamp(0.12 + 0.28 * absR + 0.30 * support +
-                                           0.22 * orientationMargin + 0.08 * proxyScore,
+
+            const double ciStrength = std::max(core.ciEdgeStrength[i][j], core.ciEdgeStrength[j][i]);
+            const double pcStrength = std::clamp(kPcBaseWeight * absR +
+                                                 0.25 * support +
+                                                 0.20 * orientationMargin +
+                                                 0.25 * ciStrength,
+                                                 0.0,
+                                                 1.0);
+
+            const double gesGain = core.gesBicGain[i][j];
+            const double gesReverseGain = core.gesBicGain[j][i];
+            const double gesDirectionShare = (gesGain > 0.0 || gesReverseGain > 0.0)
+                ? (gesGain / std::max(kComputationEpsilon, gesGain + gesReverseGain))
+                : 0.0;
+            const double gesMagnitude = std::clamp(std::log1p(std::max(0.0, gesGain)) / std::log1p(12.0), 0.0, 1.0);
+            const double gesStrength = gesDirectionShare * gesMagnitude;
+            const double lingamStrength = core.lingamSignal[i][j];
+
+            const double wPc = 0.55;
+            const double wGes = options.enableGES ? 0.25 : 0.0;
+            const double wLingam = core.usedLiNGAM ? 0.12 : 0.0;
+            const double wTemporal = (options.enableGrangerValidation || options.enableIcpValidation) ? 0.08 : 0.0;
+            const double wSum = std::max(kComputationEpsilon, wPc + wGes + wLingam + wTemporal);
+
+            double confidence = std::clamp((wPc * pcStrength +
+                                            wGes * gesStrength +
+                                            wLingam * lingamStrength +
+                                            wTemporal * proxyScore) / wSum,
                                            0.0,
                                            0.995);
             const bool latentHint = options.enableFCI && hasLikelyLatentConfounding(view.rows, i, j);
@@ -1221,6 +1355,8 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
                 confidence,
                 support,
                 "|r|=" + std::to_string(absR).substr(0, 5) +
+                    ", ci_strength=" + std::to_string(ciStrength).substr(0, 5) +
+                    ", ges_gain=" + std::to_string(gesGain).substr(0, 6) +
                     ", support=" + std::to_string(100.0 * support).substr(0, 5) +
                     "%" +
                     ", margin=" + std::to_string(100.0 * orientationMargin).substr(0, 5) + "%" +
@@ -1239,12 +1375,13 @@ CausalDiscoveryResult CausalDiscovery::discover(const TypedDataset& data,
     std::sort(result.edges.begin(), result.edges.end(), [](const auto& a, const auto& b) {
         return a.confidence > b.confidence;
     });
-    if (result.edges.size() > 12) result.edges.resize(12);
+    if (result.edges.size() > kMaxReportedEdges) result.edges.resize(kMaxReportedEdges);
 
     if (temporal.valid) {
         result.notes.push_back("Temporal axis detected for proxy intervention checks: " + temporal.axisName + ".");
     }
     result.notes.push_back("Constraint-based PC discovery executed with max conditioning set " + std::to_string(options.maxConditionSet) + ".");
+    result.notes.push_back("Bonferroni correction applied to conditional independence tests at each conditioning depth.");
     if (effectiveBootstrapSamples < options.bootstrapSamples) {
         result.notes.push_back("Bootstrap samples auto-capped for runtime at " + std::to_string(effectiveBootstrapSamples) +
                                " (requested " + std::to_string(options.bootstrapSamples) + ").");

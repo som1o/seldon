@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <ostream>
 #include <unordered_set>
 
 #if __has_include(<nlohmann/json.hpp>)
@@ -199,6 +200,39 @@ bool isValidColumnTypeOverride(const std::string& value) {
     return allowed.find(CommonUtils::toLower(CommonUtils::trim(value))) != allowed.end();
 }
 
+bool pathWithinRoot(const std::filesystem::path& root, const std::filesystem::path& candidate) {
+    std::error_code ec;
+    const std::filesystem::path rel = std::filesystem::relative(candidate, root, ec);
+    if (ec) return false;
+    if (rel.empty()) return true;
+    const std::string relStr = rel.generic_string();
+    if (relStr == ".") return true;
+    return !(relStr == ".." || relStr.rfind("../", 0) == 0);
+}
+
+std::string canonicalizeWorkspacePathOrThrow(const std::string& rawPath,
+                                             const std::string& fieldLabel,
+                                             bool requireRegularFile) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path workspaceRoot = fs::canonical(fs::current_path(), ec);
+    if (ec) {
+        throw Seldon::ConfigurationException("Unable to resolve workspace root for path validation");
+    }
+
+    const fs::path canonicalPath = fs::canonical(rawPath, ec);
+    if (ec) {
+        throw Seldon::ConfigurationException("Invalid or inaccessible " + fieldLabel + ": " + rawPath);
+    }
+    if (!pathWithinRoot(workspaceRoot, canonicalPath)) {
+        throw Seldon::ConfigurationException(fieldLabel + " must resolve inside workspace: " + rawPath);
+    }
+    if (requireRegularFile && !fs::is_regular_file(canonicalPath, ec)) {
+        throw Seldon::ConfigurationException(fieldLabel + " is not a regular file: " + rawPath);
+    }
+    return canonicalPath.string();
+}
+
 void applyProfile(AutoConfig& config, const std::string& profileRaw) {
     const std::string p = CommonUtils::toLower(CommonUtils::trim(profileRaw));
     if (p.empty() || p == StrategyKeys::kAuto) {
@@ -265,6 +299,26 @@ void applyLowMemoryDefaults(AutoConfig& config) {
     config.generateHtml = false;
 
     config.tuning.overallCorrHeatmapMaxColumns = std::min<size_t>(config.tuning.overallCorrHeatmapMaxColumns, 24);
+}
+
+void resolveProfileConflicts(AutoConfig& config) {
+    // Low-memory mode is authoritative for runtime safety and overrides heavy profile settings.
+    if (config.lowMemoryMode) {
+        config.profile = "quick";
+        config.fastMode = true;
+        config.neuralStrategy = std::string(StrategyKeys::kFast);
+        config.neuralImportanceMaxRows = std::min<size_t>(config.neuralImportanceMaxRows, 512);
+        config.neuralIntegratedGradSteps = std::min<size_t>(config.neuralIntegratedGradSteps, 8);
+        config.fastNeuralSampleRows = std::min<size_t>(config.fastNeuralSampleRows, 10000);
+        config.featureEngineeringMaxGeneratedColumns = std::min<size_t>(config.featureEngineeringMaxGeneratedColumns, 96);
+    }
+
+    if (config.profile == "thorough") {
+        config.fastMode = false;
+        if (config.neuralStrategy == StrategyKeys::kFast) {
+            config.neuralStrategy = std::string(StrategyKeys::kExpressive);
+        }
+    }
 }
 
 AutoConfig runInteractiveWizard() {
@@ -496,6 +550,7 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"neural_gradient_noise_decay", {&AutoConfig::neuralGradientNoiseDecay, 0.0}},
         {"neural_ema_decay", {&AutoConfig::neuralEmaDecay, 0.0}},
         {"neural_label_smoothing", {&AutoConfig::neuralLabelSmoothing, 0.0}},
+        {"neural_early_stopping_min_delta", {&AutoConfig::neuralEarlyStoppingMinDelta, 0.0}},
         {"neural_ood_z_threshold", {&AutoConfig::neuralOodZThreshold, 0.1}},
         {"neural_ood_distance_threshold", {&AutoConfig::neuralOodDistanceThreshold, 0.1}},
         {"neural_drift_psi_warning", {&AutoConfig::neuralDriftPsiWarning, 0.01}},
@@ -540,6 +595,10 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         {"scatter_fit_min_abs_corr", {&HeuristicTuningConfig::scatterFitMinAbsCorr, 0.0}},
         {"hybrid_explainability_weight_permutation", {&HeuristicTuningConfig::hybridExplainabilityWeightPermutation, 0.0}},
         {"hybrid_explainability_weight_integrated_gradients", {&HeuristicTuningConfig::hybridExplainabilityWeightIntegratedGradients, 0.0}},
+        {"stationarity_weak_mean_reversion_gamma", {&HeuristicTuningConfig::stationarityWeakMeanReversionGamma, -10.0}},
+        {"stationarity_not_significant_pvalue", {&HeuristicTuningConfig::stationarityNotSignificantPValue, 0.0}},
+        {"stationarity_sizable_drift_ratio", {&HeuristicTuningConfig::stationaritySizableDriftRatio, 0.0}},
+        {"lasso_min_abs_coefficient", {&HeuristicTuningConfig::lassoMinAbsCoefficient, 0.0}},
         {"gantt_duration_hours_threshold", {&HeuristicTuningConfig::ganttDurationHoursThreshold, 0.0}},
         {"lof_fallback_modified_z_threshold", {&HeuristicTuningConfig::lofFallbackModifiedZThreshold, 0.0}},
         {"lof_threshold_floor", {&HeuristicTuningConfig::lofThresholdFloor, 0.0}}
@@ -750,7 +809,7 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     }
 
     AutoConfig config;
-    config.datasetPath = argv[1];
+    config.datasetPath = canonicalizeWorkspacePathOrThrow(argv[1], "dataset path", true);
 
     std::string configPath;
     for (int i = 2; i < argc; ++i) {
@@ -874,6 +933,8 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
             config.neuralLabelSmoothing = parseDoubleStrict(argv[++i], "--neural-label-smoothing", 0.0);
         } else if (arg == "--neural-gradient-accumulation-steps" && i + 1 < argc) {
             config.neuralGradientAccumulationSteps = parseIntStrict(argv[++i], "--neural-gradient-accumulation-steps", 1);
+        } else if (arg == "--neural-early-stopping-min-delta" && i + 1 < argc) {
+            config.neuralEarlyStoppingMinDelta = parseDoubleStrict(argv[++i], "--neural-early-stopping-min-delta", 0.0);
         } else if (arg == "--neural-learning-rate" && i + 1 < argc) {
             config.neuralLearningRate = parseDoubleStrict(argv[++i], "--neural-learning-rate", 1e-8);
         } else if (arg == "--neural-min-layers" && i + 1 < argc) {
@@ -1035,13 +1096,14 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
     if (!configPath.empty()) {
         config = fromFile(configPath, config);
         // Positional dataset argument is authoritative for this run.
-        config.datasetPath = argv[1];
+        config.datasetPath = canonicalizeWorkspacePathOrThrow(argv[1], "dataset path", true);
     }
 
     applyProfile(config, config.profile);
     if (config.lowMemoryMode) {
         applyLowMemoryDefaults(config);
     }
+    resolveProfileConflicts(config);
 
     config.validate();
 
@@ -1050,22 +1112,23 @@ AutoConfig AutoConfig::fromArgs(int argc, char* argv[]) {
 
 AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig& base) {
     AutoConfig config = base;
+    const std::string safeConfigPath = canonicalizeWorkspacePathOrThrow(configPath, "config path", true);
 
 #ifdef SELDON_HAS_NLOHMANN_JSON
     {
-        const std::string ext = CommonUtils::toLower(std::filesystem::path(configPath).extension().string());
+        const std::string ext = CommonUtils::toLower(std::filesystem::path(safeConfigPath).extension().string());
         if (ext == ".json") {
-            if (parseStructuredJsonConfig(configPath, config)) {
+            if (parseStructuredJsonConfig(safeConfigPath, config)) {
                 config.validate();
                 return config;
             }
-            throw Seldon::ConfigurationException("Failed to parse JSON config file: " + configPath);
+            throw Seldon::ConfigurationException("Failed to parse JSON config file: " + safeConfigPath);
         }
     }
 #endif
 
-    std::ifstream in(configPath);
-    if (!in) throw Seldon::ConfigurationException("Could not open config file: " + configPath);
+    std::ifstream in(safeConfigPath);
+    if (!in) throw Seldon::ConfigurationException("Could not open config file: " + safeConfigPath);
 
     std::string line;
     size_t lineNo = 0;
@@ -1092,6 +1155,63 @@ AutoConfig AutoConfig::fromFile(const std::string& configPath, const AutoConfig&
     config.validate();
 
     return config;
+}
+
+std::string AutoConfig::describeParams() {
+    std::ostringstream out;
+    out << "Seldon Hyperparameter Reference\n";
+    out << "\n";
+    out << "Neural Training\n";
+    out << "  --neural-learning-rate: Optimizer step size (>0).\n";
+    out << "  --gradient-clip: Global gradient clipping norm.\n";
+    out << "  --neural-optimizer: sgd|adam|lookahead.\n";
+    out << "  --neural-lookahead-fast-optimizer: sgd|adam (inner optimizer).\n";
+    out << "  --neural-lookahead-sync-period: Lookahead sync frequency.\n";
+    out << "  --neural-lookahead-alpha: Slow weight interpolation factor [0..1].\n";
+    out << "  --neural-use-batch-norm / --neural-use-layer-norm: Toggle normalization.\n";
+    out << "  --neural-batch-norm-momentum / --neural-layer-norm-epsilon: Norm stability knobs.\n";
+    out << "  --neural-lr-decay / --neural-lr-warmup-epochs / --neural-use-cosine-annealing / --neural-use-cyclical-lr.\n";
+    out << "  --neural-lr-cycle-epochs / --neural-lr-schedule-min-factor / --neural-min-learning-rate.\n";
+    out << "  --neural-lr-plateau-patience / --neural-lr-cooldown-epochs / --neural-max-lr-reductions.\n";
+    out << "  --neural-use-validation-loss-ema / --neural-validation-loss-ema-beta.\n";
+    out << "  --neural-use-adaptive-gradient-clipping / --neural-adaptive-clip-beta / --neural-adaptive-clip-multiplier / --neural-adaptive-clip-min.\n";
+    out << "  --neural-gradient-noise-std / --neural-gradient-noise-decay.\n";
+    out << "  --neural-use-ema-weights / --neural-ema-decay.\n";
+    out << "  --neural-label-smoothing / --neural-gradient-accumulation-steps.\n";
+    out << "  --neural-early-stopping-min-delta.\n";
+    out << "\n";
+    out << "Neural Architecture\n";
+    out << "  --neural-min-layers / --neural-max-layers / --neural-fixed-layers.\n";
+    out << "  --neural-fixed-hidden-nodes / --neural-max-hidden-nodes.\n";
+    out << "  --neural-max-topology-nodes / --neural-max-trainable-params.\n";
+    out << "  --neural-max-one-hot-per-column: Cardinality cap for categorical one-hot.\n";
+    out << "  --neural-categorical-input-l2-boost: Extra regularization for encoded categoricals.\n";
+    out << "\n";
+    out << "Streaming and Explainability\n";
+    out << "  --neural-streaming-mode / --neural-streaming-chunk-rows.\n";
+    out << "  --neural-explainability: permutation|integrated_gradients|hybrid.\n";
+    out << "  --neural-integrated-grad-steps / --neural-importance-max-rows / --neural-importance-trials / --neural-importance-parallel.\n";
+    out << "  --neural-uncertainty-samples / --neural-ensemble-members / --neural-ensemble-probe-rows / --neural-ensemble-probe-epochs.\n";
+    out << "\n";
+    out << "OOD and Drift\n";
+    out << "  --neural-ood-enabled / --neural-ood-z-threshold / --neural-ood-distance-threshold.\n";
+    out << "  --neural-drift-psi-warning / --neural-drift-psi-critical.\n";
+    out << "\n";
+    out << "Heuristics and Feature Policy\n";
+    out << "  --target-strategy / --feature-strategy / --neural-strategy / --bivariate-strategy.\n";
+    out << "  --max-feature-missing-ratio / --feature-min-variance / --feature-leakage-corr-threshold.\n";
+    out << "  --significance-alpha / --bivariate-selection-quantile / --tier3-fallback-aggressiveness.\n";
+    out << "\n";
+    out << "Preprocessing and Outliers\n";
+    out << "  --outlier-method: iqr|zscore|modified_zscore|adjusted_boxplot|lof.\n";
+    out << "  --outlier-action: flag|remove|cap.\n";
+    out << "  --scaling: auto|zscore|minmax|none.\n";
+    out << "  --type <column>:<numeric|categorical|datetime> / impute.<column>=<strategy>.\n";
+    out << "\n";
+    out << "Runtime and Fast Mode\n";
+    out << "  --fast / --low-memory / --fast-max-bivariate-pairs / --fast-neural-sample-rows.\n";
+    out << "  --benchmark-mode / --kfold / --benchmark-seed / --neural-seed.\n";
+    return out.str();
 }
 
 void HeuristicTuningConfig::validate() const {
@@ -1127,6 +1247,15 @@ void HeuristicTuningConfig::validate() const {
                                    hybridExplainabilityWeightIntegratedGradients;
     if (hybridWeightSum <= 0.0) {
         throw Seldon::ConfigurationException("hybrid explainability weights must sum to > 0");
+    }
+    if (stationarityNotSignificantPValue <= 0.0 || stationarityNotSignificantPValue >= 1.0) {
+        throw Seldon::ConfigurationException("stationarity_not_significant_pvalue must be within (0,1)");
+    }
+    if (stationaritySizableDriftRatio < 0.0) {
+        throw Seldon::ConfigurationException("stationarity_sizable_drift_ratio must be >= 0");
+    }
+    if (lassoMinAbsCoefficient < 0.0) {
+        throw Seldon::ConfigurationException("lasso_min_abs_coefficient must be >= 0");
     }
     if (betaFallbackIntervalsStart > betaFallbackIntervalsMax) {
         throw Seldon::ConfigurationException("beta_fallback_intervals_start must be <= beta_fallback_intervals_max");
@@ -1281,6 +1410,9 @@ void AutoConfig::validate() const {
     }
     if (neuralGradientNoiseDecay < 0.0 || neuralGradientNoiseDecay > 1.0) {
         throw Seldon::ConfigurationException("neural_gradient_noise_decay must be within [0,1]");
+    }
+    if (neuralEarlyStoppingMinDelta < 0.0) {
+        throw Seldon::ConfigurationException("neural_early_stopping_min_delta must be >= 0");
     }
     if (neuralEmaDecay < 0.0 || neuralEmaDecay >= 1.0) {
         throw Seldon::ConfigurationException("neural_ema_decay must be within [0,1)");

@@ -12,12 +12,14 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <spawn.h>
 #include <sstream>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <vector>
 
 extern char** environ;
 
@@ -724,13 +726,99 @@ int spawnGnuplot(const std::string& executable,
     ::close(errFd);
 
     if (spawnRc != 0 || pid <= 0) return -1;
+    return static_cast<int>(pid);
+}
 
-    int status = 0;
-    if (::waitpid(pid, &status, 0) < 0) return -1;
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    return -1;
+struct PlotSpawnJob {
+    pid_t pid = -1;
+    std::string safeId;
+    std::string dataFile;
+    std::string scriptFile;
+    std::string outputFile;
+    std::string errFile;
+    std::string cacheHashFile;
+    std::string cacheKey;
+};
+
+constexpr size_t kMaxConcurrentGnuplotJobs = 4;
+std::mutex gPlotSpawnMutex;
+std::vector<PlotSpawnJob> gActivePlotJobs;
+
+bool finalizePlotJob(const PlotSpawnJob& job, int status) {
+    std::error_code ec;
+    std::filesystem::remove(job.dataFile, ec);
+    std::filesystem::remove(job.scriptFile, ec);
+
+    const bool exited = WIFEXITED(status);
+    const int rc = exited ? WEXITSTATUS(status) : -1;
+    if (rc != 0 || !std::filesystem::exists(job.outputFile)) {
+        std::ifstream errIn(job.errFile);
+        std::string firstLine;
+        std::getline(errIn, firstLine);
+        if (!firstLine.empty()) {
+            std::cerr << "[Seldon][Plot] Generation failed for id='" << job.safeId
+                      << "' rc=" << rc
+                      << " output='" << job.outputFile
+                      << "' stderr='" << firstLine << "' full_log='" << job.errFile << "'\n";
+        } else {
+            std::cerr << "[Seldon][Plot] Generation failed for id='" << job.safeId
+                      << "' rc=" << rc
+                      << " output='" << job.outputFile
+                      << "' full_log='" << job.errFile << "'\n";
+        }
+        return false;
+    }
+
+    std::filesystem::remove(job.errFile, ec);
+    std::ofstream hout(job.cacheHashFile);
+    if (hout) {
+        hout << job.cacheKey;
+        hout.flush();
+        if (!hout.good()) {
+            std::cerr << "[Seldon][Plot] Failed to flush cache hash file: '" << job.cacheHashFile << "'\n";
+        }
+    }
+    return true;
+}
+
+void reapPlotJobs(bool blockUntilOne) {
+    bool reapedAny = false;
+    while (true) {
+        int status = 0;
+        const int waitFlags = blockUntilOne && !reapedAny ? 0 : WNOHANG;
+        const pid_t pid = ::waitpid(-1, &status, waitFlags);
+        if (pid <= 0) break;
+
+        PlotSpawnJob finished;
+        {
+            std::lock_guard<std::mutex> lock(gPlotSpawnMutex);
+            auto it = std::find_if(gActivePlotJobs.begin(), gActivePlotJobs.end(),
+                                   [&](const PlotSpawnJob& job) { return job.pid == pid; });
+            if (it != gActivePlotJobs.end()) {
+                finished = *it;
+                gActivePlotJobs.erase(it);
+            }
+        }
+        if (finished.pid > 0) {
+            finalizePlotJob(finished, status);
+        }
+        reapedAny = true;
+        if (blockUntilOne) break;
+    }
 }
 } // namespace
+
+GnuplotEngine::~GnuplotEngine() {
+    while (true) {
+        size_t pending = 0;
+        {
+            std::lock_guard<std::mutex> lock(gPlotSpawnMutex);
+            pending = gActivePlotJobs.size();
+        }
+        if (pending == 0) break;
+        reapPlotJobs(true);
+    }
+}
 
 std::string GnuplotEngine::sanitizeId(const std::string& id) {
     std::string out = id;
@@ -807,7 +895,7 @@ bool GnuplotEngine::isAvailable() const {
     return !findExecutableInPath("gnuplot").empty();
 }
 
-std::string GnuplotEngine::runScript(const std::string& id, const std::string& dataContent, const std::string& scriptContent) {
+std::string GnuplotEngine::runScript(const std::string& id, const std::string& dataContent, const std::string& scriptContent) const {
     static const std::string gnuplotExeCached = findExecutableInPath("gnuplot");
     if (gnuplotExeCached.empty()) {
         return "";
@@ -820,12 +908,21 @@ std::string GnuplotEngine::runScript(const std::string& id, const std::string& d
     const std::string errFile = assetsDir_ + "/" + safeId + ".err.log";
     const std::string cacheHashFile = assetsDir_ + "/.plot_cache/" + safeId + ".hash";
 
-    const std::string combined = dataContent + "\n@@\n" + scriptContent +
-        "\nfmt=" + cfg_.format +
-        "\ntheme=" + cfg_.theme +
-        "\ngrid=" + std::string(cfg_.showGrid ? "1" : "0") +
-        "\nlineWidth=" + std::to_string(cfg_.lineWidth) +
-        "\npointSize=" + std::to_string(cfg_.pointSize);
+    std::string combined;
+    combined.reserve(dataContent.size() + scriptContent.size() + cfg_.format.size() + cfg_.theme.size() + 96);
+    combined.append(dataContent);
+    combined.append("\n@@\n");
+    combined.append(scriptContent);
+    combined.append("\nfmt=");
+    combined.append(cfg_.format);
+    combined.append("\ntheme=");
+    combined.append(cfg_.theme);
+    combined.append("\ngrid=");
+    combined.append(cfg_.showGrid ? "1" : "0");
+    combined.append("\nlineWidth=");
+    combined.append(std::to_string(cfg_.lineWidth));
+    combined.append("\npointSize=");
+    combined.append(std::to_string(cfg_.pointSize));
     const uint64_t h1 = fnv1a64(combined);
     const uint64_t h2 = fnv1a64(std::string(combined.rbegin(), combined.rend()));
     const std::string cacheKey = toHex(h1) + ":" + toHex(h2) + ":" + std::to_string(combined.size());
@@ -856,42 +953,25 @@ std::string GnuplotEngine::runScript(const std::string& id, const std::string& d
     if (!sout.good()) return "";
     sout.close();
 
-    const int rc = spawnGnuplot(gnuplotExeCached, scriptFile, errFile);
+    reapPlotJobs(false);
+    const int spawnPid = spawnGnuplot(gnuplotExeCached, scriptFile, errFile);
+    if (spawnPid <= 0) return "";
 
-    std::error_code ec;
-    std::filesystem::remove(dataFile, ec);
-    std::filesystem::remove(scriptFile, ec);
-
-    if (rc != 0 || !std::filesystem::exists(outputFile)) {
-        std::ifstream errIn(errFile);
-        std::string firstLine;
-        std::getline(errIn, firstLine);
-        if (!firstLine.empty()) {
-            std::cerr << "[Seldon][Plot] Generation failed for id='" << safeId
-                      << "' rc=" << rc
-                      << " output='" << outputFile
-                      << "' stderr='" << firstLine << "' full_log='" << errFile << "'\n";
-        } else {
-            std::cerr << "[Seldon][Plot] Generation failed for id='" << safeId
-                      << "' rc=" << rc
-                      << " output='" << outputFile
-                      << "' full_log='" << errFile << "'\n";
-        }
-        return "";
+    {
+        std::lock_guard<std::mutex> lock(gPlotSpawnMutex);
+        gActivePlotJobs.push_back(PlotSpawnJob{
+            static_cast<pid_t>(spawnPid), safeId, dataFile, scriptFile, outputFile, errFile, cacheHashFile, cacheKey
+        });
     }
 
-    std::filesystem::remove(errFile, ec);
-    std::ofstream hout(cacheHashFile);
-    if (hout) {
-        hout << cacheKey;
-        hout.flush();
-        if (!hout.good()) {
-            std::cerr << "[Seldon][Plot] Failed to flush cache hash file: '" << cacheHashFile << "'\n";
+    while (true) {
+        size_t pending = 0;
+        {
+            std::lock_guard<std::mutex> lock(gPlotSpawnMutex);
+            pending = gActivePlotJobs.size();
         }
-        hout.close();
-        if (!hout) {
-            std::cerr << "[Seldon][Plot] Failed to close cache hash file cleanly: '" << cacheHashFile << "'\n";
-        }
+        if (pending < kMaxConcurrentGnuplotJobs) break;
+        reapPlotJobs(true);
     }
 
     return outputFile;

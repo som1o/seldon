@@ -60,8 +60,9 @@ NeuralScalar DenseLayer::activate(NeuralScalar x, NeuralActivation activation) {
         case NeuralActivation::GELU: {
             constexpr NeuralScalar kInvSqrtPi = static_cast<NeuralScalar>(0.7978845608028654); // sqrt(2/pi)
             const NeuralScalar c = kInvSqrtPi;
-            const NeuralScalar x3 = x * x * x;
-            const NeuralScalar inner = c * (x + static_cast<NeuralScalar>(0.044715) * x3);
+            const NeuralScalar xClamped = std::clamp(x, static_cast<NeuralScalar>(-10.0), static_cast<NeuralScalar>(10.0));
+            const NeuralScalar x3 = xClamped * xClamped * xClamped;
+            const NeuralScalar inner = c * (xClamped + static_cast<NeuralScalar>(0.044715) * x3);
             return static_cast<NeuralScalar>(0.5) * x * (static_cast<NeuralScalar>(1.0) + static_cast<NeuralScalar>(std::tanh(inner)));
         }
         case NeuralActivation::TANH: return static_cast<NeuralScalar>(std::tanh(x));
@@ -80,9 +81,10 @@ NeuralScalar DenseLayer::activateDerivativeFromInput(NeuralScalar x, NeuralActiv
         case NeuralActivation::GELU: {
             constexpr NeuralScalar kInvSqrtPi = static_cast<NeuralScalar>(0.7978845608028654); // sqrt(2/pi)
             const NeuralScalar c = kInvSqrtPi;
-            const NeuralScalar x2 = x * x;
-            const NeuralScalar x3 = x2 * x;
-            const NeuralScalar inner = c * (x + static_cast<NeuralScalar>(0.044715) * x3);
+            const NeuralScalar xClamped = std::clamp(x, static_cast<NeuralScalar>(-10.0), static_cast<NeuralScalar>(10.0));
+            const NeuralScalar x2 = xClamped * xClamped;
+            const NeuralScalar x3 = x2 * xClamped;
+            const NeuralScalar inner = c * (xClamped + static_cast<NeuralScalar>(0.044715) * x3);
             const NeuralScalar t = static_cast<NeuralScalar>(std::tanh(inner));
             const NeuralScalar sech2 = static_cast<NeuralScalar>(1.0) - t * t;
             const NeuralScalar innerPrime = c * (static_cast<NeuralScalar>(1.0) + static_cast<NeuralScalar>(0.134145) * x2);
@@ -142,6 +144,7 @@ void DenseLayer::forward(const DenseLayer& prev,
         if (useBatchNorm) {
             const NeuralScalar clippedMomentum = static_cast<NeuralScalar>(std::clamp(batchNormMomentum, 0.0, 0.9999));
             const NeuralScalar eps = static_cast<NeuralScalar>(std::max(batchNormEpsilon, 1e-12));
+            const bool hasRunningStats = m_bnStepsAccumulated > 0;
             if (isTraining) {
                 const NeuralScalar oldRunningMean = m_bnRunningMean[n];
                 m_bnRunningMean[n] = clippedMomentum * oldRunningMean + (static_cast<NeuralScalar>(1.0) - clippedMomentum) * activationInput;
@@ -149,11 +152,15 @@ void DenseLayer::forward(const DenseLayer& prev,
                 m_bnRunningVar[n] = clippedMomentum * m_bnRunningVar[n] + (static_cast<NeuralScalar>(1.0) - clippedMomentum) * (centered * centered);
             }
 
-            const NeuralScalar var = std::max(m_bnRunningVar[n], static_cast<NeuralScalar>(0.0));
-            const NeuralScalar invStd = static_cast<NeuralScalar>(1.0 / std::sqrt(static_cast<double>(var + eps)));
-            const NeuralScalar normalized = (activationInput - m_bnRunningMean[n]) * invStd;
-            activationInput = m_bnGamma[n] * normalized + m_bnBeta[n];
-            m_bnBackpropScale[n] = m_bnGamma[n] * invStd;
+            if (isTraining || hasRunningStats) {
+                const NeuralScalar var = std::max(m_bnRunningVar[n], static_cast<NeuralScalar>(0.0));
+                const NeuralScalar invStd = static_cast<NeuralScalar>(1.0 / std::sqrt(static_cast<double>(var + eps)));
+                const NeuralScalar normalized = (activationInput - m_bnRunningMean[n]) * invStd;
+                activationInput = m_bnGamma[n] * normalized + m_bnBeta[n];
+                m_bnBackpropScale[n] = m_bnGamma[n] * invStd;
+            } else {
+                m_bnBackpropScale[n] = static_cast<NeuralScalar>(1.0);
+            }
         } else {
             m_bnBackpropScale[n] = static_cast<NeuralScalar>(1.0);
         }
@@ -203,6 +210,10 @@ void DenseLayer::forward(const DenseLayer& prev,
     } else {
         std::fill(m_dropMask.begin(), m_dropMask.end(), static_cast<uint8_t>(0));
         std::fill(m_dropoutScale.begin(), m_dropoutScale.end(), static_cast<NeuralScalar>(1.0));
+    }
+
+    if (useBatchNorm && isTraining && m_size > 0) {
+        ++m_bnStepsAccumulated;
     }
 }
 
@@ -277,23 +288,39 @@ void DenseLayer::updateParameters(const DenseLayer& prev,
         }
 
         const size_t weightOffset = n * m_prevSize;
-        #ifdef USE_OPENMP
-        #pragma omp simd
-        #endif
-        for (size_t pn = 0; pn < m_prevSize; ++pn) {
-            NeuralScalar gradW = m_gradients[n] * prev.outputs()[pn];
-            const NeuralScalar l2Scale = (inputL2Scales != nullptr && pn < inputL2Scales->size())
-                ? std::max(0.0, (*inputL2Scales)[pn])
-                : 1.0;
-            gradW += static_cast<NeuralScalar>(l2Lambda * static_cast<double>(l2Scale)) * m_weights[weightOffset + pn];
-
-            if (optimizer == NeuralOptimizer::ADAM) {
+        if (optimizer == NeuralOptimizer::ADAM) {
+            #ifdef USE_OPENMP
+            #pragma omp simd
+            #endif
+            for (size_t pn = 0; pn < m_prevSize; ++pn) {
+                NeuralScalar gradW = m_gradients[n] * prev.outputs()[pn];
+                const NeuralScalar l2Scale = (inputL2Scales != nullptr && pn < inputL2Scales->size())
+                    ? std::max(0.0, (*inputL2Scales)[pn])
+                    : 1.0;
+                gradW += static_cast<NeuralScalar>(l2Lambda * static_cast<double>(l2Scale)) * m_weights[weightOffset + pn];
                 m_mWeights[weightOffset + pn] = beta1 * m_mWeights[weightOffset + pn] + (1.0 - beta1) * gradW;
                 m_vWeights[weightOffset + pn] = beta2 * m_vWeights[weightOffset + pn] + (1.0 - beta2) * gradW * gradW;
+            }
+
+            #ifdef USE_OPENMP
+            #pragma omp simd
+            #endif
+            for (size_t pn = 0; pn < m_prevSize; ++pn) {
                 const NeuralScalar mHat = m_mWeights[weightOffset + pn] / beta1_t;
                 const NeuralScalar vHat = m_vWeights[weightOffset + pn] / beta2_t;
-                m_weights[weightOffset + pn] -= static_cast<NeuralScalar>(learningRate) * (mHat / (static_cast<NeuralScalar>(std::sqrt(static_cast<double>(vHat))) + epsilon));
-            } else {
+                m_weights[weightOffset + pn] -= static_cast<NeuralScalar>(learningRate) *
+                    (mHat / (static_cast<NeuralScalar>(std::sqrt(static_cast<double>(vHat))) + epsilon));
+            }
+        } else {
+            #ifdef USE_OPENMP
+            #pragma omp simd
+            #endif
+            for (size_t pn = 0; pn < m_prevSize; ++pn) {
+                NeuralScalar gradW = m_gradients[n] * prev.outputs()[pn];
+                const NeuralScalar l2Scale = (inputL2Scales != nullptr && pn < inputL2Scales->size())
+                    ? std::max(0.0, (*inputL2Scales)[pn])
+                    : 1.0;
+                gradW += static_cast<NeuralScalar>(l2Lambda * static_cast<double>(l2Scale)) * m_weights[weightOffset + pn];
                 m_weights[weightOffset + pn] -= static_cast<NeuralScalar>(learningRate) * gradW;
             }
         }
@@ -332,23 +359,39 @@ void DenseLayer::updateParametersAccumulated(double learningRate,
         }
 
         const size_t weightOffset = n * m_prevSize;
-        #ifdef USE_OPENMP
-        #pragma omp simd
-        #endif
-        for (size_t pn = 0; pn < m_prevSize; ++pn) {
-            NeuralScalar gradW = gradWeightAccum[weightOffset + pn];
-            const NeuralScalar l2Scale = (inputL2Scales != nullptr && pn < inputL2Scales->size())
-                ? std::max(0.0, (*inputL2Scales)[pn])
-                : 1.0;
-            gradW += static_cast<NeuralScalar>(l2Lambda * static_cast<double>(l2Scale)) * m_weights[weightOffset + pn];
-
-            if (optimizer == NeuralOptimizer::ADAM) {
+        if (optimizer == NeuralOptimizer::ADAM) {
+            #ifdef USE_OPENMP
+            #pragma omp simd
+            #endif
+            for (size_t pn = 0; pn < m_prevSize; ++pn) {
+                NeuralScalar gradW = gradWeightAccum[weightOffset + pn];
+                const NeuralScalar l2Scale = (inputL2Scales != nullptr && pn < inputL2Scales->size())
+                    ? std::max(0.0, (*inputL2Scales)[pn])
+                    : 1.0;
+                gradW += static_cast<NeuralScalar>(l2Lambda * static_cast<double>(l2Scale)) * m_weights[weightOffset + pn];
                 m_mWeights[weightOffset + pn] = beta1 * m_mWeights[weightOffset + pn] + (1.0 - beta1) * gradW;
                 m_vWeights[weightOffset + pn] = beta2 * m_vWeights[weightOffset + pn] + (1.0 - beta2) * gradW * gradW;
+            }
+
+            #ifdef USE_OPENMP
+            #pragma omp simd
+            #endif
+            for (size_t pn = 0; pn < m_prevSize; ++pn) {
                 const NeuralScalar mHat = m_mWeights[weightOffset + pn] / std::max(static_cast<NeuralScalar>(1e-12), beta1_t);
                 const NeuralScalar vHat = m_vWeights[weightOffset + pn] / std::max(static_cast<NeuralScalar>(1e-12), beta2_t);
-                m_weights[weightOffset + pn] -= static_cast<NeuralScalar>(learningRate) * (mHat / (static_cast<NeuralScalar>(std::sqrt(static_cast<double>(vHat))) + epsilon));
-            } else {
+                m_weights[weightOffset + pn] -= static_cast<NeuralScalar>(learningRate) *
+                    (mHat / (static_cast<NeuralScalar>(std::sqrt(static_cast<double>(vHat))) + epsilon));
+            }
+        } else {
+            #ifdef USE_OPENMP
+            #pragma omp simd
+            #endif
+            for (size_t pn = 0; pn < m_prevSize; ++pn) {
+                NeuralScalar gradW = gradWeightAccum[weightOffset + pn];
+                const NeuralScalar l2Scale = (inputL2Scales != nullptr && pn < inputL2Scales->size())
+                    ? std::max(0.0, (*inputL2Scales)[pn])
+                    : 1.0;
+                gradW += static_cast<NeuralScalar>(l2Lambda * static_cast<double>(l2Scale)) * m_weights[weightOffset + pn];
                 m_weights[weightOffset + pn] -= static_cast<NeuralScalar>(learningRate) * gradW;
             }
         }

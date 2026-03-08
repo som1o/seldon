@@ -29,6 +29,10 @@ RuntimeConfig& runtimeConfig() {
     return cfg;
 }
 
+const RuntimeConfig& resolvedRuntimeConfig(const RuntimeConfig* cfgOverride = nullptr) {
+    return cfgOverride ? *cfgOverride : runtimeConfig();
+}
+
 double clamp01(double v) {
     if (v < 0.0) return 0.0;
     if (v > 1.0) return 1.0;
@@ -53,8 +57,8 @@ double midpointIntegrateBetaRegularized(double a, double b, double x, size_t int
     return clamp01(sum * h);
 }
 
-double midpointIntegrateBetaAdaptive(double a, double b, double x) {
-    const RuntimeConfig& cfg = runtimeConfig();
+double midpointIntegrateBetaAdaptive(double a, double b, double x, const RuntimeConfig* cfgOverride = nullptr) {
+    const RuntimeConfig& cfg = resolvedRuntimeConfig(cfgOverride);
     size_t startIntervals = std::max<size_t>(256, cfg.betaFallbackIntervalsStart);
     size_t maxIntervals = std::max(startIntervals, cfg.betaFallbackIntervalsMax);
 
@@ -114,7 +118,8 @@ std::pair<double, bool> betaContinuedFraction(double a, double b, double x) {
 bool solveUpperTriangular(const MathUtils::Matrix& R,
                           size_t n,
                           const std::vector<double>& b,
-                          std::vector<double>& x) {
+                          std::vector<double>& x,
+                          const RuntimeConfig* cfgOverride = nullptr) {
     if (b.size() != n) return false;
     x.assign(n, 0.0);
     for (size_t i = n; i-- > 0;) {
@@ -123,7 +128,7 @@ bool solveUpperTriangular(const MathUtils::Matrix& R,
             rhs -= R.data[i][j] * x[j];
         }
         const double diag = R.data[i][i];
-        if (std::abs(diag) <= runtimeConfig().numericEpsilon) return false;
+        if (std::abs(diag) <= resolvedRuntimeConfig(cfgOverride).numericEpsilon) return false;
         x[i] = rhs / diag;
     }
     return true;
@@ -132,7 +137,8 @@ bool solveUpperTriangular(const MathUtils::Matrix& R,
 bool solveLowerFromUpperTranspose(const MathUtils::Matrix& R,
                                   size_t n,
                                   const std::vector<double>& b,
-                                  std::vector<double>& x) {
+                                  std::vector<double>& x,
+                                  const RuntimeConfig* cfgOverride = nullptr) {
     if (b.size() != n) return false;
     x.assign(n, 0.0);
     for (size_t i = 0; i < n; ++i) {
@@ -141,7 +147,7 @@ bool solveLowerFromUpperTranspose(const MathUtils::Matrix& R,
             rhs -= R.data[j][i] * x[j];
         }
         const double diag = R.data[i][i];
-        if (std::abs(diag) <= runtimeConfig().numericEpsilon) return false;
+        if (std::abs(diag) <= resolvedRuntimeConfig(cfgOverride).numericEpsilon) return false;
         x[i] = rhs / diag;
     }
     return true;
@@ -720,6 +726,10 @@ std::vector<double> MathUtils::multipleLinearRegression(const Matrix& X, const M
         return std::vector<double>();
     }
     return beta;
+}
+
+std::vector<double> MathUtils::multipleLinearRegression(Matrix&& X, Matrix&& Y) {
+    return multipleLinearRegression(static_cast<const Matrix&>(X), static_cast<const Matrix&>(Y));
 }
 
 MLRDiagnostics MathUtils::performMLRWithDiagnostics(const Matrix& X, const Matrix& Y) {

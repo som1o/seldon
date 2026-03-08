@@ -33,102 +33,38 @@ using MissingMask = ::MissingMask;
 
 constexpr double kNumericEpsilon = 1e-12;
 constexpr double kNeighborDistanceFloor = 1e-9;
+constexpr size_t kMinCorrelationSampleCount = 12;
+constexpr double kBinaryTolerance = 1e-9;
+constexpr double kDerivedFeatureCorrelationFloor = 0.05;
 constexpr double kModifiedZScaleFactor = 0.6745;
 constexpr double kMatrixCompletionBlend = 0.5;
 std::recursive_mutex gImputationCrossColumnMutex;
 
-enum class UnitSemanticKind {
-    UNKNOWN,
-    CURRENCY,
-    PERCENT,
-    RATIO,
-    RATE,
-    COUNT,
-    DURATION,
-    DISTANCE,
-    MASS,
-    VOLUME,
-    TEMPERATURE,
-    SCORE
-};
-
-UnitSemanticKind inferUnitSemanticKind(const std::string& name) {
-    const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
-    if (lower.empty()) return UnitSemanticKind::UNKNOWN;
-
-    auto hasAny = [&](std::initializer_list<const char*> tokens) {
-        for (const char* token : tokens) {
-            if (lower.find(token) != std::string::npos) return true;
-        }
-        return false;
-    };
-
-    if (hasAny({"price", "cost", "revenue", "salary", "income", "expense", "budget", "usd", "eur", "gbp", "jpy", "amount", "payment"})) {
-        return UnitSemanticKind::CURRENCY;
-    }
-    if (hasAny({"percent", "percentage", "pct", "%"})) {
-        return UnitSemanticKind::PERCENT;
-    }
-    if (hasAny({"ratio"})) {
-        return UnitSemanticKind::RATIO;
-    }
-    if (hasAny({"rate", "per_", "per ", "/"})) {
-        return UnitSemanticKind::RATE;
-    }
-    if (hasAny({"count", "qty", "quantity", "num", "number", "users", "cases", "population", "clicks", "visits"})) {
-        return UnitSemanticKind::COUNT;
-    }
-    if (hasAny({"duration", "latency", "time", "seconds", "second", "minutes", "minute", "hours", "hour", "days", "day", "ms"})) {
-        return UnitSemanticKind::DURATION;
-    }
-    if (hasAny({"distance", "km", "kilometer", "mile", "meter", "meters", "miles"})) {
-        return UnitSemanticKind::DISTANCE;
-    }
-    if (hasAny({"weight", "mass", "kg", "kilogram", "lb", "pound", "grams", "gram"})) {
-        return UnitSemanticKind::MASS;
-    }
-    if (hasAny({"volume", "litre", "liter", "ml", "gallon"})) {
-        return UnitSemanticKind::VOLUME;
-    }
-    if (hasAny({"temp", "temperature", "celsius", "fahrenheit", "kelvin"})) {
-        return UnitSemanticKind::TEMPERATURE;
-    }
-    if (hasAny({"score", "index", "rating"})) {
-        return UnitSemanticKind::SCORE;
-    }
-    return UnitSemanticKind::UNKNOWN;
-}
-
-bool isDimensionlessUnit(UnitSemanticKind kind) {
-    return kind == UnitSemanticKind::PERCENT ||
-           kind == UnitSemanticKind::RATIO ||
-           kind == UnitSemanticKind::SCORE;
-}
-
-bool areUnitsRatioCompatible(UnitSemanticKind a, UnitSemanticKind b) {
-    if (a == UnitSemanticKind::UNKNOWN || b == UnitSemanticKind::UNKNOWN) return true;
-    if (a == b) return true;
-    if (isDimensionlessUnit(a) || isDimensionlessUnit(b)) return true;
-
-    const bool currencyPerCount =
-        (a == UnitSemanticKind::CURRENCY && b == UnitSemanticKind::COUNT) ||
-        (b == UnitSemanticKind::CURRENCY && a == UnitSemanticKind::COUNT);
-    if (currencyPerCount) return true;
-
-    const bool distancePerDuration =
-        (a == UnitSemanticKind::DISTANCE && b == UnitSemanticKind::DURATION) ||
-        (b == UnitSemanticKind::DISTANCE && a == UnitSemanticKind::DURATION);
-    if (distancePerDuration) return true;
-
-    const bool countPerDuration =
-        (a == UnitSemanticKind::COUNT && b == UnitSemanticKind::DURATION) ||
-        (b == UnitSemanticKind::COUNT && a == UnitSemanticKind::DURATION);
-    if (countPerDuration) return true;
-
-    return false;
-}
-
 void imputeNumeric(NumVec& values, MissingMask& missing, const std::string& method);
+
+void imputeOnlyMissingRows(NumVec& values, MissingMask& missing, const std::string& method) {
+    NumVec valid;
+    valid.reserve(values.size());
+    for (size_t i = 0; i < values.size() && i < missing.size(); ++i) {
+        if (!missing[i] && std::isfinite(values[i])) valid.push_back(values[i]);
+    }
+
+    double fill = 0.0;
+    std::string m = CommonUtils::toLower(method);
+    if (m == "median") fill = CommonUtils::medianByNth(valid);
+    else if (m == "zero") fill = 0.0;
+    else {
+        double sum = 0.0;
+        for (double v : valid) sum += v;
+        fill = valid.empty() ? 0.0 : (sum / valid.size());
+    }
+
+    for (size_t i = 0; i < values.size() && i < missing.size(); ++i) {
+        if (!missing[i]) continue;
+        values[i] = std::isfinite(values[i]) ? values[i] : fill;
+        missing[i] = static_cast<uint8_t>(0);
+    }
+}
 
 struct NumericSnapshotStore {
     std::vector<size_t> numericIndices;
@@ -176,6 +112,16 @@ struct KdNode {
     size_t axis = 0;
     int left = -1;
     int right = -1;
+};
+
+struct SharedKnnIndex {
+    std::vector<double> means;
+    std::vector<KdPoint> points;
+    std::vector<KdNode> nodes;
+    std::vector<size_t> rowByPoint;
+    size_t dims = 0;
+    int root = -1;
+    bool valid = false;
 };
 
 double squaredDistance(const std::vector<double>& a, const std::vector<double>& b) {
@@ -254,10 +200,62 @@ void queryKdKnn(const std::vector<KdPoint>& points,
     }
 }
 
+SharedKnnIndex buildSharedKnnIndex(const NumericSnapshotStore& snapshot, size_t nRows) {
+    SharedKnnIndex out;
+    out.dims = snapshot.numericIndices.size();
+    if (out.dims == 0 || nRows == 0) return out;
+
+    out.means.assign(out.dims, 0.0);
+    std::vector<size_t> meanCounts(out.dims, 0);
+    for (size_t di = 0; di < out.dims; ++di) {
+        const NumVec* pVals = snapshotValuesForColumn(snapshot, snapshot.numericIndices[di]);
+        const MissingMask* pMissing = snapshotMissingForColumn(snapshot, snapshot.numericIndices[di]);
+        if (pVals == nullptr || pMissing == nullptr) continue;
+        const size_t n = std::min(nRows, std::min(pVals->size(), pMissing->size()));
+        for (size_t row = 0; row < n; ++row) {
+            if ((*pMissing)[row] || !std::isfinite((*pVals)[row])) continue;
+            out.means[di] += (*pVals)[row];
+            ++meanCounts[di];
+        }
+        if (meanCounts[di] > 0) out.means[di] /= static_cast<double>(meanCounts[di]);
+    }
+
+    out.points.reserve(nRows);
+    out.rowByPoint.reserve(nRows);
+    for (size_t row = 0; row < nRows; ++row) {
+        KdPoint p;
+        p.coords.assign(out.dims, 0.0);
+        bool hasFinite = false;
+        for (size_t di = 0; di < out.dims; ++di) {
+            const NumVec* pVals = snapshotValuesForColumn(snapshot, snapshot.numericIndices[di]);
+            const MissingMask* pMissing = snapshotMissingForColumn(snapshot, snapshot.numericIndices[di]);
+            if (pVals == nullptr || pMissing == nullptr || row >= pVals->size() || row >= pMissing->size() ||
+                (*pMissing)[row] || !std::isfinite((*pVals)[row])) {
+                p.coords[di] = out.means[di];
+            } else {
+                p.coords[di] = (*pVals)[row];
+                hasFinite = true;
+            }
+        }
+        if (!hasFinite) continue;
+        out.rowByPoint.push_back(row);
+        out.points.push_back(std::move(p));
+    }
+
+    if (out.points.empty()) return out;
+    std::vector<size_t> order(out.points.size(), 0);
+    std::iota(order.begin(), order.end(), 0);
+    out.nodes.reserve(out.points.size());
+    out.root = buildKdTree(order, 0, order.size(), 0, out.points, out.nodes);
+    out.valid = out.root >= 0;
+    return out;
+}
+
 void imputeNumericKnnWithSnapshot(NumVec& targetVals,
                                   MissingMask& targetMissing,
                                   const NumericSnapshotStore& snapshot,
                                   size_t targetCol,
+                                  const SharedKnnIndex* sharedIndex,
                                   size_t k = 5) {
     std::vector<size_t> predictors;
     predictors.reserve(snapshot.numericIndices.size());
@@ -272,6 +270,57 @@ void imputeNumericKnnWithSnapshot(NumVec& targetVals,
 
     const bool useKdTree = targetVals.size() >= 500 && !predictors.empty();
     if (useKdTree) {
+        if (sharedIndex != nullptr && sharedIndex->valid && sharedIndex->dims == snapshot.numericIndices.size()) {
+            const size_t dims = sharedIndex->dims;
+            const size_t queryK = std::min(sharedIndex->points.size(), std::max<size_t>(k * 8, 64));
+            std::vector<double> query(dims, 0.0);
+
+            for (size_t row = 0; row < targetVals.size() && row < targetMissing.size(); ++row) {
+                if (!targetMissing[row] && std::isfinite(targetVals[row])) continue;
+
+                for (size_t di = 0; di < dims; ++di) {
+                    const size_t colIdx = snapshot.numericIndices[di];
+                    const NumVec* pVals = snapshotValuesForColumn(snapshot, colIdx);
+                    const MissingMask* pMissing = snapshotMissingForColumn(snapshot, colIdx);
+                    if (pVals == nullptr || pMissing == nullptr || row >= pVals->size() || row >= pMissing->size() ||
+                        (*pMissing)[row] || !std::isfinite((*pVals)[row])) {
+                        query[di] = sharedIndex->means[di];
+                    } else {
+                        query[di] = (*pVals)[row];
+                    }
+                }
+
+                std::priority_queue<std::pair<double, size_t>> best;
+                queryKdKnn(sharedIndex->points, sharedIndex->nodes, sharedIndex->root, query, queryK, best);
+                if (best.empty()) continue;
+
+                double wsum = 0.0;
+                double ysum = 0.0;
+                size_t used = 0;
+                while (!best.empty() && used < k) {
+                    const auto [dist2, pointIdx] = best.top();
+                    best.pop();
+                    if (pointIdx >= sharedIndex->rowByPoint.size()) continue;
+                    const size_t candRow = sharedIndex->rowByPoint[pointIdx];
+                    if (candRow >= targetVals.size() || candRow >= targetMissing.size()) continue;
+                    if (targetMissing[candRow] || !std::isfinite(targetVals[candRow])) continue;
+
+                    const double dist = std::sqrt(std::max(0.0, dist2));
+                    const double w = 1.0 / std::max(kNeighborDistanceFloor, dist);
+                    wsum += w;
+                    ysum += w * targetVals[candRow];
+                    ++used;
+                }
+                if (wsum > 0.0) {
+                    targetVals[row] = ysum / wsum;
+                    targetMissing[row] = static_cast<uint8_t>(0);
+                }
+            }
+
+            imputeOnlyMissingRows(targetVals, targetMissing, "mean");
+            return;
+        }
+
         const size_t dims = predictors.size();
         std::vector<double> means(dims, 0.0);
         std::vector<size_t> meanCounts(dims, 0);
@@ -354,7 +403,7 @@ void imputeNumericKnnWithSnapshot(NumVec& targetVals,
                 }
             }
 
-            imputeNumeric(targetVals, targetMissing, "mean");
+            imputeOnlyMissingRows(targetVals, targetMissing, "mean");
             return;
         }
     }
@@ -408,12 +457,13 @@ void imputeNumericKnnWithSnapshot(NumVec& targetVals,
         }
     }
 
-    imputeNumeric(targetVals, targetMissing, "mean");
+    imputeOnlyMissingRows(targetVals, targetMissing, "mean");
 }
 
 void imputeNumericMiceWithSnapshot(NumVec& targetVals,
                                    MissingMask& targetMissing,
                                    const NumericSnapshotStore& snapshot,
+                                   const SharedKnnIndex* sharedIndex,
                                    size_t targetCol) {
     std::vector<size_t> predictors;
     predictors.reserve(snapshot.numericIndices.size());
@@ -445,12 +495,12 @@ void imputeNumericMiceWithSnapshot(NumVec& targetVals,
             x.push_back((*pVals)[i]);
             y.push_back(targetVals[i]);
         }
-        if (x.size() < 12) continue;
+        if (x.size() < kMinCorrelationSampleCount) continue;
         const double r = std::abs(MathUtils::calculatePearson(x, y, Statistics::calculateStats(x), Statistics::calculateStats(y)).value_or(0.0));
         if (std::isfinite(r)) ranked.push_back({pIdx, r});
     }
     if (ranked.empty()) {
-        imputeNumericKnnWithSnapshot(targetVals, targetMissing, snapshot, targetCol, 5);
+        imputeNumericKnnWithSnapshot(targetVals, targetMissing, snapshot, targetCol, sharedIndex, 5);
         return;
     }
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -482,7 +532,7 @@ void imputeNumericMiceWithSnapshot(NumVec& targetVals,
     }
 
     if (rows.size() < predictors.size() + 8) {
-        imputeNumericKnnWithSnapshot(targetVals, targetMissing, snapshot, targetCol, 5);
+        imputeNumericKnnWithSnapshot(targetVals, targetMissing, snapshot, targetCol, sharedIndex, 5);
         return;
     }
 
@@ -494,7 +544,7 @@ void imputeNumericMiceWithSnapshot(NumVec& targetVals,
     }
     const auto beta = MathUtils::multipleLinearRegression(X, Y);
     if (beta.size() != predictors.size() + 1) {
-        imputeNumericKnnWithSnapshot(targetVals, targetMissing, snapshot, targetCol, 5);
+        imputeNumericKnnWithSnapshot(targetVals, targetMissing, snapshot, targetCol, sharedIndex, 5);
         return;
     }
 
@@ -517,7 +567,7 @@ void imputeNumericMiceWithSnapshot(NumVec& targetVals,
         targetMissing[i] = static_cast<uint8_t>(0);
     }
 
-    imputeNumeric(targetVals, targetMissing, "mean");
+    imputeOnlyMissingRows(targetVals, targetMissing, "mean");
 }
 
 void imputeNumericMatrixCompletionWithSnapshot(NumVec& targetVals,
@@ -865,9 +915,9 @@ bool isBinarySeries(const NumVec& values) {
     bool seenZero = false;
     bool seenOne = false;
     for (double v : values) {
-        if (std::abs(v) <= 1e-9) {
+        if (std::abs(v) <= kBinaryTolerance) {
             seenZero = true;
-        } else if (std::abs(v - 1.0) <= 1e-9) {
+        } else if (std::abs(v - 1.0) <= kBinaryTolerance) {
             seenOne = true;
         } else {
             return false;
@@ -999,7 +1049,7 @@ void imputeNumericMiceColumn(TypedDataset& data, size_t targetCol) {
             x.push_back(pVals[i]);
             y.push_back(targetVals[i]);
         }
-        if (x.size() < 12) continue;
+        if (x.size() < kMinCorrelationSampleCount) continue;
         const double r = std::abs(MathUtils::calculatePearson(x, y, Statistics::calculateStats(x), Statistics::calculateStats(y)).value_or(0.0));
         if (std::isfinite(r)) ranked.push_back({pIdx, r});
     }
@@ -1413,7 +1463,7 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
         const double baseA = baseCorr.count(parentA) ? baseCorr[parentA] : 0.0;
         const double baseB = baseCorr.count(parentB) ? baseCorr[parentB] : 0.0;
         const double baseBest = std::max(baseA, baseB);
-        const double minCorr = std::max(0.05, baseBest * 1.01);
+        const double minCorr = std::max(kDerivedFeatureCorrelationFloor, baseBest * 1.01);
         const double minLift = 0.015;
         return derivedCorr >= minCorr && (derivedCorr + minLift) >= baseBest;
     };
@@ -1520,14 +1570,14 @@ void addAutoNumericFeatureEngineering(TypedDataset& data, const AutoConfig& conf
                 if (!config.featureEngineeringEnableRatioProductDiscovery) continue;
                 if (!canAddMore()) break;
 
-                const UnitSemanticKind unitA = inferUnitSemanticKind(a.name);
-                const UnitSemanticKind unitB = inferUnitSemanticKind(b.name);
-                const bool ratioCompatible = areUnitsRatioCompatible(unitA, unitB);
+                const CommonUtils::UnitSemanticKind unitA = CommonUtils::inferUnitSemanticKind(a.name);
+                const CommonUtils::UnitSemanticKind unitB = CommonUtils::inferUnitSemanticKind(b.name);
+                const bool ratioCompatible = CommonUtils::areUnitsRatioCompatible(unitA, unitB);
                 if (!ratioCompatible) {
                     continue;
                 }
 
-                const double denomEps = std::max(1e-9, config.tuning.numericEpsilon * 1000.0);
+                const double denomEps = std::max(kNeighborDistanceFloor, config.tuning.numericEpsilon * 1000.0);
 
                 std::vector<double> ratioAB(n, 0.0);
                 MissingMask missAB(n, static_cast<uint8_t>(0));
@@ -1827,6 +1877,14 @@ void capOutliers(NumVec& values, const std::vector<bool>& flags) {
     }
 }
 
+void normalizeCategoricalTokens(StrVec& values, const MissingMask& missing) {
+    const size_t n = std::min(values.size(), missing.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (missing[i]) continue;
+        values[i] = CommonUtils::toLower(CommonUtils::trim(values[i]));
+    }
+}
+
 }
 
 PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config) {
@@ -1893,6 +1951,7 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
     const std::vector<size_t> numericCols = data.numericColumnIndices();
     if (!numericCols.empty()) {
         const NumericSnapshotStore numericSnapshot = buildNumericSnapshotStore(data);
+        const SharedKnnIndex sharedKnnIndex = buildSharedKnnIndex(numericSnapshot, data.rowCount());
         std::vector<NumVec> numericValuesResult(numericCols.size());
         std::vector<MissingMask> numericMissingResult(numericCols.size());
 
@@ -1911,9 +1970,9 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
             if (normalizedStrategy == "interpolate") {
                 interpolateSeries(values, missing);
             } else if (normalizedStrategy == "knn") {
-                imputeNumericKnnWithSnapshot(values, missing, numericSnapshot, colIdx, 5);
+                imputeNumericKnnWithSnapshot(values, missing, numericSnapshot, colIdx, &sharedKnnIndex, 5);
             } else if (normalizedStrategy == "mice") {
-                imputeNumericMiceWithSnapshot(values, missing, numericSnapshot, colIdx);
+                imputeNumericMiceWithSnapshot(values, missing, numericSnapshot, &sharedKnnIndex, colIdx);
             } else if (normalizedStrategy == "matrix_completion") {
                 imputeNumericMatrixCompletionWithSnapshot(values, missing, numericSnapshot, colIdx, 3);
             } else {
@@ -1940,6 +1999,8 @@ PreprocessReport Preprocessor::run(TypedDataset& data, const AutoConfig& config)
         if (col.type == ColumnType::CATEGORICAL) {
             auto& values = std::get<StrVec>(col.values);
             imputeCategorical(values, col.missing, strategy.empty() ? "mode" : strategy);
+            // Stabilize labels before neural one-hot encoding in modeling stage.
+            normalizeCategoricalTokens(values, col.missing);
         } else {
             auto& values = std::get<TimeVec>(col.values);
             imputeDatetime(values, col.missing, strategy.empty() ? "interpolate" : strategy);

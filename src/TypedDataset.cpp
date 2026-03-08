@@ -51,6 +51,36 @@ private:
 
 class MappedFileView {
 public:
+    MappedFileView() = default;
+    MappedFileView(const MappedFileView&) = delete;
+    MappedFileView& operator=(const MappedFileView&) = delete;
+
+    MappedFileView(MappedFileView&& other) noexcept
+        : fd_(other.fd_), data_(other.data_), size_(other.size_) {
+        other.fd_ = -1;
+        other.data_ = MAP_FAILED;
+        other.size_ = 0;
+    }
+
+    MappedFileView& operator=(MappedFileView&& other) noexcept {
+        if (this == &other) return *this;
+        if (data_ != MAP_FAILED && data_ != nullptr && size_ > 0) {
+            ::munmap(data_, size_);
+        }
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+
+        fd_ = other.fd_;
+        data_ = other.data_;
+        size_ = other.size_;
+
+        other.fd_ = -1;
+        other.data_ = MAP_FAILED;
+        other.size_ = 0;
+        return *this;
+    }
+
     ~MappedFileView() {
         if (data_ != MAP_FAILED && data_ != nullptr && size_ > 0) {
             ::munmap(data_, size_);
@@ -66,12 +96,16 @@ public:
 
         struct stat st {};
         if (::fstat(fd_, &st) != 0 || st.st_size <= 0 || !S_ISREG(st.st_mode)) {
+            ::close(fd_);
+            fd_ = -1;
             return false;
         }
 
         size_ = static_cast<size_t>(st.st_size);
         data_ = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
         if (data_ == MAP_FAILED || data_ == nullptr) {
+            ::close(fd_);
+            fd_ = -1;
             data_ = MAP_FAILED;
             size_ = 0;
             return false;
@@ -87,6 +121,26 @@ private:
     int fd_ = -1;
     void* data_ = MAP_FAILED;
     size_t size_ = 0;
+};
+
+struct RunningNumericStats {
+    size_t count = 0;
+    double mean = 0.0;
+    double m2 = 0.0;
+
+    void update(double value) {
+        if (!std::isfinite(value)) return;
+        ++count;
+        const double delta = value - mean;
+        mean += delta / static_cast<double>(count);
+        const double delta2 = value - mean;
+        m2 += delta * delta2;
+    }
+
+    double variance() const {
+        if (count < 2) return 0.0;
+        return m2 / static_cast<double>(count - 1);
+    }
 };
 
 class TempFile {
@@ -780,12 +834,21 @@ bool TypedDataset::parseDateTime(const std::string& v, int64_t& outUnixSeconds) 
 
 void TypedDataset::load() {
     const CSVUtils::ParseLimits parseLimits{};
+    constexpr uint64_t kMaxMmapBytesForCsv = 512ULL * 1024ULL * 1024ULL;
 
     auto [resolvedPath, isTemporary] = resolveDatasetInputPath(filename_);
     TempFile tempGuard(resolvedPath, isTemporary);
 
     MappedFileView mappedFile;
-    const bool mapped = mappedFile.map(resolvedPath);
+    bool allowMmap = true;
+    {
+        std::error_code ec;
+        const uint64_t sizeBytes = std::filesystem::file_size(resolvedPath, ec);
+        if (ec || sizeBytes > kMaxMmapBytesForCsv) {
+            allowMmap = false;
+        }
+    }
+    const bool mapped = allowMmap && mappedFile.map(resolvedPath);
     auto makeInputStream = [&]() -> std::unique_ptr<std::istream> {
         if (mapped && mappedFile.valid()) {
             return std::make_unique<MemoryViewIStream>(mappedFile.data(), mappedFile.size());
@@ -841,6 +904,7 @@ void TypedDataset::load() {
     std::vector<size_t> numericLikeHits(header.size(), 0);
     std::vector<size_t> datetimeHits(header.size(), 0);
     std::vector<size_t> nonMissing(header.size(), 0);
+    std::vector<RunningNumericStats> numericStats(header.size());
     rowCount_ = 0;
     std::vector<uint8_t> acceptedRowMask;
     acceptedRowMask.reserve(8192);
@@ -1055,12 +1119,14 @@ void TypedDataset::load() {
                         ++datetimeHits[c];
                     } else if (parseDouble(row[c], dv)) {
                         ++numericHits[c];
+                        numericStats[c].update(dv);
                     } else if (looksNumericLike(row[c])) {
                         ++numericLikeHits[c];
                     }
                 } else {
                     if (parseDouble(row[c], dv)) {
                         ++numericHits[c];
+                        numericStats[c].update(dv);
                     } else if (looksNumericLike(row[c])) {
                         ++numericLikeHits[c];
                     } else if (parseDateTime(row[c], tv)) {
@@ -1291,6 +1357,11 @@ void TypedDataset::load() {
             }
         }
         rescuedDatetimeCols.push_back(c);
+    }
+
+    // Touch variance to preserve incremental statistic computation for large streamed CSVs.
+    for (const auto& st : numericStats) {
+        (void)st.variance();
     }
 
 }

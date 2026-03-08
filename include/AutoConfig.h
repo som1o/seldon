@@ -151,6 +151,19 @@ struct HeuristicTuningConfig {
     double hybridExplainabilityWeightPermutation = 0.50;
     double hybridExplainabilityWeightIntegratedGradients = 0.50;
 
+    // Stationarity diagnostics: weak mean-reversion threshold in ADF-style drift check.
+    // Values closer to 0 are less strict; more negative values demand stronger reversion.
+    double stationarityWeakMeanReversionGamma = -0.03;
+    // Stationarity diagnostics: p-value above this suggests insufficient mean-reversion evidence.
+    double stationarityNotSignificantPValue = 0.05;
+    // Stationarity diagnostics: normalized early-vs-late level drift gate.
+    // Computed as |late_mean - early_mean| / stddev(series).
+    double stationaritySizableDriftRatio = 0.35;
+
+    // Lasso gate: minimum absolute standardized coefficient required for automatic retention.
+    // Coefficients below this are treated as weak and not selected by magnitude-only ranking.
+    double lassoMinAbsCoefficient = 1e-4;
+
     // Project-timeline (Gantt) auto-detection tuning
     bool ganttAutoEnabled = true;
     size_t ganttMinTasks = 3;
@@ -259,6 +272,7 @@ struct AutoConfig {
     double neuralEmaDecay = 0.995;
     double neuralLabelSmoothing = 0.02;
     int neuralGradientAccumulationSteps = 2;
+    double neuralEarlyStoppingMinDelta = 1e-4;
 
     // Advanced neural controls
     double neuralLearningRate = 0.001;
@@ -319,6 +333,11 @@ struct AutoConfig {
      * @throws Seldon::ConfigurationException on parse/validation failures.
      */
     static AutoConfig fromFile(const std::string& configPath, const AutoConfig& base);
+
+    /**
+     * @brief Returns human-readable documentation for major CLI/config parameters.
+     */
+    static std::string describeParams();
 
     /**
      * @brief Validates merged configuration invariants and enum-like fields.

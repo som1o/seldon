@@ -26,8 +26,8 @@ struct StationarityDiagnostic {
 };
 
 struct AsymmetricDirectionScore {
-    double xToY = 0.0;
-    double yToX = 0.0;
+    double igXtoY = 0.0;
+    double igYtoX = 0.0;
     double asymmetry = 0.0;
     std::string suggestedDirection = "undirected";
 };

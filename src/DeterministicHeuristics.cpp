@@ -1,16 +1,19 @@
 #include "DeterministicHeuristics.h"
 
+#include "AutoConfig.h"
 #include "CommonUtils.h"
 #include "MathUtils.h"
 #include "Statistics.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <limits>
 #include <numeric>
 #include <sstream>
 #include <set>
 #include <unordered_map>
+#include <vector>
 
 namespace DeterministicHeuristics {
 namespace {
@@ -111,73 +114,6 @@ bool isTargetCandidateName(const std::string& name) {
            lower.find("class") != std::string::npos;
 }
 
-enum class UnitSemanticKind {
-    UNKNOWN,
-    CURRENCY,
-    PERCENT,
-    RATIO,
-    RATE,
-    COUNT,
-    DURATION,
-    DISTANCE,
-    TEMPERATURE,
-    SCORE
-};
-
-UnitSemanticKind inferUnitSemanticKind(const std::string& name) {
-    const std::string lower = CommonUtils::toLower(CommonUtils::trim(name));
-    if (lower.empty()) return UnitSemanticKind::UNKNOWN;
-
-    auto hasAny = [&](std::initializer_list<const char*> tokens) {
-        for (const char* token : tokens) {
-            if (lower.find(token) != std::string::npos) return true;
-        }
-        return false;
-    };
-
-    if (hasAny({"price", "cost", "revenue", "salary", "income", "expense", "budget", "usd", "eur", "gbp", "jpy", "amount", "payment"})) {
-        return UnitSemanticKind::CURRENCY;
-    }
-    if (hasAny({"percent", "percentage", "pct", "%", "ratio"})) {
-        if (hasAny({"rate"})) return UnitSemanticKind::RATE;
-        return (lower.find("ratio") != std::string::npos) ? UnitSemanticKind::RATIO : UnitSemanticKind::PERCENT;
-    }
-    if (hasAny({"rate", "per_", "per ", "/"})) {
-        return UnitSemanticKind::RATE;
-    }
-    if (hasAny({"count", "qty", "quantity", "num", "number", "visits", "clicks", "users", "cases", "population"})) {
-        return UnitSemanticKind::COUNT;
-    }
-    if (hasAny({"duration", "latency", "time", "seconds", "second", "minutes", "minute", "hours", "hour", "days", "day", "ms"})) {
-        return UnitSemanticKind::DURATION;
-    }
-    if (hasAny({"distance", "km", "kilometer", "mile", "meter", "miles", "meters"})) {
-        return UnitSemanticKind::DISTANCE;
-    }
-    if (hasAny({"temp", "temperature", "celsius", "fahrenheit", "kelvin"})) {
-        return UnitSemanticKind::TEMPERATURE;
-    }
-    if (hasAny({"score", "index", "rating"})) {
-        return UnitSemanticKind::SCORE;
-    }
-    return UnitSemanticKind::UNKNOWN;
-}
-
-std::string unitSemanticLabel(UnitSemanticKind kind) {
-    switch (kind) {
-        case UnitSemanticKind::CURRENCY: return "currency";
-        case UnitSemanticKind::PERCENT: return "percentage";
-        case UnitSemanticKind::RATIO: return "ratio";
-        case UnitSemanticKind::RATE: return "rate";
-        case UnitSemanticKind::COUNT: return "count";
-        case UnitSemanticKind::DURATION: return "duration";
-        case UnitSemanticKind::DISTANCE: return "distance";
-        case UnitSemanticKind::TEMPERATURE: return "temperature";
-        case UnitSemanticKind::SCORE: return "score/index";
-        default: return "unspecified";
-    }
-}
-
 double safeAbsCorr(const std::vector<double>& x, const std::vector<double>& y) {
     const ColumnStats sx = Statistics::calculateStats(x);
     const ColumnStats sy = Statistics::calculateStats(y);
@@ -188,6 +124,137 @@ double softThreshold(double z, double gamma) {
     if (z > gamma) return z - gamma;
     if (z < -gamma) return z + gamma;
     return 0.0;
+}
+
+std::vector<double> solveLinearSystem(std::vector<std::vector<double>> a, std::vector<double> b) {
+    const size_t n = a.size();
+    if (n == 0 || b.size() != n) return {};
+
+    for (size_t i = 0; i < n; ++i) {
+        size_t pivot = i;
+        double best = std::abs(a[i][i]);
+        for (size_t r = i + 1; r < n; ++r) {
+            const double cand = std::abs(a[r][i]);
+            if (cand > best) {
+                best = cand;
+                pivot = r;
+            }
+        }
+        if (best <= 1e-12) return {};
+        if (pivot != i) {
+            std::swap(a[pivot], a[i]);
+            std::swap(b[pivot], b[i]);
+        }
+
+        const double diag = a[i][i];
+        for (size_t c = i; c < n; ++c) a[i][c] /= diag;
+        b[i] /= diag;
+
+        for (size_t r = 0; r < n; ++r) {
+            if (r == i) continue;
+            const double factor = a[r][i];
+            if (std::abs(factor) <= 1e-15) continue;
+            for (size_t c = i; c < n; ++c) a[r][c] -= factor * a[i][c];
+            b[r] -= factor * b[i];
+        }
+    }
+    return b;
+}
+
+std::unordered_map<int, double> computeVifScores(const TypedDataset& data,
+                                                 const std::vector<int>& featureIdx) {
+    std::unordered_map<int, double> vif;
+    if (featureIdx.size() < 2) return vif;
+
+    std::vector<int> valid;
+    valid.reserve(featureIdx.size());
+    for (int idx : featureIdx) {
+        if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
+        if (data.columns()[static_cast<size_t>(idx)].type != ColumnType::NUMERIC) continue;
+        valid.push_back(idx);
+    }
+    if (valid.size() < 2) return vif;
+
+    const size_t p = valid.size();
+    std::vector<std::vector<double>> cols;
+    cols.reserve(p);
+    for (int idx : valid) {
+        cols.push_back(std::get<std::vector<double>>(data.columns()[static_cast<size_t>(idx)].values));
+    }
+
+    std::vector<size_t> rows;
+    rows.reserve(data.rowCount());
+    for (size_t r = 0; r < data.rowCount(); ++r) {
+        bool ok = true;
+        for (size_t j = 0; j < p; ++j) {
+            if (r >= cols[j].size() || !std::isfinite(cols[j][r])) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) rows.push_back(r);
+    }
+    if (rows.size() < p + 2) return vif;
+
+    for (size_t target = 0; target < p; ++target) {
+        const size_t q = p; // intercept + (p-1) predictors
+        std::vector<std::vector<double>> xtx(q, std::vector<double>(q, 0.0));
+        std::vector<double> xty(q, 0.0);
+
+        for (size_t row : rows) {
+            std::vector<double> reg;
+            reg.reserve(q);
+            reg.push_back(1.0);
+            for (size_t j = 0; j < p; ++j) {
+                if (j == target) continue;
+                reg.push_back(cols[j][row]);
+            }
+            const double y = cols[target][row];
+
+            for (size_t i = 0; i < q; ++i) {
+                xty[i] += reg[i] * y;
+                for (size_t j = 0; j < q; ++j) xtx[i][j] += reg[i] * reg[j];
+            }
+        }
+
+        std::vector<double> beta = solveLinearSystem(xtx, xty);
+        if (beta.empty()) {
+            vif[valid[target]] = std::numeric_limits<double>::infinity();
+            continue;
+        }
+
+        double yMean = 0.0;
+        for (size_t row : rows) yMean += cols[target][row];
+        yMean /= static_cast<double>(rows.size());
+
+        double tss = 0.0;
+        double rss = 0.0;
+        for (size_t row : rows) {
+            std::vector<double> reg;
+            reg.reserve(q);
+            reg.push_back(1.0);
+            for (size_t j = 0; j < p; ++j) {
+                if (j == target) continue;
+                reg.push_back(cols[j][row]);
+            }
+            double pred = 0.0;
+            for (size_t i = 0; i < q && i < beta.size(); ++i) pred += beta[i] * reg[i];
+            const double y = cols[target][row];
+            const double dy = y - yMean;
+            const double err = y - pred;
+            tss += dy * dy;
+            rss += err * err;
+        }
+
+        if (tss <= 1e-12) {
+            vif[valid[target]] = std::numeric_limits<double>::infinity();
+            continue;
+        }
+        const double r2 = std::clamp(1.0 - (rss / tss), 0.0, 0.999999999);
+        vif[valid[target]] = 1.0 / std::max(1e-9, 1.0 - r2);
+    }
+
+    return vif;
 }
 
 std::vector<int> lassoTopK(const TypedDataset& data,
@@ -296,16 +363,10 @@ std::vector<int> lassoTopK(const TypedDataset& data,
         return a.second > b.second;
     });
 
+    const double minAbsCoefficient = HeuristicTuningConfig{}.lassoMinAbsCoefficient;
     for (const auto& kv : ranked) {
         if (out.size() >= keepK) break;
-        if (kv.second > 1e-9) out.push_back(kv.first);
-    }
-
-    if (out.size() < std::min(keepK, ranked.size())) {
-        for (const auto& kv : ranked) {
-            if (out.size() >= keepK) break;
-            if (std::find(out.begin(), out.end(), kv.first) == out.end()) out.push_back(kv.first);
-        }
+        if (kv.second >= minAbsCoefficient) out.push_back(kv.first);
     }
 
     return out;
@@ -321,27 +382,36 @@ Outcome runAllPhases(const TypedDataset& data,
     out.filteredFeatures.reserve(candidateFeatureIdx.size());
 
     const size_t rows = std::max<size_t>(1, data.rowCount());
+    const size_t colCount = data.columns().size();
 
-    for (size_t c = 0; c < data.columns().size(); ++c) {
+    std::vector<size_t> uniqueCounts(colCount, 0);
+    std::vector<uint8_t> integerLikeFlags(colCount, static_cast<uint8_t>(0));
+    std::vector<uint8_t> constantFlags(colCount, static_cast<uint8_t>(0));
+    for (size_t c = 0; c < colCount; ++c) {
+        const auto& col = data.columns()[c];
+        uniqueCounts[c] = uniqueCountForColumn(col);
+        if (col.type == ColumnType::NUMERIC) {
+            const auto& vals = std::get<std::vector<double>>(col.values);
+            const bool integerLike = isIntegerLikeColumn(vals, col.missing);
+            integerLikeFlags[c] = integerLike ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+            const auto st = Statistics::calculateStats(vals);
+            const bool constant = std::isfinite(st.variance) && st.variance <= 1e-12;
+            constantFlags[c] = constant ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+        }
+    }
+
+    for (size_t c = 0; c < colCount; ++c) {
         const auto& col = data.columns()[c];
         const size_t missing = prep.missingCounts.count(col.name) ? prep.missingCounts.at(col.name)
                                                                    : static_cast<size_t>(std::count(col.missing.begin(), col.missing.end(), true));
         const double nullRatio = static_cast<double>(missing) / static_cast<double>(rows);
-        const size_t uniq = uniqueCountForColumn(col);
+        const size_t uniq = uniqueCounts[c];
 
         const bool metadataName = isMetadataName(col.name);
         const bool targetName = isTargetCandidateName(col.name);
 
-        bool integerLike = false;
-        if (col.type == ColumnType::NUMERIC) {
-            integerLike = isIntegerLikeColumn(std::get<std::vector<double>>(col.values), col.missing);
-        }
-
-        bool constant = false;
-        if (col.type == ColumnType::NUMERIC) {
-            const auto st = Statistics::calculateStats(std::get<std::vector<double>>(col.values));
-            constant = std::isfinite(st.variance) && st.variance <= 1e-12;
-        }
+        const bool integerLike = integerLikeFlags[c] != 0;
+        const bool constant = constantFlags[c] != 0;
 
         const bool idLikeType = (col.type == ColumnType::CATEGORICAL) || (col.type == ColumnType::NUMERIC && integerLike);
         const bool admin = (uniq == data.rowCount()) && idLikeType;
@@ -356,12 +426,21 @@ Outcome runAllPhases(const TypedDataset& data,
         out.roleTagRows.push_back({
             col.name,
             role,
-            unitSemanticLabel(inferUnitSemanticKind(col.name)),
+            CommonUtils::unitSemanticLabel(CommonUtils::inferUnitSemanticKind(col.name)),
             std::to_string(uniq),
             std::to_string(missing),
             formatDouble(100.0 * nullRatio, 2) + "%"
         });
     }
+
+    auto exclusionReason = [&](const TypedColumn& col, size_t uniq, double nullRatio, bool integerLike, bool constant) -> std::optional<std::string> {
+        const bool idLikeType = (col.type == ColumnType::CATEGORICAL) || (col.type == ColumnType::NUMERIC && integerLike);
+        const bool admin = (uniq == data.rowCount()) && idLikeType;
+        if (admin) return col.name + ": administrative column excluded from analysis";
+        if (constant) return col.name + ": constant column excluded (zero variance)";
+        if (nullRatio > 0.40) return col.name + ": low-signal column excluded (>40% missing values)";
+        return std::nullopt;
+    };
 
     for (int idx : candidateFeatureIdx) {
         if (idx < 0 || static_cast<size_t>(idx) >= data.columns().size()) continue;
@@ -370,32 +449,14 @@ Outcome runAllPhases(const TypedDataset& data,
         const size_t missing = prep.missingCounts.count(col.name) ? prep.missingCounts.at(col.name)
                                                                    : static_cast<size_t>(std::count(col.missing.begin(), col.missing.end(), true));
         const double nullRatio = static_cast<double>(missing) / static_cast<double>(rows);
-        const size_t uniq = uniqueCountForColumn(col);
+        const size_t uniq = uniqueCounts[static_cast<size_t>(idx)];
 
-        bool integerLike = false;
-        if (col.type == ColumnType::NUMERIC) {
-            integerLike = isIntegerLikeColumn(std::get<std::vector<double>>(col.values), col.missing);
-        }
+        const bool integerLike = integerLikeFlags[static_cast<size_t>(idx)] != 0;
+        const bool constant = constantFlags[static_cast<size_t>(idx)] != 0;
 
-        bool constant = false;
-        if (col.type == ColumnType::NUMERIC) {
-            const auto st = Statistics::calculateStats(std::get<std::vector<double>>(col.values));
-            constant = std::isfinite(st.variance) && st.variance <= 1e-12;
-        }
-
-        const bool idLikeType = (col.type == ColumnType::CATEGORICAL) || (col.type == ColumnType::NUMERIC && integerLike);
-        const bool admin = (uniq == data.rowCount()) && idLikeType;
-
-        if (admin) {
-            out.excludedReasonLines.push_back(col.name + ": administrative column excluded from analysis");
-            continue;
-        }
-        if (constant) {
-            out.excludedReasonLines.push_back(col.name + ": constant column excluded (zero variance)");
-            continue;
-        }
-        if (nullRatio > 0.40) {
-            out.excludedReasonLines.push_back(col.name + ": low-signal column excluded (>40% missing values)");
+        const auto reason = exclusionReason(col, uniq, nullRatio, integerLike, constant);
+        if (reason.has_value()) {
+            out.excludedReasonLines.push_back(*reason);
             continue;
         }
 
@@ -489,6 +550,34 @@ Outcome runAllPhases(const TypedDataset& data,
 
     if (out.lassoGateApplied) {
         out.badgeNarratives.push_back("Lasso Gate: features pruned to top " + std::to_string(out.lassoSelectedCount) + " weighted predictors.");
+    }
+
+    const double vifThreshold = 10.0;
+    bool vifPrunedAny = false;
+    while (out.filteredFeatures.size() > 2) {
+        const std::unordered_map<int, double> vif = computeVifScores(data, out.filteredFeatures);
+        if (vif.empty()) break;
+
+        int worstFeature = -1;
+        double worstVif = vifThreshold;
+        for (const auto& kv : vif) {
+            if (kv.second > worstVif) {
+                worstVif = kv.second;
+                worstFeature = kv.first;
+            }
+        }
+        if (worstFeature < 0) break;
+
+        auto it = std::find(out.filteredFeatures.begin(), out.filteredFeatures.end(), worstFeature);
+        if (it == out.filteredFeatures.end()) break;
+
+        const std::string featureName = data.columns()[static_cast<size_t>(worstFeature)].name;
+        out.excludedReasonLines.push_back(featureName + ": removed for multicollinearity (VIF=" + formatDouble(worstVif, 2) + ", threshold=10.00)");
+        out.filteredFeatures.erase(it);
+        vifPrunedAny = true;
+    }
+    if (vifPrunedAny) {
+        out.badgeNarratives.push_back("Multicollinearity Guardrail: features with VIF > 10 were pruned.");
     }
 
     if (!out.residualNarrative.empty()) {

@@ -10,6 +10,21 @@
 
 namespace CommonUtils {
 
+enum class UnitSemanticKind {
+    UNKNOWN,
+    CURRENCY,
+    PERCENT,
+    RATIO,
+    RATE,
+    COUNT,
+    DURATION,
+    DISTANCE,
+    MASS,
+    VOLUME,
+    TEMPERATURE,
+    SCORE
+};
+
 inline std::string trim(std::string_view s) {
     const size_t b = s.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) return "";
@@ -69,6 +84,99 @@ inline double quantileByNth(std::vector<double> values, double q) {
     const long double frac = pos - static_cast<long double>(lo);
     const long double out = static_cast<long double>(loVal) * (1.0L - frac) + static_cast<long double>(hiVal) * frac;
     return static_cast<double>(out);
+}
+
+inline UnitSemanticKind inferUnitSemanticKind(std::string_view name) {
+    const std::string lower = toLower(trim(name));
+    if (lower.empty()) return UnitSemanticKind::UNKNOWN;
+
+    auto hasAny = [&](std::initializer_list<const char*> tokens) {
+        for (const char* token : tokens) {
+            if (lower.find(token) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    if (hasAny({"price", "cost", "revenue", "salary", "income", "expense", "budget", "usd", "eur", "gbp", "jpy", "amount", "payment"})) {
+        return UnitSemanticKind::CURRENCY;
+    }
+    if (hasAny({"percent", "percentage", "pct", "%"})) {
+        return UnitSemanticKind::PERCENT;
+    }
+    if (hasAny({"ratio"})) {
+        return UnitSemanticKind::RATIO;
+    }
+    if (hasAny({"rate", "per_", "per ", "/"})) {
+        return UnitSemanticKind::RATE;
+    }
+    if (hasAny({"count", "qty", "quantity", "num", "number", "users", "cases", "population", "clicks", "visits"})) {
+        return UnitSemanticKind::COUNT;
+    }
+    if (hasAny({"duration", "latency", "time", "seconds", "second", "minutes", "minute", "hours", "hour", "days", "day", "ms"})) {
+        return UnitSemanticKind::DURATION;
+    }
+    if (hasAny({"distance", "km", "kilometer", "mile", "meter", "meters", "miles"})) {
+        return UnitSemanticKind::DISTANCE;
+    }
+    if (hasAny({"weight", "mass", "kg", "kilogram", "lb", "pound", "grams", "gram"})) {
+        return UnitSemanticKind::MASS;
+    }
+    if (hasAny({"volume", "litre", "liter", "ml", "gallon"})) {
+        return UnitSemanticKind::VOLUME;
+    }
+    if (hasAny({"temp", "temperature", "celsius", "fahrenheit", "kelvin"})) {
+        return UnitSemanticKind::TEMPERATURE;
+    }
+    if (hasAny({"score", "index", "rating"})) {
+        return UnitSemanticKind::SCORE;
+    }
+    return UnitSemanticKind::UNKNOWN;
+}
+
+inline bool isDimensionlessUnit(UnitSemanticKind kind) {
+    return kind == UnitSemanticKind::PERCENT ||
+           kind == UnitSemanticKind::RATIO ||
+           kind == UnitSemanticKind::SCORE;
+}
+
+inline bool areUnitsRatioCompatible(UnitSemanticKind a, UnitSemanticKind b) {
+    if (a == UnitSemanticKind::UNKNOWN || b == UnitSemanticKind::UNKNOWN) return true;
+    if (a == b) return true;
+    if (isDimensionlessUnit(a) || isDimensionlessUnit(b)) return true;
+
+    const bool currencyPerCount =
+        (a == UnitSemanticKind::CURRENCY && b == UnitSemanticKind::COUNT) ||
+        (b == UnitSemanticKind::CURRENCY && a == UnitSemanticKind::COUNT);
+    if (currencyPerCount) return true;
+
+    const bool distancePerDuration =
+        (a == UnitSemanticKind::DISTANCE && b == UnitSemanticKind::DURATION) ||
+        (b == UnitSemanticKind::DISTANCE && a == UnitSemanticKind::DURATION);
+    if (distancePerDuration) return true;
+
+    const bool countPerDuration =
+        (a == UnitSemanticKind::COUNT && b == UnitSemanticKind::DURATION) ||
+        (b == UnitSemanticKind::COUNT && a == UnitSemanticKind::DURATION);
+    if (countPerDuration) return true;
+
+    return false;
+}
+
+inline std::string unitSemanticLabel(UnitSemanticKind kind) {
+    switch (kind) {
+        case UnitSemanticKind::CURRENCY: return "currency";
+        case UnitSemanticKind::PERCENT: return "percentage";
+        case UnitSemanticKind::RATIO: return "ratio";
+        case UnitSemanticKind::RATE: return "rate";
+        case UnitSemanticKind::COUNT: return "count";
+        case UnitSemanticKind::DURATION: return "duration";
+        case UnitSemanticKind::DISTANCE: return "distance";
+        case UnitSemanticKind::MASS: return "mass";
+        case UnitSemanticKind::VOLUME: return "volume";
+        case UnitSemanticKind::TEMPERATURE: return "temperature";
+        case UnitSemanticKind::SCORE: return "score/index";
+        default: return "unspecified";
+    }
 }
 
 } // namespace CommonUtils

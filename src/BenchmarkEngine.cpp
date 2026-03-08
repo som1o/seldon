@@ -17,6 +17,56 @@ struct FeatureScaler {
     std::vector<double> stddev;
 };
 
+bool isIntegerLike(double v) {
+    return std::isfinite(v) && std::abs(v - std::round(v)) <= 1e-9;
+}
+
+bool shouldUseStratifiedFolds(const std::vector<double>& y) {
+    if (y.size() < 20) return false;
+    std::unordered_map<long long, size_t> counts;
+    counts.reserve(y.size());
+    for (double v : y) {
+        if (!isIntegerLike(v)) return false;
+        counts[static_cast<long long>(std::llround(v))] += 1;
+    }
+    if (counts.size() < 2) return false;
+    const size_t maxClasses = std::min<size_t>(20, std::max<size_t>(2, y.size() / 8));
+    return counts.size() <= maxClasses;
+}
+
+std::vector<int> buildFoldAssignment(const std::vector<double>& y, int folds, uint32_t seed) {
+    const size_t n = y.size();
+    std::vector<int> foldOf(n, 0);
+    if (n == 0 || folds <= 1) return foldOf;
+
+    std::mt19937 rng(seed);
+    if (!shouldUseStratifiedFolds(y)) {
+        std::vector<size_t> order(n);
+        std::iota(order.begin(), order.end(), 0);
+        std::shuffle(order.begin(), order.end(), rng);
+        for (size_t rank = 0; rank < n; ++rank) {
+            foldOf[order[rank]] = static_cast<int>(rank % static_cast<size_t>(folds));
+        }
+        return foldOf;
+    }
+
+    std::unordered_map<long long, std::vector<size_t>> classRows;
+    classRows.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const long long label = static_cast<long long>(std::llround(y[i]));
+        classRows[label].push_back(i);
+    }
+
+    for (auto& kv : classRows) {
+        auto& rows = kv.second;
+        std::shuffle(rows.begin(), rows.end(), rng);
+        for (size_t rank = 0; rank < rows.size(); ++rank) {
+            foldOf[rows[rank]] = static_cast<int>(rank % static_cast<size_t>(folds));
+        }
+    }
+    return foldOf;
+}
+
 FeatureScaler fitFeatureScaler(const Matrix& X, const std::vector<size_t>& trainRows) {
     FeatureScaler scaler;
     if (X.empty() || trainRows.empty()) return scaler;
@@ -51,15 +101,17 @@ void scaleRowInPlace(std::vector<double>& row, const FeatureScaler& scaler) {
     }
 }
 
-Matrix gatherAndScaleRows(const Matrix& X, const std::vector<size_t>& rows, const FeatureScaler& scaler) {
-    Matrix out;
+void gatherAndScaleRows(const Matrix& X,
+                        const std::vector<size_t>& rows,
+                        const FeatureScaler& scaler,
+                        Matrix& out) {
+    out.clear();
     out.reserve(rows.size());
     for (size_t idx : rows) {
         std::vector<double> row = X[idx];
         scaleRowInPlace(row, scaler);
         out.push_back(std::move(row));
     }
-    return out;
 }
 
 std::pair<double, double> fitTargetScaler(const std::vector<double>& y) {
@@ -75,7 +127,7 @@ std::pair<double, double> fitTargetScaler(const std::vector<double>& y) {
     return {mean, stddev};
 }
 
-std::vector<double> fitLinear(const Matrix& X, const std::vector<double>& y, double lambda = 0.0) {
+std::vector<double> fitLinear(Matrix X, std::vector<double> y, double lambda = 0.0) {
     if (X.empty()) return {};
 
     const size_t n = X.size();
@@ -103,7 +155,7 @@ std::vector<double> fitLinear(const Matrix& X, const std::vector<double>& y, dou
         }
     }
 
-    return MathUtils::multipleLinearRegression(design, target);
+    return MathUtils::multipleLinearRegression(std::move(design), std::move(target));
 }
 
 double predictLinear(const std::vector<double>& beta, const std::vector<double>& x) {
@@ -119,26 +171,24 @@ BenchmarkResult evalLinear(const std::string& name, const Matrix& X, const std::
 
     size_t n = X.size();
     int folds = std::max(2, std::min<int>(kfold, static_cast<int>(n)));
-    size_t foldSize = std::max<size_t>(1, n / folds);
-
-    std::vector<size_t> order(n);
-    std::iota(order.begin(), order.end(), 0);
-    std::mt19937 rng(seed);
-    std::shuffle(order.begin(), order.end(), rng);
+    const std::vector<int> foldOf = buildFoldAssignment(y, folds, seed);
 
     std::vector<double> preds(n, 0.0);
+    Matrix XtrScaled;
+    Matrix XteScaled;
+    std::vector<double> ytr;
+    std::vector<double> ytrScaled;
+    std::vector<size_t> testRows;
+    std::vector<size_t> trainRows;
     for (int f = 0; f < folds; ++f) {
-        size_t s = static_cast<size_t>(f) * foldSize;
-        size_t e = (f == folds - 1) ? n : std::min(n, s + foldSize);
-        std::vector<double> ytr;
-        std::vector<size_t> testRows;
-        std::vector<size_t> trainRows;
-        ytr.reserve(n - (e - s));
-        testRows.reserve(e - s);
-        trainRows.reserve(n - (e - s));
-        for (size_t i = 0; i < n; ++i) {
-            size_t idx = order[i];
-            if (i >= s && i < e) {
+        ytr.clear();
+        testRows.clear();
+        trainRows.clear();
+        ytr.reserve(n);
+        testRows.reserve(n / static_cast<size_t>(folds) + 1);
+        trainRows.reserve(n);
+        for (size_t idx = 0; idx < n; ++idx) {
+            if (foldOf[idx] == f) {
                 testRows.push_back(idx);
                 continue;
             }
@@ -149,14 +199,14 @@ BenchmarkResult evalLinear(const std::string& name, const Matrix& X, const std::
         if (trainRows.empty() || testRows.empty()) continue;
 
         FeatureScaler xScaler = fitFeatureScaler(X, trainRows);
-        Matrix XtrScaled = gatherAndScaleRows(X, trainRows, xScaler);
-        Matrix XteScaled = gatherAndScaleRows(X, testRows, xScaler);
+        gatherAndScaleRows(X, trainRows, xScaler, XtrScaled);
+        gatherAndScaleRows(X, testRows, xScaler, XteScaled);
 
         auto [yMean, yStd] = fitTargetScaler(ytr);
-        std::vector<double> ytrScaled = ytr;
+        ytrScaled = ytr;
         for (double& v : ytrScaled) v = (v - yMean) / yStd;
 
-        auto beta = fitLinear(XtrScaled, ytrScaled, lambda);
+        auto beta = fitLinear(std::move(XtrScaled), std::move(ytrScaled), lambda);
         for (size_t i = 0; i < XteScaled.size(); ++i) {
             double predScaled = predictLinear(beta, XteScaled[i]);
             preds[testRows[i]] = predScaled * yStd + yMean;
@@ -189,30 +239,20 @@ BenchmarkResult evalTreeStump(const Matrix& X, const std::vector<double>& y, int
     size_t n = X.size();
     size_t p = X[0].size();
     std::vector<double> preds(n, 0.0);
-    std::vector<double> gain(p, 0.0);
 
     int folds = std::max(2, std::min<int>(kfold, static_cast<int>(n)));
-    size_t foldSize = std::max<size_t>(1, n / folds);
-
-    std::vector<size_t> order(n);
-    std::iota(order.begin(), order.end(), 0);
-    std::mt19937 rng(seed);
-    std::shuffle(order.begin(), order.end(), rng);
+    const std::vector<int> foldOf = buildFoldAssignment(y, folds, seed);
 
     for (int f = 0; f < folds; ++f) {
-        size_t s = static_cast<size_t>(f) * foldSize;
-        size_t e = (f == folds - 1) ? n : std::min(n, s + foldSize);
-
         size_t bestFeat = 0;
         double bestThresh = 0.0;
         double bestErr = 1e300;
 
         for (size_t feat = 0; feat < p; ++feat) {
             std::vector<double> cand;
-            cand.reserve(n - (e - s));
-            for (size_t i = 0; i < n; ++i) {
-                if (i >= s && i < e) continue;
-                size_t idx = order[i];
+            cand.reserve(n);
+            for (size_t idx = 0; idx < n; ++idx) {
+                if (foldOf[idx] == f) continue;
                 cand.push_back(X[idx][feat]);
             }
             if (cand.empty()) continue;
@@ -220,9 +260,8 @@ BenchmarkResult evalTreeStump(const Matrix& X, const std::vector<double>& y, int
             double thr = cand[cand.size() / 2];
 
             double lsum = 0, rsum = 0; size_t lc = 0, rc = 0;
-            for (size_t i = 0; i < n; ++i) {
-                if (i >= s && i < e) continue;
-                size_t idx = order[i];
+            for (size_t idx = 0; idx < n; ++idx) {
+                if (foldOf[idx] == f) continue;
                 if (X[idx][feat] <= thr) { lsum += y[idx]; lc++; }
                 else { rsum += y[idx]; rc++; }
             }
@@ -230,9 +269,8 @@ BenchmarkResult evalTreeStump(const Matrix& X, const std::vector<double>& y, int
             double rmean = rc ? rsum / rc : 0.0;
 
             double err = 0.0;
-            for (size_t i = 0; i < n; ++i) {
-                if (i >= s && i < e) continue;
-                size_t idx = order[i];
+            for (size_t idx = 0; idx < n; ++idx) {
+                if (foldOf[idx] == f) continue;
                 double pred = (X[idx][feat] <= thr) ? lmean : rmean;
                 double d = y[idx] - pred;
                 err += d * d;
@@ -244,20 +282,17 @@ BenchmarkResult evalTreeStump(const Matrix& X, const std::vector<double>& y, int
             }
         }
 
-        gain[bestFeat] += 1.0;
-
         double lsum = 0, rsum = 0; size_t lc = 0, rc = 0;
-        for (size_t i = 0; i < n; ++i) {
-            if (i >= s && i < e) continue;
-            size_t idx = order[i];
+        for (size_t idx = 0; idx < n; ++idx) {
+            if (foldOf[idx] == f) continue;
             if (X[idx][bestFeat] <= bestThresh) { lsum += y[idx]; lc++; }
             else { rsum += y[idx]; rc++; }
         }
         double lmean = lc ? lsum / lc : 0.0;
         double rmean = rc ? rsum / rc : 0.0;
 
-        for (size_t i = s; i < e; ++i) {
-            size_t idx = order[i];
+        for (size_t idx = 0; idx < n; ++idx) {
+            if (foldOf[idx] != f) continue;
             preds[idx] = (X[idx][bestFeat] <= bestThresh) ? lmean : rmean;
         }
     }
@@ -276,7 +311,109 @@ BenchmarkResult evalTreeStump(const Matrix& X, const std::vector<double>& y, int
     res.r2 = (tss > 0 ? 1.0 - rss / tss : 0.0);
     res.actual = y;
     res.predicted = preds;
-    res.featureImportance = gain;
+    res.featureImportance.clear();
+    return res;
+}
+
+BenchmarkResult evalBaggedTreeStumps(const Matrix& X, const std::vector<double>& y, int kfold, uint32_t seed, size_t bags = 25) {
+    BenchmarkResult res;
+    res.model = "BaggedTreeStumps";
+    if (X.empty() || X[0].empty()) return res;
+
+    const size_t n = X.size();
+    const size_t p = X[0].size();
+    std::vector<double> preds(n, 0.0);
+
+    int folds = std::max(2, std::min<int>(kfold, static_cast<int>(n)));
+    const std::vector<int> foldOf = buildFoldAssignment(y, folds, seed);
+
+    for (int f = 0; f < folds; ++f) {
+        std::vector<size_t> trainRows;
+        std::vector<size_t> testRows;
+        trainRows.reserve(n);
+        testRows.reserve(n / static_cast<size_t>(folds) + 1);
+        for (size_t i = 0; i < n; ++i) {
+            if (foldOf[i] == f) testRows.push_back(i);
+            else trainRows.push_back(i);
+        }
+        if (trainRows.empty() || testRows.empty()) continue;
+
+        std::vector<double> foldPred(testRows.size(), 0.0);
+        std::mt19937 rng(seed ^ static_cast<uint32_t>(0x9E3779B9u + static_cast<uint32_t>(f * 31)));
+        std::uniform_int_distribution<size_t> rowDist(0, trainRows.size() - 1);
+
+        for (size_t b = 0; b < std::max<size_t>(1, bags); ++b) {
+            std::vector<size_t> sampled;
+            sampled.reserve(trainRows.size());
+            for (size_t k = 0; k < trainRows.size(); ++k) sampled.push_back(trainRows[rowDist(rng)]);
+
+            size_t bestFeat = 0;
+            double bestThresh = 0.0;
+            double bestErr = std::numeric_limits<double>::infinity();
+
+            for (size_t feat = 0; feat < p; ++feat) {
+                std::vector<double> cand;
+                cand.reserve(sampled.size());
+                for (size_t idx : sampled) cand.push_back(X[idx][feat]);
+                if (cand.empty()) continue;
+                std::nth_element(cand.begin(), cand.begin() + cand.size() / 2, cand.end());
+                const double thr = cand[cand.size() / 2];
+
+                double lsum = 0.0, rsum = 0.0;
+                size_t lc = 0, rc = 0;
+                for (size_t idx : sampled) {
+                    if (X[idx][feat] <= thr) { lsum += y[idx]; ++lc; }
+                    else { rsum += y[idx]; ++rc; }
+                }
+                const double lmean = lc ? lsum / static_cast<double>(lc) : 0.0;
+                const double rmean = rc ? rsum / static_cast<double>(rc) : 0.0;
+
+                double err = 0.0;
+                for (size_t idx : sampled) {
+                    const double pred = (X[idx][feat] <= thr) ? lmean : rmean;
+                    const double d = y[idx] - pred;
+                    err += d * d;
+                }
+                if (err < bestErr) {
+                    bestErr = err;
+                    bestFeat = feat;
+                    bestThresh = thr;
+                }
+            }
+
+            double lsum = 0.0, rsum = 0.0;
+            size_t lc = 0, rc = 0;
+            for (size_t idx : sampled) {
+                if (X[idx][bestFeat] <= bestThresh) { lsum += y[idx]; ++lc; }
+                else { rsum += y[idx]; ++rc; }
+            }
+            const double lmean = lc ? lsum / static_cast<double>(lc) : 0.0;
+            const double rmean = rc ? rsum / static_cast<double>(rc) : 0.0;
+
+            for (size_t i = 0; i < testRows.size(); ++i) {
+                foldPred[i] += (X[testRows[i]][bestFeat] <= bestThresh) ? lmean : rmean;
+            }
+        }
+
+        const double invBags = 1.0 / static_cast<double>(std::max<size_t>(1, bags));
+        for (size_t i = 0; i < testRows.size(); ++i) preds[testRows[i]] = foldPred[i] * invBags;
+    }
+
+    double mse = 0.0;
+    const double mean = std::accumulate(y.begin(), y.end(), 0.0) / static_cast<double>(n);
+    double tss = 0.0, rss = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double d = y[i] - preds[i];
+        mse += d * d;
+        rss += d * d;
+        const double t = y[i] - mean;
+        tss += t * t;
+    }
+
+    res.rmse = std::sqrt(mse / static_cast<double>(n));
+    res.r2 = (tss > 0.0) ? 1.0 - (rss / tss) : 0.0;
+    res.actual = y;
+    res.predicted = preds;
     return res;
 }
 }
@@ -309,9 +446,10 @@ std::vector<BenchmarkResult> BenchmarkEngine::run(const TypedDataset& data, int 
     BenchmarkResult linear;
     BenchmarkResult ridge;
     BenchmarkResult stump;
+    BenchmarkResult baggedStump;
 
     #ifdef USE_OPENMP
-    #pragma omp parallel sections default(none) shared(linear, ridge, stump, X, target, kfold, seed)
+    #pragma omp parallel sections default(none) shared(linear, ridge, stump, baggedStump, X, target, kfold, seed)
     {
         #pragma omp section
         { linear = evalLinear("LinearRegression", X, target, kfold, seed, 1e-6); }
@@ -319,16 +457,20 @@ std::vector<BenchmarkResult> BenchmarkEngine::run(const TypedDataset& data, int 
         { ridge = evalLinear("RidgeRegression", X, target, kfold, seed ^ 0x9e3779b9U, 1.0); }
         #pragma omp section
         { stump = evalTreeStump(X, target, kfold, seed ^ 0x85ebca6bU); }
+        #pragma omp section
+        { baggedStump = evalBaggedTreeStumps(X, target, kfold, seed ^ 0xc2b2ae35U, 25); }
     }
     #else
     linear = evalLinear("LinearRegression", X, target, kfold, seed, 1e-6);
     ridge = evalLinear("RidgeRegression", X, target, kfold, seed ^ 0x9e3779b9U, 1.0);
     stump = evalTreeStump(X, target, kfold, seed ^ 0x85ebca6bU);
+    baggedStump = evalBaggedTreeStumps(X, target, kfold, seed ^ 0xc2b2ae35U, 25);
     #endif
 
     out.push_back(std::move(linear));
     out.push_back(std::move(ridge));
     out.push_back(std::move(stump));
+    out.push_back(std::move(baggedStump));
 
     // crude binary accuracy if target looks binary
     bool isBinary = true;

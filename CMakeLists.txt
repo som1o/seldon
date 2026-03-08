@@ -26,9 +26,7 @@ option(SELDON_ENABLE_FAST_MATH "Enable -ffast-math for faster floating-point ker
 option(SELDON_ENABLE_LTO "Enable interprocedural optimization (LTO/IPO)" ON)
 option(SELDON_ENABLE_PGO_GENERATE "Build with -fprofile-generate instrumentation" OFF)
 option(SELDON_ENABLE_PGO_USE "Build with -fprofile-use profile feedback" OFF)
-option(SELDON_ENABLE_REST_SERVICE "Build lightweight REST prediction service" ON)
 
-message(STATUS "Seldon: web dashboard + CLI + REST service modes enabled in unified binary")
 
 if(SELDON_ENABLE_NATIVE_ARCH)
     target_compile_options(seldon PRIVATE -march=native)
@@ -118,30 +116,7 @@ if(SELDON_ENABLE_NATIVE_PARQUET)
     endif()
 endif()
 
-if(SELDON_ENABLE_REST_SERVICE)
-    find_path(HTTPLIB_INCLUDE_DIR httplib.h)
-    find_library(HTTPLIB_LIBRARY NAMES cpp-httplib)
-    if(NOT HTTPLIB_INCLUDE_DIR)
-        include(FetchContent)
-        FetchContent_Declare(
-            cpp_httplib
-            GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-            GIT_TAG v0.15.3
-        )
-        FetchContent_MakeAvailable(cpp_httplib)
-        set(HTTPLIB_INCLUDE_DIR "${cpp_httplib_SOURCE_DIR}")
-        unset(HTTPLIB_LIBRARY)
-    endif()
 
-    target_sources(seldon PRIVATE src/service/PredictionService.cpp)
-    target_sources(seldon PRIVATE src/web/WebDashboard.cpp)
-    target_include_directories(seldon PRIVATE ${HTTPLIB_INCLUDE_DIR})
-    if(HTTPLIB_LIBRARY)
-        target_link_libraries(seldon PRIVATE ${HTTPLIB_LIBRARY})
-    endif()
-
-    message(STATUS "Seldon: REST prediction service integrated into seldon binary")
-endif()
 
 if(SELDON_ENABLE_CUDA)
     find_package(CUDAToolkit QUIET)

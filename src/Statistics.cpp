@@ -1,12 +1,28 @@
 #include "Statistics.h"
 
+#include "AutoConfig.h"
+
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <limits>
 #include <numeric>
 #include <unordered_map>
 
 namespace {
+constexpr size_t kMinAdfLagSamples = 12;
+constexpr double kStationaryGammaThreshold = -0.08;
+constexpr double kStationaryPValueThreshold = 0.05;
+constexpr double kStddevFloor = 1e-9;
+
+std::vector<uint8_t> buildFiniteMask(const std::vector<double>& values) {
+    std::vector<uint8_t> mask(values.size(), static_cast<uint8_t>(0));
+    for (size_t i = 0; i < values.size(); ++i) {
+        mask[i] = std::isfinite(values[i]) ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+    }
+    return mask;
+}
+
 double safeLog2(double p) {
     if (p <= 1e-12) return 0.0;
     return std::log(p) / std::log(2.0);
@@ -46,11 +62,14 @@ ColumnStats Statistics::calculateStats(const std::vector<double>& col) {
     ColumnStats stats{0, 0, 0, 0, 0, 0};
     if (col.empty()) return stats;
 
+    const std::vector<uint8_t> finiteMask = buildFiniteMask(col);
+
     double mean = 0.0;
     double m2 = 0.0;
     size_t count = 0;
-    for (double value : col) {
-        if (!std::isfinite(value)) continue;
+    for (size_t i = 0; i < col.size(); ++i) {
+        if (!finiteMask[i]) continue;
+        const double value = col[i];
         ++count;
         double delta = value - mean;
         mean += delta / static_cast<double>(count);
@@ -66,8 +85,8 @@ ColumnStats Statistics::calculateStats(const std::vector<double>& col) {
 
     std::vector<double> medianWork;
     medianWork.reserve(n);
-    for (double value : col) {
-        if (std::isfinite(value)) medianWork.push_back(value);
+    for (size_t i = 0; i < col.size(); ++i) {
+        if (finiteMask[i]) medianWork.push_back(col[i]);
     }
     size_t mid = n / 2;
     std::nth_element(medianWork.begin(), medianWork.begin() + mid, medianWork.end());
@@ -81,8 +100,9 @@ ColumnStats Statistics::calculateStats(const std::vector<double>& col) {
 
     if (n > 2 && stats.stddev > 0) {
         double m3 = 0, m4 = 0;
-        for (double val : col) {
-            if (!std::isfinite(val)) continue;
+        for (size_t i = 0; i < col.size(); ++i) {
+            if (!finiteMask[i]) continue;
+            const double val = col[i];
             double diff = val - stats.mean;
             double diff2 = diff * diff;
             m3 += diff2 * diff;
@@ -120,36 +140,39 @@ StationarityDiagnostic Statistics::adfStyleDrift(const std::vector<double>& seri
         return out;
     }
 
-    std::vector<std::pair<double, double>> aligned;
-    aligned.reserve(n);
+    std::vector<size_t> order;
+    order.reserve(n);
     for (size_t i = 0; i < n; ++i) {
         if (!std::isfinite(series[i]) || !std::isfinite(axis[i])) continue;
-        aligned.push_back({axis[i], series[i]});
+        order.push_back(i);
     }
-    if (aligned.size() < 16) {
+    if (order.size() < 16) {
         out.verdict = "insufficient";
         return out;
     }
 
-    std::sort(aligned.begin(), aligned.end(), [](const auto& a, const auto& b) {
-        if (a.first == b.first) return a.second < b.second;
-        return a.first < b.first;
+    std::sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+        if (axis[lhs] == axis[rhs]) return series[lhs] < series[rhs];
+        return axis[lhs] < axis[rhs];
     });
 
     std::vector<double> lag;
     std::vector<double> delta;
-    lag.reserve(aligned.size() - 1);
-    delta.reserve(aligned.size() - 1);
-    for (size_t i = 1; i < aligned.size(); ++i) {
-        const double y0 = aligned[i - 1].second;
-        const double y1 = aligned[i].second;
-        if (!std::isfinite(y0) || !std::isfinite(y1)) continue;
+    std::vector<double> yVals;
+    lag.reserve(order.size() - 1);
+    delta.reserve(order.size() - 1);
+    yVals.reserve(order.size());
+    if (!order.empty()) yVals.push_back(series[order.front()]);
+    for (size_t i = 1; i < order.size(); ++i) {
+        const double y0 = series[order[i - 1]];
+        const double y1 = series[order[i]];
         lag.push_back(y0);
         delta.push_back(y1 - y0);
+        yVals.push_back(y1);
     }
 
     out.samples = lag.size();
-    if (lag.size() < 12) {
+    if (lag.size() < kMinAdfLagSamples) {
         out.verdict = "insufficient";
         return out;
     }
@@ -192,29 +215,27 @@ StationarityDiagnostic Statistics::adfStyleDrift(const std::vector<double>& seri
         out.pApprox = 1.0;
     }
 
-    const size_t q = std::max<size_t>(3, aligned.size() / 4);
+    const size_t q = std::max<size_t>(3, lag.size() / 4);
     double earlyMean = 0.0;
     double lateMean = 0.0;
-    for (size_t i = 0; i < q; ++i) earlyMean += aligned[i].second;
-    for (size_t i = aligned.size() - q; i < aligned.size(); ++i) lateMean += aligned[i].second;
+    for (size_t i = 0; i < q; ++i) earlyMean += lag[i];
+    for (size_t i = lag.size() - q; i < lag.size(); ++i) lateMean += lag[i];
     earlyMean /= static_cast<double>(q);
     lateMean /= static_cast<double>(q);
 
-    std::vector<double> yVals;
-    yVals.reserve(aligned.size());
-    for (const auto& p : aligned) yVals.push_back(p.second);
     const ColumnStats ys = Statistics::calculateStats(yVals);
-    const double scale = std::max(1e-9, ys.stddev);
+    const double scale = std::max(kStddevFloor, ys.stddev);
     out.driftRatio = std::abs(lateMean - earlyMean) / scale;
 
-    const bool weakMeanReversion = gamma > -0.03;
-    const bool notSignificant = out.pApprox > 0.05;
-    const bool sizableDrift = out.driftRatio >= 0.35;
+    const HeuristicTuningConfig tuning{};
+    const bool weakMeanReversion = gamma > tuning.stationarityWeakMeanReversionGamma;
+    const bool notSignificant = out.pApprox > tuning.stationarityNotSignificantPValue;
+    const bool sizableDrift = out.driftRatio >= tuning.stationaritySizableDriftRatio;
     out.nonStationary = weakMeanReversion && (notSignificant || sizableDrift);
 
     if (out.nonStationary) {
         out.verdict = "non-stationary";
-    } else if (gamma <= -0.08 && out.pApprox <= 0.05 && out.driftRatio < 0.25) {
+    } else if (gamma <= kStationaryGammaThreshold && out.pApprox <= kStationaryPValueThreshold && out.driftRatio < 0.25) {
         out.verdict = "stationary";
     } else {
         out.verdict = "borderline";
@@ -292,9 +313,10 @@ AsymmetricDirectionScore Statistics::asymmetricInformationGain(const std::vector
 
     const double igXtoY = std::max(0.0, hy - hyGivenX);
     const double igYtoX = std::max(0.0, hx - hxGivenY);
-    out.xToY = igXtoY;
-    out.yToX = igYtoX;
-    out.asymmetry = igXtoY - igYtoX;
+    out.igXtoY = igXtoY;
+    out.igYtoX = igYtoX;
+    const double scale = std::max(1e-12, std::max(igXtoY, igYtoX));
+    out.asymmetry = (igXtoY - igYtoX) / scale;
 
     const double eps = 1e-4;
     if (out.asymmetry > eps) out.suggestedDirection = "x->y";

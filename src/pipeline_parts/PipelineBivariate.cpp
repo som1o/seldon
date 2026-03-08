@@ -177,10 +177,17 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
     double bestIgProxy = 0.0;
     {
         const size_t n = numericFeatures.size();
+        constexpr double kPairPrefilterAbsR = 0.05;
         for (size_t i = 0; i < n; ++i) {
             const auto& xa = std::get<std::vector<double>>(data.columns()[numericFeatures[i]].values);
+            const auto xaIt = statsCache.find(numericFeatures[i]);
+            const ColumnStats xaStats = (xaIt != statsCache.end()) ? xaIt->second : Statistics::calculateStats(xa);
             for (size_t j = i + 1; j < n; ++j) {
                 const auto& xb = std::get<std::vector<double>>(data.columns()[numericFeatures[j]].values);
+                const auto xbIt = statsCache.find(numericFeatures[j]);
+                const ColumnStats xbStats = (xbIt != statsCache.end()) ? xbIt->second : Statistics::calculateStats(xb);
+                const double rPair = std::abs(MathUtils::calculatePearson(xa, xb, xaStats, xbStats).value_or(0.0));
+                if (rPair < kPairPrefilterAbsR) continue;
                 std::vector<double> cross;
                 cross.reserve(std::min({xa.size(), xb.size(), y.size()}));
                 std::vector<double> yc;
