@@ -1,3 +1,7 @@
+#include "PipelineParts.h"
+
+namespace seldon_pipeline {
+
 struct RegularizedSeriesView {
     std::vector<double> x;
     std::vector<double> y;
@@ -923,18 +927,8 @@ AdvancedAnalyticsOutputs buildAdvancedAnalyticsOutputs(const TypedDataset& data,
     return out;
 }
 
-struct StratifiedPopulationInsight {
-    std::string segmentColumn;
-    std::string numericColumn;
-    size_t groups = 0;
-    size_t rows = 0;
-    double eta2 = 0.0;
-    double separation = 0.0;
-    std::string groupMeans;
-};
-
 std::vector<StratifiedPopulationInsight> detectStratifiedPopulations(const TypedDataset& data,
-                                                                     size_t maxInsights = 12) {
+                                                                     size_t maxInsights) {
     std::vector<StratifiedPopulationInsight> out;
     const auto cats = data.categoricalColumnIndices();
     const auto nums = data.numericColumnIndices();
@@ -1627,3 +1621,5 @@ void addOverallSections(ReportEngine& report,
                   << " selected significant pair finding(s).\n";
     }
 }
+
+} // namespace seldon_pipeline

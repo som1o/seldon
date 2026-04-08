@@ -1,3 +1,7 @@
+#include "PipelineParts.h"
+
+namespace seldon_pipeline {
+
 NeuralAnalysis runNeuralAnalysis(const TypedDataset& data,
                                  int targetIdx,
                                  const std::vector<int>& featureIdx,
@@ -2344,17 +2348,6 @@ std::vector<PairInsight> analyzeBivariatePairs(const TypedDataset& data,
     return pairs;
 }
 
-struct ContingencyInsight {
-    std::string catA;
-    std::string catB;
-    double chi2 = 0.0;
-    double pValue = 1.0;
-    double cramerV = 0.0;
-    double oddsRatio = 1.0;
-    double oddsCiLow = 1.0;
-    double oddsCiHigh = 1.0;
-};
-
 std::vector<ContingencyInsight> analyzeContingencyPairs(const TypedDataset& data) {
     std::vector<ContingencyInsight> out;
     const auto cats = data.categoricalColumnIndices();
@@ -2427,15 +2420,6 @@ std::vector<ContingencyInsight> analyzeContingencyPairs(const TypedDataset& data
     return out;
 }
 
-struct AnovaInsight {
-    std::string categorical;
-    std::string numeric;
-    double fStat = 0.0;
-    double pValue = 1.0;
-    double eta2 = 0.0;
-    std::string tukeySummary;
-};
-
 std::vector<AnovaInsight> analyzeAnovaPairs(const TypedDataset& data) {
     std::vector<AnovaInsight> out;
     const auto cats = data.categoricalColumnIndices();
@@ -2496,35 +2480,11 @@ std::vector<AnovaInsight> analyzeAnovaPairs(const TypedDataset& data) {
     return out;
 }
 
-struct AdvancedAnalyticsOutputs {
-    std::vector<std::vector<std::string>> orderedRows;
-    std::vector<std::vector<std::string>> mahalanobisRows;
-    std::vector<std::vector<std::string>> pdpRows;
-    std::vector<std::vector<std::string>> causalDagRows;
-    std::vector<std::vector<std::string>> globalConditionalRows;
-    std::vector<std::vector<std::string>> temporalDriftRows;
-    std::vector<std::vector<std::string>> contextualDeadZoneRows;
-    std::vector<std::string> narrativeRows;
-    std::vector<std::string> priorityTakeaways;
-    std::optional<std::string> interactionEvidence;
-    std::optional<std::string> causalDagMermaid;
-    std::unordered_map<size_t, double> mahalanobisByRow;
-    double mahalanobisThreshold = 0.0;
-    std::optional<std::string> executiveSummary;
-};
-
-struct ConditionalDriftAssessment {
-    bool signFlip = false;
-    bool magnitudeCollapse = false;
-    double collapseRatio = 1.0;
-    std::string label = "stable";
-};
-
 ConditionalDriftAssessment assessGlobalConditionalDrift(double globalR,
                                                         double conditionalR,
-                                                        double minGlobalAbs = 0.15,
-                                                        double collapseRatioThreshold = 0.50,
-                                                        double collapseAbsDrop = 0.12) {
+                                                        double minGlobalAbs,
+                                                        double collapseRatioThreshold,
+                                                        double collapseAbsDrop) {
     ConditionalDriftAssessment out;
     if (!std::isfinite(globalR) || !std::isfinite(conditionalR)) {
         out.label = "insufficient";
@@ -2566,11 +2526,6 @@ std::string cramerStrengthLabel(double v) {
     if (v >= 0.10) return "weak";
     return "very weak";
 }
-
-struct TemporalAxisDescriptor {
-    std::vector<double> axis;
-    std::string name;
-};
 
 TemporalAxisDescriptor detectTemporalAxis(const TypedDataset& data) {
     TemporalAxisDescriptor out;
@@ -2634,20 +2589,10 @@ double absCorrAligned(const std::vector<double>& x,
     return std::abs(MathUtils::calculatePearson(xa, ya, xs, ys).value_or(0.0));
 }
 
-struct ContextualDeadZoneInsight {
-    std::string feature;
-    std::string strongCluster;
-    std::string weakCluster;
-    double strongCorr = 0.0;
-    double weakCorr = 0.0;
-    double dropRatio = 1.0;
-    size_t support = 0;
-};
-
 std::vector<ContextualDeadZoneInsight> detectContextualDeadZones(const TypedDataset& data,
                                                                  size_t targetIdx,
                                                                  const std::vector<size_t>& candidateFeatures,
-                                                                 size_t maxRows = 10) {
+                                                                 size_t maxRows) {
     std::vector<ContextualDeadZoneInsight> out;
     if (targetIdx >= data.columns().size() || data.columns()[targetIdx].type != ColumnType::NUMERIC) return out;
 
@@ -2745,4 +2690,6 @@ std::vector<ContextualDeadZoneInsight> detectContextualDeadZones(const TypedData
     if (out.size() > maxRows) out.resize(maxRows);
     return out;
 }
+
+} // namespace seldon_pipeline
 

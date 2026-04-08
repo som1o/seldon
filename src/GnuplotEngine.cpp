@@ -1,8 +1,10 @@
 #include "GnuplotEngine.h"
+#include "CommonUtils.h"
 #include "PlotHeuristics.h"
 #include "StatsUtils.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cctype>
 #include <cstdlib>
@@ -14,14 +16,11 @@
 #include <map>
 #include <mutex>
 #include <numeric>
-#include <spawn.h>
 #include <sstream>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
-
-extern char** environ;
 
 namespace {
 std::string trimAsciiSpaces(const std::string& value) {
@@ -655,78 +654,15 @@ std::string ganttColorForSemantic(const std::string& semantic, const std::string
     return fallback;
 }
 
-std::string findExecutableInPath(const std::string& command) {
-    if (command.empty()) return "";
-    const char* pathEnv = std::getenv("PATH");
-    if (!pathEnv) return "";
-
-    std::stringstream ss{std::string(pathEnv)};
-    std::string token;
-    while (std::getline(ss, token, ':')) {
-        if (token.empty()) token = ".";
-        std::filesystem::path candidate = std::filesystem::path(token) / command;
-        std::error_code ec;
-        if (std::filesystem::exists(candidate, ec) && !ec && ::access(candidate.c_str(), X_OK) == 0) {
-            return candidate.string();
-        }
-    }
-    return "";
-}
-
 int spawnGnuplot(const std::string& executable,
                  const std::string& scriptPath,
                  const std::string& stderrPath) {
     const int errFd = ::open(stderrPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
     if (errFd < 0) return -1;
 
-    int fdFlags = ::fcntl(errFd, F_GETFD);
-    if (fdFlags < 0 || ::fcntl(errFd, F_SETFD, fdFlags | FD_CLOEXEC) < 0) {
-        ::close(errFd);
-        return -1;
-    }
-
-    posix_spawn_file_actions_t actions;
-    if (::posix_spawn_file_actions_init(&actions) != 0) {
-        ::close(errFd);
-        return -1;
-    }
-
-    if (::posix_spawn_file_actions_adddup2(&actions, errFd, STDERR_FILENO) != 0 ||
-        ::posix_spawn_file_actions_addclose(&actions, errFd) != 0) {
-        ::posix_spawn_file_actions_destroy(&actions);
-        ::close(errFd);
-        return -1;
-    }
-
-    posix_spawnattr_t attr;
-    if (::posix_spawnattr_init(&attr) != 0) {
-        ::posix_spawn_file_actions_destroy(&actions);
-        ::close(errFd);
-        return -1;
-    }
-
-    short spawnFlags = 0;
-#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
-    spawnFlags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
-#endif
-    if (spawnFlags != 0 && ::posix_spawnattr_setflags(&attr, spawnFlags) != 0) {
-        ::posix_spawnattr_destroy(&attr);
-        ::posix_spawn_file_actions_destroy(&actions);
-        ::close(errFd);
-        return -1;
-    }
-
-    const char* argvRaw[] = {executable.c_str(), scriptPath.c_str(), nullptr};
-    char* const* argv = const_cast<char* const*>(argvRaw);
-    pid_t pid = -1;
-    const int spawnRc = ::posix_spawn(&pid, executable.c_str(), &actions, &attr, argv, environ);
-
-    ::posix_spawnattr_destroy(&attr);
-    ::posix_spawn_file_actions_destroy(&actions);
+    const int pid = CommonUtils::spawnProcess(executable, {scriptPath}, -1, errFd);
     ::close(errFd);
-
-    if (spawnRc != 0 || pid <= 0) return -1;
-    return static_cast<int>(pid);
+    return pid;
 }
 
 struct PlotSpawnJob {
@@ -743,6 +679,16 @@ struct PlotSpawnJob {
 constexpr size_t kMaxConcurrentGnuplotJobs = 4;
 std::mutex gPlotSpawnMutex;
 std::vector<PlotSpawnJob> gActivePlotJobs;
+
+bool removeTrackedPlotJob(pid_t pid, PlotSpawnJob& outJob) {
+    std::lock_guard<std::mutex> lock(gPlotSpawnMutex);
+    auto it = std::find_if(gActivePlotJobs.begin(), gActivePlotJobs.end(),
+                           [&](const PlotSpawnJob& job) { return job.pid == pid; });
+    if (it == gActivePlotJobs.end()) return false;
+    outJob = *it;
+    gActivePlotJobs.erase(it);
+    return true;
+}
 
 bool finalizePlotJob(const PlotSpawnJob& job, int status) {
     std::error_code ec;
@@ -782,28 +728,90 @@ bool finalizePlotJob(const PlotSpawnJob& job, int status) {
 }
 
 void reapPlotJobs(bool blockUntilOne) {
-    bool reapedAny = false;
-    while (true) {
-        int status = 0;
-        const int waitFlags = blockUntilOne && !reapedAny ? 0 : WNOHANG;
-        const pid_t pid = ::waitpid(-1, &status, waitFlags);
-        if (pid <= 0) break;
+    auto snapshotOwnedPids = []() {
+        std::vector<pid_t> pids;
+        std::lock_guard<std::mutex> lock(gPlotSpawnMutex);
+        pids.reserve(gActivePlotJobs.size());
+        for (const auto& job : gActivePlotJobs) {
+            if (job.pid > 0) pids.push_back(job.pid);
+        }
+        return pids;
+    };
 
-        PlotSpawnJob finished;
-        {
-            std::lock_guard<std::mutex> lock(gPlotSpawnMutex);
-            auto it = std::find_if(gActivePlotJobs.begin(), gActivePlotJobs.end(),
-                                   [&](const PlotSpawnJob& job) { return job.pid == pid; });
-            if (it != gActivePlotJobs.end()) {
-                finished = *it;
-                gActivePlotJobs.erase(it);
+    if (blockUntilOne) {
+        while (true) {
+            const std::vector<pid_t> ownedPids = snapshotOwnedPids();
+            if (ownedPids.empty()) return;
+
+            for (pid_t ownedPid : ownedPids) {
+                int status = 0;
+                pid_t waited = -1;
+                do {
+                    waited = ::waitpid(ownedPid, &status, WNOHANG);
+                } while (waited < 0 && errno == EINTR);
+
+                if (waited == ownedPid) {
+                    PlotSpawnJob finished;
+                    if (removeTrackedPlotJob(ownedPid, finished)) {
+                        finalizePlotJob(finished, status);
+                    }
+                    return;
+                }
+                if (waited < 0 && errno == ECHILD) {
+                    PlotSpawnJob orphan;
+                    removeTrackedPlotJob(ownedPid, orphan);
+                }
+            }
+
+            const pid_t blockingPid = ownedPids.front();
+            int status = 0;
+            pid_t waited = -1;
+            do {
+                waited = ::waitpid(blockingPid, &status, 0);
+            } while (waited < 0 && errno == EINTR);
+
+            if (waited == blockingPid) {
+                PlotSpawnJob finished;
+                if (removeTrackedPlotJob(blockingPid, finished)) {
+                    finalizePlotJob(finished, status);
+                }
+                return;
+            }
+            if (waited < 0 && errno == ECHILD) {
+                PlotSpawnJob orphan;
+                removeTrackedPlotJob(blockingPid, orphan);
+                continue;
+            }
+            return;
+        }
+    }
+
+    while (true) {
+        const std::vector<pid_t> ownedPids = snapshotOwnedPids();
+        if (ownedPids.empty()) break;
+
+        bool madeProgress = false;
+        for (pid_t ownedPid : ownedPids) {
+            int status = 0;
+            pid_t waited = -1;
+            do {
+                waited = ::waitpid(ownedPid, &status, WNOHANG);
+            } while (waited < 0 && errno == EINTR);
+
+            if (waited == ownedPid) {
+                PlotSpawnJob finished;
+                if (removeTrackedPlotJob(ownedPid, finished)) {
+                    finalizePlotJob(finished, status);
+                }
+                madeProgress = true;
+            } else if (waited < 0 && errno == ECHILD) {
+                PlotSpawnJob orphan;
+                if (removeTrackedPlotJob(ownedPid, orphan)) {
+                    madeProgress = true;
+                }
             }
         }
-        if (finished.pid > 0) {
-            finalizePlotJob(finished, status);
-        }
-        reapedAny = true;
-        if (blockUntilOne) break;
+        if (!madeProgress) break;
     }
 }
 } // namespace
@@ -892,11 +900,11 @@ GnuplotEngine::GnuplotEngine(std::string assetsDir, PlotConfig cfg)
 }
 
 bool GnuplotEngine::isAvailable() const {
-    return !findExecutableInPath("gnuplot").empty();
+    return !CommonUtils::findExecutableInPath("gnuplot").empty();
 }
 
 std::string GnuplotEngine::runScript(const std::string& id, const std::string& dataContent, const std::string& scriptContent) const {
-    static const std::string gnuplotExeCached = findExecutableInPath("gnuplot");
+    static const std::string gnuplotExeCached = CommonUtils::findExecutableInPath("gnuplot");
     if (gnuplotExeCached.empty()) {
         return "";
     }

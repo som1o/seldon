@@ -210,16 +210,70 @@ bool pathWithinRoot(const std::filesystem::path& root, const std::filesystem::pa
     return !(relStr == ".." || relStr.rfind("../", 0) == 0);
 }
 
-std::string canonicalizeWorkspacePathOrThrow(const std::string& rawPath,
-                                             const std::string& fieldLabel,
-                                             bool requireRegularFile) {
+bool hasTraversalSegment(const std::filesystem::path& path) {
+    for (const auto& part : path) {
+        if (part == "..") return true;
+    }
+    return false;
+}
+
+bool isFilesystemRoot(const std::filesystem::path& path) {
+    const std::filesystem::path normalized = path.lexically_normal();
+    if (normalized.empty()) return true;
+    return normalized == normalized.root_path();
+}
+
+std::filesystem::path workspaceRootOrThrow() {
     namespace fs = std::filesystem;
     std::error_code ec;
     const fs::path workspaceRoot = fs::canonical(fs::current_path(), ec);
     if (ec) {
         throw Seldon::ConfigurationException("Unable to resolve workspace root for path validation");
     }
+    return workspaceRoot;
+}
 
+std::string normalizeWritableWorkspacePathOrThrow(const std::string& rawPath,
+                                                  const std::string& fieldLabel) {
+    namespace fs = std::filesystem;
+    const std::string trimmed = CommonUtils::trim(rawPath);
+    if (trimmed.empty()) {
+        throw Seldon::ConfigurationException(fieldLabel + " must not be empty");
+    }
+
+    const fs::path inputPath(trimmed);
+    if (hasTraversalSegment(inputPath)) {
+        throw Seldon::ConfigurationException(fieldLabel + " must not contain traversal segments");
+    }
+
+    const fs::path workspaceRoot = workspaceRootOrThrow();
+    fs::path absolutePath = inputPath.is_absolute() ? inputPath : (workspaceRoot / inputPath);
+    absolutePath = absolutePath.lexically_normal();
+    if (absolutePath.empty() || isFilesystemRoot(absolutePath)) {
+        throw Seldon::ConfigurationException(fieldLabel + " must not be a filesystem root path");
+    }
+
+    std::error_code ec;
+    const fs::path canonicalPath = fs::weakly_canonical(absolutePath, ec);
+    if (ec) {
+        throw Seldon::ConfigurationException("Invalid " + fieldLabel + ": " + rawPath);
+    }
+    if (isFilesystemRoot(canonicalPath)) {
+        throw Seldon::ConfigurationException(fieldLabel + " must not be a filesystem root path");
+    }
+    if (!pathWithinRoot(workspaceRoot, canonicalPath)) {
+        throw Seldon::ConfigurationException(fieldLabel + " must resolve inside workspace: " + rawPath);
+    }
+    return canonicalPath.string();
+}
+
+std::string canonicalizeWorkspacePathOrThrow(const std::string& rawPath,
+                                             const std::string& fieldLabel,
+                                             bool requireRegularFile) {
+    namespace fs = std::filesystem;
+    const fs::path workspaceRoot = workspaceRootOrThrow();
+
+    std::error_code ec;
     const fs::path canonicalPath = fs::canonical(rawPath, ec);
     if (ec) {
         throw Seldon::ConfigurationException("Invalid or inaccessible " + fieldLabel + ": " + rawPath);
@@ -680,6 +734,8 @@ void assignKeyValue(AutoConfig& config, const std::string& key, const std::strin
         config.tuning.*(it->second.member) = static_cast<size_t>(parseIntStrict(value, key, it->second.minValue));
         return;
     }
+
+    throw Seldon::ConfigurationException("Unknown config key '" + key + "'");
 }
 
 std::string normalizeStructuredPath(std::string path) {
@@ -707,12 +763,6 @@ void assignConfigEntry(AutoConfig& config,
     const std::string key = normalizeConfigKey(normalizeStructuredPath(rawPath));
     const std::string value = CommonUtils::trim(rawValue);
 
-    try {
-        assignKeyValue(config, key, value);
-    } catch (const Seldon::SeldonException& ex) {
-        throw Seldon::ConfigurationException(context + " -> " + ex.what());
-    }
-
     if (key.rfind("impute.", 0) == 0) {
         const std::string normalized = CommonUtils::toLower(value);
         if (!isValidImputationStrategy(normalized)) {
@@ -724,6 +774,7 @@ void assignConfigEntry(AutoConfig& config,
             throw Seldon::ConfigurationException(context + " -> impute.<column> requires a non-empty column name");
         }
         config.columnImputation[columnName] = normalized;
+        return;
     }
     if (key.rfind("type.", 0) == 0) {
         const std::string normalized = CommonUtils::toLower(value);
@@ -731,7 +782,18 @@ void assignConfigEntry(AutoConfig& config,
             throw Seldon::ConfigurationException(context + " -> invalid column type override '" + value +
                                                  "' (allowed: numeric, categorical, datetime)");
         }
-        config.columnTypeOverrides[CommonUtils::toLower(key.substr(5))] = normalized;
+        const std::string columnName = CommonUtils::trim(key.substr(5));
+        if (columnName.empty()) {
+            throw Seldon::ConfigurationException(context + " -> type.<column> requires a non-empty column name");
+        }
+        config.columnTypeOverrides[CommonUtils::toLower(columnName)] = normalized;
+        return;
+    }
+
+    try {
+        assignKeyValue(config, key, value);
+    } catch (const Seldon::SeldonException& ex) {
+        throw Seldon::ConfigurationException(context + " -> " + ex.what());
     }
 }
 
@@ -1214,6 +1276,11 @@ std::string AutoConfig::describeParams() {
     return out.str();
 }
 
+std::string AutoConfig::normalizeWritablePath(const std::string& rawPath,
+                                              const std::string& fieldLabel) {
+    return normalizeWritableWorkspacePathOrThrow(rawPath, fieldLabel);
+}
+
 void HeuristicTuningConfig::validate() const {
     if (featureLeakageCorrThreshold < 0.0 || featureLeakageCorrThreshold > 1.0) {
         throw Seldon::ConfigurationException("feature_leakage_corr_threshold must be within [0,1]");
@@ -1310,6 +1377,15 @@ void HeuristicTuningConfig::validate() const {
 void AutoConfig::validate() const {
     if (datasetPath.empty()) {
         throw Seldon::ConfigurationException("dataset path is required");
+    }
+
+    if (!outputDir.empty()) {
+        (void)normalizeWritablePath(outputDir, "output_dir");
+    }
+    (void)normalizeWritablePath(assetsDir, "assets_dir");
+    (void)normalizeWritablePath(reportFile, "report");
+    if (!exportPreprocessedPath.empty()) {
+        (void)normalizeWritablePath(exportPreprocessedPath, "export_preprocessed_path");
     }
 
     const auto isIn = [](const std::string& value, const std::vector<std::string>& allowed) {

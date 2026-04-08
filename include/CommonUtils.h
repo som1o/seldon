@@ -179,4 +179,22 @@ inline std::string unitSemanticLabel(UnitSemanticKind kind) {
     }
 }
 
+std::string findExecutableInPath(const std::string& command);
+bool commandAvailable(const std::string& command);
+
+// Spawns a process and returns child PID (>0) or -1 on failure.
+int spawnProcess(const std::string& executable,
+                 const std::vector<std::string>& args,
+                 int stdoutFd,
+                 int stderrFd);
+
+// Waits for a child process and returns its exit status, or -1 on failure/signal termination.
+int waitForProcessExitCode(int pid);
+
+// Convenience wrapper around spawnProcess + waitForProcessExitCode.
+int spawnProcessAndWait(const std::string& executable,
+                        const std::vector<std::string>& args,
+                        int stdoutFd,
+                        int stderrFd);
+
 } // namespace CommonUtils

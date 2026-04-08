@@ -1,7 +1,9 @@
 #include "ReportEngine.h"
+#include "SeldonExceptions.h"
 
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 namespace {
@@ -93,14 +95,35 @@ std::string ReportEngine::renderBody() const {
 
 void ReportEngine::save(const std::string& filePath) const {
     const std::filesystem::path outPath(filePath);
-    std::error_code ec;
-    std::filesystem::create_directories(outPath.parent_path(), ec);
+    const std::filesystem::path parent = outPath.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            throw Seldon::IOException("Unable to create report directory '" + parent.string() + "': " + ec.message());
+        }
+    }
 
     const bool htmlOut = outPath.extension() == ".html";
     const std::string payload = htmlOut ? buildStandaloneHtml(body_) : body_;
+    if (payload.size() > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw Seldon::IOException("Report payload exceeds stream write bounds for: " + filePath);
+    }
 
     std::ofstream out(filePath, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        throw Seldon::IOException("Unable to open report output file: " + filePath);
+    }
+
     std::vector<char> ioBuffer(1 << 20, '\0');
     out.rdbuf()->pubsetbuf(ioBuffer.data(), static_cast<std::streamsize>(ioBuffer.size()));
     out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    if (!out.good()) {
+        throw Seldon::IOException("Failed to write report output file: " + filePath);
+    }
+
+    out.flush();
+    if (!out.good()) {
+        throw Seldon::IOException("Failed to flush report output file: " + filePath);
+    }
 }

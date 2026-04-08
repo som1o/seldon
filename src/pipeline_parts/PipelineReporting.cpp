@@ -1,3 +1,7 @@
+#include "PipelineParts.h"
+
+namespace seldon_pipeline {
+
 std::optional<std::string> buildResidualDiscoveryNarrative(const TypedDataset& data,
                                                            int targetIdx,
                                                            const std::vector<int>& featureIdx,
@@ -95,9 +99,9 @@ std::optional<std::string> buildResidualDiscoveryNarrative(const TypedDataset& d
 
 std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset& data,
                                                               const PreprocessReport& prep,
-                                                              const std::unordered_map<size_t, double>& mahalByRow = {},
-                                                              double mahalThreshold = 0.0,
-                                                              size_t maxRows = 8) {
+                                                              const std::unordered_map<size_t, double>& mahalByRow,
+                                                              double mahalThreshold,
+                                                              size_t maxRows) {
     std::vector<std::vector<std::string>> rows;
     if (prep.outlierFlags.empty() || data.rowCount() == 0) return rows;
 
@@ -300,5 +304,5 @@ std::vector<std::vector<std::string>> buildOutlierContextRows(const TypedDataset
     }
     return rows;
 }
-} // namespace
+} // namespace seldon_pipeline
 

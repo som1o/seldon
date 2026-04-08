@@ -1,3 +1,67 @@
+#include "AutomationPipeline.h"
+#include "PipelineParts.h"
+
+#include "CausalDiscovery.h"
+#include "CommonUtils.h"
+#include "DeterministicHeuristics.h"
+#include "MathUtils.h"
+#include "SeldonExceptions.h"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdlib>
+#include <filesystem>
+#include <future>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <numeric>
+#include <optional>
+#include <random>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <unistd.h>
+
+namespace {
+class CliProgressSpinner {
+public:
+    explicit CliProgressSpinner(bool enabled)
+        : enabled_(enabled) {}
+
+    void update(const std::string& label, size_t step, size_t total) {
+        if (!enabled_) return;
+        static const char frames[] = {'|', '/', '-', '\\'};
+        const char frame = frames[tick_++ % 4];
+        const size_t pct = (total > 0) ? static_cast<size_t>((100.0 * static_cast<double>(step)) / static_cast<double>(total)) : 0;
+        std::cout << "\r[Seldon] " << frame << " [" << step << "/" << total << "] " << pct << "% " << label << std::flush;
+    }
+
+    void done(const std::string& label) {
+        if (!enabled_) return;
+        std::cout << "\r[Seldon] Pipeline complete                                \n";
+    }
+
+private:
+    bool enabled_ = false;
+    size_t tick_ = 0;
+};
+} // namespace
+
+using namespace seldon_pipeline;
+
 int AutomationPipeline::run(const AutoConfig& config) {
     AutoConfig runCfg = config;
     static const std::string kCancellationSignal = "__seldon_cancelled__";
@@ -60,6 +124,14 @@ int AutomationPipeline::run(const AutoConfig& config) {
             reportPath = reportPath.parent_path() / (reportPath.stem().string() + ".html");
         }
         runCfg.reportFile = reportPath.string();
+
+        runCfg.outputDir = AutoConfig::normalizeWritablePath(runCfg.outputDir, "output_dir");
+        runCfg.assetsDir = AutoConfig::normalizeWritablePath(runCfg.assetsDir, "assets_dir");
+        runCfg.reportFile = AutoConfig::normalizeWritablePath(runCfg.reportFile, "report");
+        if (!runCfg.exportPreprocessedPath.empty()) {
+            runCfg.exportPreprocessedPath = AutoConfig::normalizeWritablePath(runCfg.exportPreprocessedPath,
+                                                                              "export_preprocessed_path");
+        }
     }
     CliProgressSpinner progress(!runCfg.verboseAnalysis && ::isatty(STDOUT_FILENO));
     constexpr size_t totalSteps = 10;

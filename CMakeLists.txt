@@ -13,8 +13,33 @@ file(GLOB SOURCES "src/*.cpp")
 list(FILTER SOURCES EXCLUDE REGEX "src/tests\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX "src/service_main\\.cpp$")
 
+set(PIPELINE_PART_SOURCES
+    src/pipeline_parts/PipelineUnivariate.cpp
+    src/pipeline_parts/PipelineModeling.cpp
+    src/pipeline_parts/PipelineBivariate.cpp
+    src/pipeline_parts/PipelineReporting.cpp
+    src/pipeline_parts/PipelineRuntime.cpp
+)
+
+list(APPEND SOURCES ${PIPELINE_PART_SOURCES})
+
 add_executable(seldon ${SOURCES})
 target_include_directories(seldon PRIVATE include)
+
+enable_testing()
+
+add_test(
+    NAME security_regression
+    COMMAND ${CMAKE_COMMAND} -E env SELDON_BIN=$<TARGET_FILE:seldon> bash ${CMAKE_SOURCE_DIR}/tests/security/security_regression.sh
+)
+set_tests_properties(security_regression PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_custom_target(security_regression_gate
+    COMMAND ${CMAKE_COMMAND} -E env SELDON_BIN=$<TARGET_FILE:seldon> bash ${CMAKE_SOURCE_DIR}/tests/security/security_regression.sh
+    DEPENDS seldon
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Running Seldon security regression gate"
+)
 
 option(SELDON_ENABLE_OPENMP "Enable OpenMP acceleration for supported kernels" ON)
 option(SELDON_NEURAL_FLOAT32 "Use float32 for neural-layer tensors (weights/activations/gradients)" OFF)

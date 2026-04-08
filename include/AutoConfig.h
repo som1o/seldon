@@ -340,6 +340,13 @@ struct AutoConfig {
     static std::string describeParams();
 
     /**
+     * @brief Normalizes and validates a writable path to stay inside the workspace.
+     * @throws Seldon::ConfigurationException on empty/traversal/root/out-of-workspace paths.
+     */
+    static std::string normalizeWritablePath(const std::string& rawPath,
+                                             const std::string& fieldLabel);
+
+    /**
      * @brief Validates merged configuration invariants and enum-like fields.
      * @throws Seldon::ConfigurationException on invalid values.
      */

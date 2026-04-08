@@ -50,7 +50,7 @@
 #include <omp.h>
 #endif
 
-namespace {
+namespace seldon_pipeline {
 #ifdef SELDON_USE_NATIVE_PARQUET
 bool exportParquetNative(const TypedDataset& data,
                         const std::string& parquetPath,
@@ -2697,15 +2697,28 @@ std::vector<int> selectAuxiliaryNumericTargets(const TypedDataset& data,
 
 std::string escapeJsonString(const std::string& in) {
     std::string out;
-    out.reserve(in.size() + 16);
-    for (char ch : in) {
+    out.reserve(in.size() + 24);
+    static const char kHex[] = "0123456789ABCDEF";
+    for (unsigned char ch : in) {
         switch (ch) {
             case '"': out += "\\\""; break;
             case '\\': out += "\\\\"; break;
             case '\n': out += "\\n"; break;
             case '\r': out += "\\r"; break;
             case '\t': out += "\\t"; break;
-            default: out.push_back(ch); break;
+            case '<': out += "\\x3C"; break;
+            case '>': out += "\\x3E"; break;
+            case '&': out += "\\x26"; break;
+            case '\'': out += "\\x27"; break;
+            default:
+                if (ch < 0x20) {
+                    out += "\\u00";
+                    out.push_back(kHex[ch >> 4]);
+                    out.push_back(kHex[ch & 0x0F]);
+                } else {
+                    out.push_back(static_cast<char>(ch));
+                }
+                break;
         }
     }
     return out;
@@ -2785,7 +2798,7 @@ std::optional<std::string> writeCausalDagEditor(const AutoConfig& cfg,
     out << "function render(){ensureUniqueEdges();while(svg.firstChild) svg.removeChild(svg.firstChild);\n";
     out << "edges.forEach((e,idx)=>{const a=arrow(pos[e.from].x,pos[e.from].y,pos[e.to].x,pos[e.to].y);const l=document.createElementNS(ns,'line');l.setAttribute('x1',a.x1);l.setAttribute('y1',a.y1);l.setAttribute('x2',a.x2);l.setAttribute('y2',a.y2);l.setAttribute('stroke',idx===selected?'#d12':'#666');l.setAttribute('stroke-width',idx===selected?'3':'2');l.style.cursor='pointer';l.onclick=()=>{selected=idx;render();};svg.appendChild(l);const p=document.createElementNS(ns,'polygon');const px=a.x2,py=a.y2;const s=7;const p1=(px)+','+(py);const p2=(px- s*a.ux + s*a.uy)+','+(py- s*a.uy - s*a.ux);const p3=(px- s*a.ux - s*a.uy)+','+(py- s*a.uy + s*a.ux);p.setAttribute('points',p1+' '+p2+' '+p3);p.setAttribute('fill',idx===selected?'#d12':'#666');svg.appendChild(p);});\n";
     out << "nodes.forEach(n=>{const g=document.createElementNS(ns,'g');g.style.cursor='move';const c=document.createElementNS(ns,'circle');c.setAttribute('cx',pos[n].x);c.setAttribute('cy',pos[n].y);c.setAttribute('r',22);c.setAttribute('fill','#f3f7ff');c.setAttribute('stroke','#3366cc');c.setAttribute('stroke-width','2');g.appendChild(c);const t=document.createElementNS(ns,'text');t.setAttribute('x',pos[n].x);t.setAttribute('y',pos[n].y+4);t.setAttribute('font-size','11');t.setAttribute('text-anchor','middle');t.textContent=n;g.appendChild(t);let drag=false;g.onmousedown=(ev)=>{drag=true;ev.preventDefault();};window.addEventListener('mouseup',()=>drag=false);window.addEventListener('mousemove',(ev)=>{if(!drag) return;const r=svg.getBoundingClientRect();pos[n].x=Math.max(30,Math.min(W-30,ev.clientX-r.left));pos[n].y=Math.max(30,Math.min(H-30,ev.clientY-r.top));render();});svg.appendChild(g);});\n";
-    out << "const body=document.getElementById('edgeBody');body.innerHTML='';edges.forEach((e,idx)=>{const tr=document.createElement('tr');if(idx===selected) tr.style.background='#fff2f2';tr.onclick=()=>{selected=idx;render();};tr.innerHTML='<td>'+ (idx+1) +'</td><td>'+e.from+'</td><td>'+e.to+'</td>';body.appendChild(tr);});\n";
+    out << "const body=document.getElementById('edgeBody');body.textContent='';edges.forEach((e,idx)=>{const tr=document.createElement('tr');if(idx===selected) tr.style.background='#fff2f2';tr.onclick=()=>{selected=idx;render();};const c0=document.createElement('td');c0.textContent=String(idx+1);const c1=document.createElement('td');c1.textContent=e.from;const c2=document.createElement('td');c2.textContent=e.to;tr.appendChild(c0);tr.appendChild(c1);tr.appendChild(c2);body.appendChild(tr);});\n";
     out << "const mer=['flowchart LR'];edges.forEach(e=>{mer.push('    '+safeId(e.from)+'[\"'+escapeMer(e.from)+'\"] --> '+safeId(e.to)+'[\"'+escapeMer(e.to)+'\"]');});document.getElementById('mermaidOut').value=mer.join('\\n');}\n";
     out << "function safeId(n){return 'N'+(nodes.indexOf(n)+1);} function escapeMer(s){return String(s).replace(/\"/g,\"'\");}\n";
     out << "const fromSel=document.getElementById('fromSel');const toSel=document.getElementById('toSel');nodes.forEach(n=>{const o1=document.createElement('option');o1.textContent=n;o1.value=n;fromSel.appendChild(o1);const o2=document.createElement('option');o2.textContent=n;o2.value=n;toSel.appendChild(o2);});\n";
@@ -2816,15 +2829,111 @@ std::string plotSubdir(const AutoConfig& cfg, const std::string& name) {
     return cfg.assetsDir + "/" + name;
 }
 
-void cleanupOutputs(const AutoConfig& config) {
+bool pathWithinRoot(const std::filesystem::path& root, const std::filesystem::path& candidate) {
+    std::error_code ec;
+    const std::filesystem::path rel = std::filesystem::relative(candidate, root, ec);
+    if (ec) return false;
+    if (rel.empty()) return true;
+    const std::string relStr = rel.generic_string();
+    if (relStr == ".") return true;
+    return !(relStr == ".." || relStr.rfind("../", 0) == 0);
+}
+
+bool isFilesystemRootPath(const std::filesystem::path& path) {
+    const std::filesystem::path normalized = path.lexically_normal();
+    if (normalized.empty()) return true;
+    return normalized == normalized.root_path();
+}
+
+std::filesystem::path canonicalWorkspaceRootForCleanup() {
     namespace fs = std::filesystem;
     std::error_code ec;
-    if (!config.outputDir.empty()) {
-        fs::remove_all(config.outputDir, ec);
-        fs::create_directories(config.outputDir, ec);
+    const fs::path workspaceRoot = fs::canonical(fs::current_path(), ec);
+    if (ec) {
+        throw Seldon::ConfigurationException("Unable to resolve workspace root for cleanup");
     }
-    fs::remove_all(config.assetsDir, ec);
-    fs::create_directories(config.assetsDir, ec);
+    return workspaceRoot;
+}
+
+std::filesystem::path resolveSafeCleanupDirectory(const std::string& rawPath,
+                                                  const std::string& fieldLabel,
+                                                  const std::filesystem::path& workspaceRoot,
+                                                  const std::filesystem::path& currentDir) {
+    namespace fs = std::filesystem;
+    const fs::path candidate(AutoConfig::normalizeWritablePath(rawPath, fieldLabel));
+    if (candidate.empty() || isFilesystemRootPath(candidate)) {
+        throw Seldon::ConfigurationException("Refusing to clean filesystem root for " + fieldLabel);
+    }
+    if (!pathWithinRoot(workspaceRoot, candidate)) {
+        throw Seldon::ConfigurationException("Refusing cleanup outside workspace for " + fieldLabel + ": " + candidate.string());
+    }
+    if (candidate == workspaceRoot || candidate == currentDir) {
+        throw Seldon::ConfigurationException("Refusing to clean workspace/current directory for " + fieldLabel + ": " + candidate.string());
+    }
+    return candidate;
+}
+
+void clearDirectoryContentsSafely(const std::filesystem::path& targetDir,
+                                  const std::unordered_set<std::string>& approvedDirs,
+                                  const std::string& fieldLabel) {
+    namespace fs = std::filesystem;
+    if (approvedDirs.find(targetDir.string()) == approvedDirs.end()) {
+        throw Seldon::ConfigurationException("Refusing cleanup for unapproved path: " + targetDir.string());
+    }
+
+    std::error_code ec;
+    if (!fs::exists(targetDir, ec)) {
+        fs::create_directories(targetDir, ec);
+        if (ec) {
+            throw Seldon::ConfigurationException("Failed to create cleanup directory for " + fieldLabel + ": " + targetDir.string());
+        }
+        return;
+    }
+    if (ec || !fs::is_directory(targetDir, ec)) {
+        throw Seldon::ConfigurationException("Cleanup target is not a directory for " + fieldLabel + ": " + targetDir.string());
+    }
+
+    for (fs::directory_iterator it(targetDir, ec), end; !ec && it != end; it.increment(ec)) {
+        fs::remove_all(it->path(), ec);
+        if (ec) {
+            throw Seldon::ConfigurationException("Failed to clean directory for " + fieldLabel + ": " + targetDir.string());
+        }
+    }
+    if (ec) {
+        throw Seldon::ConfigurationException("Failed to iterate cleanup directory for " + fieldLabel + ": " + targetDir.string());
+    }
+
+    fs::create_directories(targetDir, ec);
+    if (ec) {
+        throw Seldon::ConfigurationException("Failed to recreate cleanup directory for " + fieldLabel + ": " + targetDir.string());
+    }
+}
+
+void cleanupOutputs(const AutoConfig& config) {
+    namespace fs = std::filesystem;
+    const fs::path workspaceRoot = canonicalWorkspaceRootForCleanup();
+    const fs::path currentDir = workspaceRoot;
+
+    std::optional<fs::path> outputDir;
+    if (!config.outputDir.empty()) {
+        outputDir = resolveSafeCleanupDirectory(config.outputDir,
+                                                "output_dir",
+                                                workspaceRoot,
+                                                currentDir);
+    }
+    const fs::path assetsDir = resolveSafeCleanupDirectory(config.assetsDir,
+                                                           "assets_dir",
+                                                           workspaceRoot,
+                                                           currentDir);
+
+    std::unordered_set<std::string> approvedDirs;
+    if (outputDir.has_value()) approvedDirs.insert(outputDir->string());
+    approvedDirs.insert(assetsDir.string());
+
+    if (outputDir.has_value()) {
+        clearDirectoryContentsSafely(*outputDir, approvedDirs, "output_dir");
+    }
+    clearDirectoryContentsSafely(assetsDir, approvedDirs, "assets_dir");
 }
 
 void cleanupPlotCacheArtifacts(const AutoConfig& config) {
@@ -2832,7 +2941,12 @@ void cleanupPlotCacheArtifacts(const AutoConfig& config) {
     std::error_code ec;
     if (config.assetsDir.empty()) return;
 
-    const fs::path root(config.assetsDir);
+    const fs::path workspaceRoot = canonicalWorkspaceRootForCleanup();
+    const fs::path currentDir = workspaceRoot;
+    const fs::path root = resolveSafeCleanupDirectory(config.assetsDir,
+                                                      "assets_dir",
+                                                      workspaceRoot,
+                                                      currentDir);
     if (!fs::exists(root, ec)) return;
 
     std::vector<fs::path> cacheDirs;
@@ -2856,6 +2970,12 @@ void cleanupPlotCacheArtifacts(const AutoConfig& config) {
     });
 
     for (const auto& cacheDir : cacheDirs) {
+        std::error_code cacheEc;
+        const fs::path canonicalCache = fs::weakly_canonical(cacheDir, cacheEc);
+        if (cacheEc) continue;
+        if (isFilesystemRootPath(canonicalCache)) continue;
+        if (canonicalCache == root || canonicalCache == workspaceRoot || canonicalCache == currentDir) continue;
+        if (!pathWithinRoot(root, canonicalCache)) continue;
         fs::remove_all(cacheDir, ec);
     }
 }
@@ -3710,4 +3830,6 @@ void addNeuralLossSummaryTable(ReportEngine& report, const NeuralAnalysis& neura
         report.addTable("Neural Loss Summary", {"Series", "Min", "Max", "Final"}, lossSummary);
     }
 }
+
+} // namespace seldon_pipeline
 

@@ -20,6 +20,7 @@ and no managed cloud dependency on the critical path.
 - [Prerequisites](#prerequisites)
 - [Building Seldon](#building-seldon)
 - [Running Seldon](#running-seldon)
+- [Security and CI Gate](#security-and-ci-gate)
 - [Output Artifacts](#output-artifacts)
 - [CLI Reference](#cli-reference)
 - [Configuration File Reference](#configuration-file-reference)
@@ -233,7 +234,7 @@ into the bivariate report. Stage 9 consumes all prior outputs.
 
 ```
 src/
-  AutomationPipeline.cpp       — Top-level orchestrator, includes pipeline parts
+  AutomationPipeline.cpp       — Top-level orchestrator entry and thread-local hooks
   pipeline_parts/
     PipelineRuntime.cpp        — End-to-end execution flow and report composition
     PipelineUnivariate.cpp     — Univariate scaffolding, plot helpers, I/O save helpers
@@ -404,6 +405,51 @@ modern hardware. Accept a small numerical precision trade-off in neural outputs.
 | `SELDON_ENABLE_CUDA`           | `OFF`   | CUDA acceleration + secondary binary target      |
 | `SELDON_NEURAL_FLOAT32`        | `OFF`   | 32-bit precision neural network                  |
 | `SELDON_ENABLE_NATIVE_PARQUET` | `OFF`   | Native Arrow/Parquet export backend              |
+
+---
+
+## Security and CI Gate
+
+Seldon now ships with a security regression gate that is runnable locally and in CI.
+
+### Local Security Gate
+
+```bash
+cmake --build build --target security_regression_gate
+```
+
+Equivalent CTest invocation:
+
+```bash
+ctest --test-dir build -R security_regression --output-on-failure
+```
+
+### What the Gate Validates
+
+- Path-block guardrails:
+  - Traversal segments are rejected (for example `../...`).
+  - Paths that resolve outside the workspace are rejected.
+  - Filesystem root targets are rejected.
+  - Dangerous cleanup targets (workspace/current directory) are rejected.
+- Report safety / XSS regression checks:
+  - Raw script payloads from dataset content are not emitted into report HTML.
+  - Escaped payloads remain visible for analyst traceability.
+- Temp-file hygiene for compressed input conversion:
+  - Temporary conversion files for `.gz` ingestion do not leak.
+- Subprocess isolation:
+  - Malicious shell metacharacters in compressed input filenames do not trigger command execution side effects.
+
+Security fixtures and the gate script live under `tests/security/`.
+
+### CI Integration
+
+The GitHub Actions workflow at `.github/workflows/ci.yml` builds Seldon and runs:
+
+```bash
+cmake --build build --target security_regression_gate
+```
+
+This makes security regressions part of the release gate instead of an ad-hoc local step.
 
 ---
 

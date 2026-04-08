@@ -76,9 +76,12 @@ std::vector<std::string> parseCSVLine(std::istream& is,
     };
 
     auto addRecordBytes = [&](size_t delta) {
-        if (limits.maxRecordBytes > 0 && recordBytes > limits.maxRecordBytes - delta) {
-            markLimitExceeded();
-            return false;
+        if (limits.maxRecordBytes > 0) {
+            const size_t nextRecordBytes = recordBytes + delta;
+            if (nextRecordBytes < recordBytes || nextRecordBytes > limits.maxRecordBytes) {
+                markLimitExceeded();
+                return false;
+            }
         }
         recordBytes += delta;
         return true;

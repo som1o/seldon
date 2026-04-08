@@ -8,23 +8,18 @@
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
-#include <ctime>
 #include <filesystem>
 #include <fcntl.h>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
-#include <spawn.h>
 #include <sstream>
 #include <streambuf>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
-
-extern char** environ;
 
 TypedDataset::TypedDataset(std::string filename, char delimiter)
     : filename_(std::move(filename)), delimiter_(delimiter) {}
@@ -180,11 +175,54 @@ private:
     bool active_ = false;
 };
 
-std::string makeUniqueTempCsvPath(const std::string& sourcePath) {
+class ScopedFd {
+public:
+    ScopedFd() = default;
+    explicit ScopedFd(int fd) : fd_(fd) {}
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    ScopedFd(ScopedFd&& other) noexcept : fd_(other.fd_) {
+        other.fd_ = -1;
+    }
+    ScopedFd& operator=(ScopedFd&& other) noexcept {
+        if (this == &other) return *this;
+        reset(other.fd_);
+        other.fd_ = -1;
+        return *this;
+    }
+    ~ScopedFd() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+
+    int get() const { return fd_; }
+
+    void reset(int nextFd = -1) {
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = nextFd;
+    }
+
+private:
+    int fd_ = -1;
+};
+
+std::pair<std::string, int> createExclusiveTempCsvFile() {
     namespace fs = std::filesystem;
-    const auto token = std::to_string(static_cast<unsigned long long>(
-        std::hash<std::string>{}(sourcePath + std::to_string(std::time(nullptr)) + std::to_string(::getpid()))));
-    return (fs::temp_directory_path() / ("seldon_input_" + token + ".csv")).string();
+    const fs::path tmplPath = fs::temp_directory_path() / "seldon_input_XXXXXX";
+    std::string tmpl = tmplPath.string();
+    std::vector<char> writable(tmpl.begin(), tmpl.end());
+    writable.push_back('\0');
+
+    const int fd = ::mkstemp(writable.data());
+    if (fd < 0) {
+        throw Seldon::DatasetException("Failed to create secure temporary conversion file");
+    }
+
+    int flags = ::fcntl(fd, F_GETFD);
+    if (flags >= 0) {
+        ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    }
+
+    return {std::string(writable.data()), fd};
 }
 
 bool isMissingToken(const std::string& raw) {
@@ -337,109 +375,6 @@ bool parseDatePart(const std::string& datePart, TypedDataset::DateLocaleHint loc
     return false;
 }
 
-std::string findExecutableInPath(const std::string& command) {
-    if (command.empty()) return "";
-    const char* pathEnv = std::getenv("PATH");
-    if (!pathEnv) return "";
-
-    std::string pathValue(pathEnv);
-    std::stringstream ss(pathValue);
-    std::string token;
-    while (std::getline(ss, token, ':')) {
-        if (token.empty()) token = ".";
-        std::filesystem::path candidate = std::filesystem::path(token) / command;
-        std::error_code ec;
-        if (std::filesystem::exists(candidate, ec) && !ec && ::access(candidate.c_str(), X_OK) == 0) {
-            return candidate.string();
-        }
-    }
-    return "";
-}
-
-bool commandAvailable(const std::string& command) {
-    return !findExecutableInPath(command).empty();
-}
-
-int spawnToFile(const std::string& executable,
-                const std::vector<std::string>& args,
-                const std::string& outputPath) {
-    const int outFd = ::open(outputPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
-    if (outFd < 0) return -1;
-    const int devNull = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
-    if (devNull < 0) {
-        ::close(outFd);
-        return -1;
-    }
-
-    int outFlags = ::fcntl(outFd, F_GETFD);
-    int devNullFlags = ::fcntl(devNull, F_GETFD);
-    if (outFlags < 0 || devNullFlags < 0 ||
-        ::fcntl(outFd, F_SETFD, outFlags | FD_CLOEXEC) < 0 ||
-        ::fcntl(devNull, F_SETFD, devNullFlags | FD_CLOEXEC) < 0) {
-        ::close(devNull);
-        ::close(outFd);
-        return -1;
-    }
-
-    posix_spawn_file_actions_t actions;
-    if (::posix_spawn_file_actions_init(&actions) != 0) {
-        ::close(devNull);
-        ::close(outFd);
-        return -1;
-    }
-
-    if (::posix_spawn_file_actions_adddup2(&actions, outFd, STDOUT_FILENO) != 0 ||
-        ::posix_spawn_file_actions_adddup2(&actions, devNull, STDERR_FILENO) != 0 ||
-        ::posix_spawn_file_actions_addclose(&actions, outFd) != 0 ||
-        ::posix_spawn_file_actions_addclose(&actions, devNull) != 0) {
-        ::posix_spawn_file_actions_destroy(&actions);
-        ::close(devNull);
-        ::close(outFd);
-        return -1;
-    }
-
-    posix_spawnattr_t attr;
-    if (::posix_spawnattr_init(&attr) != 0) {
-        ::posix_spawn_file_actions_destroy(&actions);
-        ::close(devNull);
-        ::close(outFd);
-        return -1;
-    }
-
-    short spawnFlags = 0;
-#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
-    spawnFlags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
-#endif
-    if (spawnFlags != 0 && ::posix_spawnattr_setflags(&attr, spawnFlags) != 0) {
-        ::posix_spawnattr_destroy(&attr);
-        ::posix_spawn_file_actions_destroy(&actions);
-        ::close(devNull);
-        ::close(outFd);
-        return -1;
-    }
-
-    std::vector<char*> argv;
-    argv.reserve(args.size() + 2);
-    argv.push_back(const_cast<char*>(executable.c_str()));
-    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
-    argv.push_back(nullptr);
-
-    pid_t pid = -1;
-    const int spawnRc = ::posix_spawn(&pid, executable.c_str(), &actions, &attr, argv.data(), environ);
-
-    ::posix_spawnattr_destroy(&attr);
-    ::posix_spawn_file_actions_destroy(&actions);
-    ::close(devNull);
-    ::close(outFd);
-
-    if (spawnRc != 0 || pid <= 0) return -1;
-
-    int status = 0;
-    if (::waitpid(pid, &status, 0) < 0) return -1;
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    return -1;
-}
-
 std::pair<std::string, bool> resolveDatasetInputPath(const std::string& sourcePath) {
     namespace fs = std::filesystem;
     const fs::path src(sourcePath);
@@ -449,10 +384,22 @@ std::pair<std::string, bool> resolveDatasetInputPath(const std::string& sourcePa
         return {sourcePath, false};
     }
 
-    TempFile tmpFile(makeUniqueTempCsvPath(sourcePath), true);
+    const auto [tmpPath, tmpFdRaw] = createExclusiveTempCsvFile();
+    TempFile tmpFile(tmpPath, true);
+    ScopedFd tmpFd(tmpFdRaw);
 
     auto runToTmp = [&](const std::string& executable, const std::vector<std::string>& args) {
-        const int rc = spawnToFile(executable, args, tmpFile.path());
+        if (::ftruncate(tmpFd.get(), 0) < 0 || ::lseek(tmpFd.get(), 0, SEEK_SET) < 0) {
+            throw Seldon::DatasetException("Failed to prepare temporary conversion output file");
+        }
+
+        const int devNullFdRaw = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (devNullFdRaw < 0) {
+            throw Seldon::DatasetException("Failed to open /dev/null for conversion process stderr");
+        }
+        ScopedFd devNullFd(devNullFdRaw);
+
+        const int rc = CommonUtils::spawnProcessAndWait(executable, args, tmpFd.get(), devNullFd.get());
         if (rc != 0) {
             throw Seldon::DatasetException("Failed to convert input source: " + sourcePath);
         }
@@ -460,24 +407,24 @@ std::pair<std::string, bool> resolveDatasetInputPath(const std::string& sourcePa
     };
 
     if (lowerExt == ".gz") {
-        const std::string exe = findExecutableInPath("gzip");
+        const std::string exe = CommonUtils::findExecutableInPath("gzip");
         if (exe.empty()) throw Seldon::DatasetException("gzip is required to read .gz files");
         return runToTmp(exe, {"-cd", sourcePath});
     }
     if (lowerExt == ".zip") {
-        const std::string exe = findExecutableInPath("unzip");
+        const std::string exe = CommonUtils::findExecutableInPath("unzip");
         if (exe.empty()) throw Seldon::DatasetException("unzip is required to read .zip files");
         return runToTmp(exe, {"-p", sourcePath});
     }
     if (lowerExt == ".xlsx") {
-        const std::string exe = findExecutableInPath("xlsx2csv");
+        const std::string exe = CommonUtils::findExecutableInPath("xlsx2csv");
         if (!exe.empty()) {
             return runToTmp(exe, {sourcePath});
         }
         throw Seldon::DatasetException("XLSX import requires xlsx2csv. See docs/ENABLE_EXCEL_IMPORT");
     }
     if (lowerExt == ".xls") {
-        const std::string exe = findExecutableInPath("xls2csv");
+        const std::string exe = CommonUtils::findExecutableInPath("xls2csv");
         if (!exe.empty()) {
             return runToTmp(exe, {sourcePath});
         }
